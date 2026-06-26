@@ -1,0 +1,9 @@
+result
+result-*
+__pycache__/
+*.pyc
+.direnv/
+*.partial
+# Events live in $RATCHET_DATA_DIR (outside this repo). Guard against an accidental
+# data dir landing inside the tree — events are never version-controlled.
+/data/
