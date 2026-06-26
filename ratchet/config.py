@@ -16,8 +16,8 @@ def data_root() -> Path:
 
 
 def ensure_layout(root: Path | None = None) -> Path:
-    """Create the data subtree (blobs, state, tmp) and return the root."""
+    """Create the data subtree (blobs, state, tmp, events) and return the root."""
     root = root or data_root()
-    for sub in ("blobs", "state", "tmp"):
+    for sub in ("blobs", "state", "tmp", "events"):
         (root / sub).mkdir(parents=True, exist_ok=True)
     return root

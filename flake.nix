@@ -26,9 +26,10 @@
             ''}";
           };
         in {
-          tap = block "tap";      # fetch:  datastore → raw blob
-          weave = block "weave";  # render: raw blob → cleaned blob
-          chunk = block "chunk";  # window: cleaned blob → chunkset
+          tap = block "tap";      # fetch:   datastore → raw blob
+          weave = block "weave";  # render:  raw blob → cleaned blob
+          chunk = block "chunk";  # window:  cleaned blob → chunkset
+          glean = block "glean";  # extract: chunkset → events (LLM)
         });
     };
 }
