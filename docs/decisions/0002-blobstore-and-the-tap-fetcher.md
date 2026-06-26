@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-06-26
-- Supersedes: 0001 §2 (per-chunk blob granularity)
+- Supersedes: 0001 §2 (per-chunk blob granularity; the separate tracking ledger), 0001 §4 (ledgers as per-run shard files)
 - Superseded by: —
 
 Informed by prior art in incremental web crawling, backup deduplication, web archiving

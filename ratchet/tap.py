@@ -81,6 +81,8 @@ def load_fetch_state(root: Path) -> dict[str, list]:
 
 
 def save_fetch_state(root: Path, state: dict) -> None:
+    # No fsync: the cursor is a rebuildable optimization, not ground truth — a lost write
+    # just forces one re-read next run.
     p = _state_path(root)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".partial")
@@ -99,24 +101,14 @@ def _sweep_partials(root: Path) -> None:
                 pass
 
 
-def _latest_index(root: Path) -> dict[str, tuple]:
-    """source_id -> (fetched_at, hash) for the newest committed blob, built in ONE scan."""
-    idx: dict[str, tuple] = {}
-    for m in blobstore.iter_meta(root):
-        sid = m.get("source_id")
-        key = (m.get("fetched_at", ""), m.get("content_hash", ""))
-        if sid and (sid not in idx or key > idx[sid]):
-            idx[sid] = key
-    return idx
-
-
 def tap(datastore: Path, project: str | None = None, limit: int | None = None,
         dry_run: bool = False) -> str:
+    """Sweep the datastore once: copy new/changed transcripts into the blobstore. Returns run_id."""
     run_id = f"tap-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     root = config.ensure_layout()
     _sweep_partials(root)
     state = load_fetch_state(root)
-    latest = _latest_index(root)  # source_id -> (fetched_at, hash); kept current in-run
+    latest = blobstore.latest_index(root)  # source_id -> (fetched_at, hash); kept current in-run
     located = copied = skipped = errored = 0
 
     for path in discover(datastore, project):
@@ -143,8 +135,9 @@ def tap(datastore: Path, project: str | None = None, limit: int | None = None,
 
             prev = latest.get(sid, ("", None))[1]
             ver = "v1" if prev is None else f"v+ (prev {prev[:8]})"
+            line = f"{path.name}  {origin['lines']:>5} lines  {h[:12]}  {ver}"
             if dry_run:
-                print(f"would copy {path.name}  {origin['lines']:>5} lines  {h[:12]}  {ver}")
+                print(f"would copy {line}")
                 copied += 1
                 continue
             fetched_at = datetime.now(timezone.utc).isoformat()
@@ -152,7 +145,7 @@ def tap(datastore: Path, project: str | None = None, limit: int | None = None,
                              fetched_at=fetched_at, prev=prev, h=h, root=root)
             latest[sid] = (fetched_at, h)
             copied += 1
-            print(f"copied {path.name}  {origin['lines']:>5} lines  {h[:12]}  {ver}")
+            print(f"copied {line}")
         except OSError as e:
             errored += 1
             print(f"skip   {path.name}  (unreadable: {type(e).__name__})")

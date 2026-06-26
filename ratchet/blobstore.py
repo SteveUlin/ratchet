@@ -67,7 +67,7 @@ def _atomic_write(path: Path, data: str, root: Path) -> None:
         raise
 
 
-def put(
+def _put(
     text: str,
     *,
     source_kind: str,
@@ -79,31 +79,24 @@ def put(
     root: Path | None = None,
 ) -> tuple[str, bool]:
     """Freeze `text` as an immutable blob (content first, meta last = commit). Returns
-    (hash, written); an already-committed hash is a no-op."""
+    (hash, written); an already-committed hash is a no-op. Internal — callers use `ingest`."""
     root = root or config.data_root()
     h = h or blob_hash(text)
     content, meta = _paths(h, root)
     if meta.exists():  # already committed
         return h, False
+    record = {
+        "content_hash": h,
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "origin_ref": origin_ref,
+        "fetched_at": fetched_at or datetime.now(timezone.utc).isoformat(),
+        "prev": prev,
+        "bytes": len(text.encode("utf-8")),
+    }
     content.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(content, text, root)  # 1. content (idempotent; overwrites any prior orphan)
-    _atomic_write(                       # 2. meta = COMMIT marker
-        meta,
-        json.dumps(
-            {
-                "content_hash": h,
-                "source_kind": source_kind,
-                "source_id": source_id,
-                "origin_ref": origin_ref,
-                "fetched_at": fetched_at or datetime.now(timezone.utc).isoformat(),
-                "prev": prev,
-                "bytes": len(text.encode("utf-8")),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        root,
-    )
+    _atomic_write(content, text, root)                                            # 1. content
+    _atomic_write(meta, json.dumps(record, ensure_ascii=False, indent=2), root)   # 2. commit
     return h, True
 
 
@@ -123,20 +116,25 @@ def iter_meta(root: Path | None = None) -> Iterator[dict]:
                 continue
 
 
-def latest_version(source_id: str, root: Path | None = None) -> str | None:
-    """Most recent committed blob hash for a logical source, or None.
-
-    Derived from meta sidecars. Ties on `fetched_at` break deterministically by content
-    hash, so the answer is well-defined regardless of scan order.
-    """
-    best: tuple[tuple[str, str], str] | None = None  # ((fetched_at, hash), hash)
+def latest_index(root: Path | None = None) -> dict[str, tuple[str, str]]:
+    """source_id -> (fetched_at, content_hash) of its newest blob, in ONE scan over the meta
+    sidecars. Ties on `fetched_at` break deterministically by hash, so the answer is
+    well-defined regardless of scan order."""
+    idx: dict[str, tuple[str, str]] = {}
     for m in iter_meta(root):
-        if m.get("source_id") != source_id:
+        sid = m.get("source_id")
+        if not sid:
             continue
         key = (m.get("fetched_at", ""), m.get("content_hash", ""))
-        if best is None or key > best[0]:
-            best = (key, m.get("content_hash"))
-    return best[1] if best else None
+        if sid not in idx or key > idx[sid]:
+            idx[sid] = key
+    return idx
+
+
+def latest_version(source_id: str, root: Path | None = None) -> str | None:
+    """Most recent committed blob hash for a logical source, or None."""
+    key = latest_index(root).get(source_id)
+    return key[1] if key else None
 
 
 def ingest(
@@ -162,6 +160,5 @@ def ingest(
         return h, False
     if prev is _DERIVE:
         prev = latest_version(source_id, root)
-    return put(text, source_kind=source_kind, source_id=source_id, origin_ref=origin_ref,
-               prev=prev, fetched_at=fetched_at or datetime.now(timezone.utc).isoformat(),
-               h=h, root=root)
+    return _put(text, source_kind=source_kind, source_id=source_id, origin_ref=origin_ref,
+                prev=prev, fetched_at=fetched_at, h=h, root=root)
