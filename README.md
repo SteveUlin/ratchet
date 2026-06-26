@@ -19,10 +19,19 @@ The blobstore lives **outside** this repo, in `$RATCHET_DATA_DIR`
 (default `${XDG_DATA_HOME:-~/.local/share}/ratchet`). It is append-only and local-only; the
 repo holds only code.
 
+## Run
+
+```
+nix run .#tap -- --dry-run          # show which transcripts would be copied
+nix run .#tap                       # copy new transcripts into the blobstore
+```
+
 ## Develop
+
+From the dev shell (picks up uncommitted changes):
 
 ```
 direnv allow                        # or: nix develop
-python -m ratchet.tap --dry-run     # show which transcripts would be copied
-python -m ratchet.tap               # copy new transcripts into the blobstore
+python -m ratchet.tap --dry-run
+python tests/test_storage.py && python tests/test_tap.py
 ```
