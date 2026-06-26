@@ -42,7 +42,11 @@ def has(h: str, root: Path | None = None) -> bool:
 
 
 def get(h: str, root: Path | None = None) -> str:
-    return _paths(h, root or config.data_root())[0].read_text(encoding="utf-8")
+    # read_bytes + decode, NOT read_text: read_text opens in universal-newline mode and would
+    # rewrite \r\n→\n and lone \r→\n on read, corrupting content and breaking content-addressing
+    # (`blob_hash(get(h)) != h`). A cleaned blob holds real \r decoded from rendered tool output
+    # (HTTP headers, terminal control), so this is load-bearing, not theoretical.
+    return _paths(h, root or config.data_root())[0].read_bytes().decode("utf-8")
 
 
 def get_meta(h: str, root: Path | None = None) -> dict:
@@ -54,8 +58,8 @@ def _atomic_write(path: Path, data: str, root: Path) -> None:
     tmpdir.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=tmpdir, suffix=".partial")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(data)
+        with os.fdopen(fd, "wb") as f:  # bytes, not text: no newline translation (see `get`)
+            f.write(data.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)  # atomic within the filesystem (tmp + blobs share `root`)
@@ -65,6 +69,31 @@ def _atomic_write(path: Path, data: str, root: Path) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _commit(h: str, text: str, record: dict, root: Path) -> tuple[str, bool]:
+    """Write content first, then the meta sidecar last as the COMMIT marker, each via temp +
+    atomic rename. Returns (hash, written); an already-committed hash (meta present) is a no-op.
+    Shared by the raw (`_put`) and derived (`put_derived`) paths."""
+    content, meta = _paths(h, root)
+    if meta.exists():  # already committed
+        existing = json.loads(meta.read_text(encoding="utf-8"))
+        if existing.get("kind", "raw") != record.get("kind", "raw"):
+            # raw and derived share one hash→meta namespace; identical bytes across kinds would
+            # otherwise silently no-op and drop the new lineage. Fail loud instead (near-impossible:
+            # a rendered doc byte-identical to a raw .jsonl), never mis-tag a committed blob.
+            raise ValueError(
+                f"blob {h[:12]} already committed as kind={existing.get('kind', 'raw')!r}; "
+                f"refusing to re-commit as kind={record.get('kind')!r}")
+        return h, False
+    content.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(content, text, root)                                            # 1. content
+    _atomic_write(meta, json.dumps(record, ensure_ascii=False, indent=2), root)   # 2. commit
+    return h, True
 
 
 def _put(
@@ -78,26 +107,61 @@ def _put(
     h: str | None = None,
     root: Path | None = None,
 ) -> tuple[str, bool]:
-    """Freeze `text` as an immutable blob (content first, meta last = commit). Returns
-    (hash, written); an already-committed hash is a no-op. Internal — callers use `ingest`."""
+    """Freeze `text` as an immutable RAW blob (ground truth, kept forever). Internal — callers
+    use `ingest`."""
     root = root or config.data_root()
     h = h or blob_hash(text)
-    content, meta = _paths(h, root)
-    if meta.exists():  # already committed
-        return h, False
     record = {
         "content_hash": h,
+        "kind": "raw",
         "source_kind": source_kind,
         "source_id": source_id,
         "origin_ref": origin_ref,
-        "fetched_at": fetched_at or datetime.now(timezone.utc).isoformat(),
+        "fetched_at": fetched_at or _now(),
         "prev": prev,
         "bytes": len(text.encode("utf-8")),
     }
-    content.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(content, text, root)                                            # 1. content
-    _atomic_write(meta, json.dumps(record, ensure_ascii=False, indent=2), root)   # 2. commit
-    return h, True
+    return _commit(h, text, record, root)
+
+
+def put_derived(
+    text: str,
+    *,
+    source_kind: str,
+    derived_from: str,
+    produced_by: str,
+    render_version: str,
+    fmt: str,
+    tags: dict | None = None,
+    expires_at: str | None = None,
+    created_at: str | None = None,
+    h: str | None = None,
+    root: Path | None = None,
+) -> tuple[str, bool]:
+    """Freeze a DERIVED artifact — a deterministic function of an immutable blob — as its own
+    content-addressed blob. Returns (hash, written); an existing hash is a no-op.
+
+    Unlike a raw blob (ground truth, kept forever) a derived blob is rebuildable from
+    `derived_from` + `render_version`, so it is TTL-eligible (`expires_at`) — yet still immutable
+    in place, which keeps provenance spans sound. The sidecar is self-describing (`kind`,
+    `source_kind`, `format`, `render_version`, `produced_by`, `derived_from`, `tags`) so a consumer
+    can skip/use without reading the content (ADR-0003)."""
+    root = root or config.data_root()
+    h = h or blob_hash(text)
+    record = {
+        "content_hash": h,
+        "kind": "derived",
+        "source_kind": source_kind,
+        "derived_from": derived_from,
+        "produced_by": produced_by,
+        "render_version": render_version,
+        "format": fmt,
+        "created_at": created_at or _now(),
+        "expires_at": expires_at,
+        "tags": tags or {},
+        "bytes": len(text.encode("utf-8")),
+    }
+    return _commit(h, text, record, root)
 
 
 def iter_meta(root: Path | None = None) -> Iterator[dict]:
@@ -137,6 +201,17 @@ def latest_version(source_id: str, root: Path | None = None) -> str | None:
     return key[1] if key else None
 
 
+def derived_for(derived_from: str, root: Path | None = None, *,
+                fmt: str | None = None) -> Iterator[dict]:
+    """Yield the meta of every derived blob produced from `derived_from` (optionally filtered by
+    `format`) — the downstream lineage of a raw blob, by one scan over the sidecars. No index
+    (ADR-0002): add one only when a scan actually hurts."""
+    for m in iter_meta(root):
+        if m.get("kind") == "derived" and m.get("derived_from") == derived_from:
+            if fmt is None or m.get("format") == fmt:
+                yield m
+
+
 def ingest(
     text: str,
     *,
@@ -157,6 +232,9 @@ def ingest(
     root = root or config.data_root()
     h = h or blob_hash(text)
     if has(h, root):
+        if get_meta(h, root).get("kind", "raw") != "raw":   # symmetric with _commit's guard:
+            raise ValueError(f"blob {h[:12]} already committed as derived; "  # never silently drop
+                             f"refusing to ingest as raw")                    # a raw snapshot
         return h, False
     if prev is _DERIVE:
         prev = latest_version(source_id, root)

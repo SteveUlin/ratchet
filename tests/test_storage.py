@@ -46,5 +46,62 @@ h4, w4 = blobstore.ingest(orphan, source_kind="transcript", source_id="sess2",
 assert w4 is True and blobstore.has(oh) and h4 == oh, "orphan repaired — meta now written"
 assert blobstore.get_meta(oh)["source_id"] == "sess2"
 
-print("OK — ingest dedup, header data, meta-as-truth versioning, crash-orphan repair")
+# raw blobs carry the kind discriminator so a consumer can tell ground truth from cache
+assert blobstore.get_meta(h1)["kind"] == "raw", "raw blob tagged kind=raw"
+
+# derived blobs: content-addressed like raw, but lineage-tagged + TTL-eligible (ADR-0003)
+rendered = "[user] no, use jj not git\n\n[assistant] ok"
+dh, dw = blobstore.put_derived(rendered, source_kind="transcript", derived_from=h1,
+                               produced_by="weave", render_version="weave/1",
+                               fmt="weave.render/1", tags={"project": "proj"},
+                               expires_at="2026-12-31T00:00:00Z")
+dh2, dw2 = blobstore.put_derived(rendered, source_kind="transcript", derived_from=h1,
+                                 produced_by="weave", render_version="weave/1",
+                                 fmt="weave.render/1")
+assert dw is True and dw2 is False and dh == dh2, "derived dedup is content-addressed"
+assert blobstore.get(dh) == rendered
+
+dm = blobstore.get_meta(dh)
+assert dm["kind"] == "derived" and dm["derived_from"] == h1 and dm["produced_by"] == "weave"
+assert dm["render_version"] == "weave/1" and dm["format"] == "weave.render/1"
+assert dm["expires_at"] == "2026-12-31T00:00:00Z" and dm["tags"]["project"] == "proj"
+
+# lineage is traversable: derived_for(raw) finds the render; format filter narrows it
+lineage = list(blobstore.derived_for(h1))
+assert [m["content_hash"] for m in lineage] == [dh], "derived_for yields the render"
+assert list(blobstore.derived_for(h1, fmt="nope")) == [], "format filter excludes non-matches"
+
+# derived blobs stay OUT of the raw version index (no source_id) — they don't fork the TimeMap
+assert blobstore.latest_version("sess1") == h3, "derived blob does not become a raw version"
+
+# byte-faithful store: content with \r must round-trip, or content-addressing breaks (a cleaned
+# blob holds real \r from rendered tool output; read_text would rewrite \r\n→\n). (adversarial finding)
+for crlf in ("a\rb", "h\r\nv", "x\r\r\ny"):
+    ch, _ = blobstore.ingest(crlf, source_kind="transcript", source_id="cr-" + str(len(crlf)),
+                             origin_ref={})
+    assert blobstore.get(ch) == crlf, f"\\r round-trips ({crlf!r} → {blobstore.get(ch)!r})"
+    assert blobstore.blob_hash(blobstore.get(ch)) == ch, "blob_hash(get(h)) == h"
+
+# raw and derived share one hash→meta namespace; identical bytes across kinds must fail loud, not
+# silently no-op and drop lineage (adversarial finding) — in BOTH directions.
+collide = "x-collide-x"
+blobstore.ingest(collide, source_kind="transcript", source_id="c1", origin_ref={})
+try:
+    blobstore.put_derived(collide, source_kind="transcript", derived_from=h1, produced_by="weave",
+                          render_version="weave/1", fmt="weave.render/1")
+    assert False, "derived bytes colliding with a raw blob must raise"
+except ValueError:
+    pass
+derived_only = "y-derived-only-y"
+blobstore.put_derived(derived_only, source_kind="transcript", derived_from=h1, produced_by="weave",
+                      render_version="weave/1", fmt="weave.render/1")
+try:
+    blobstore.ingest(derived_only, source_kind="transcript", source_id="c2", origin_ref={})
+    assert False, "raw bytes colliding with a derived blob must raise (symmetric guard)"
+except ValueError:
+    pass
+
+print("OK — ingest dedup, header data, meta-as-truth versioning, crash-orphan repair,")
+print("     derived primitive (content-addressed, lineage-tagged, TTL, out of TimeMap),")
+print("     byte-faithful \\r round-trip, symmetric raw/derived collision guard")
 print("data dir:", root)

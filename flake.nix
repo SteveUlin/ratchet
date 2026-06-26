@@ -14,17 +14,21 @@
           default = pkgs.mkShell { packages = [ pkgs.python3 ]; };
         });
 
-      # `nix run .#tap [-- ARGS]` — the transcript fetcher as a real command.
+      # `nix run .#<block> [-- ARGS]` — each composable block as a real command.
       apps = forAll (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in {
-          tap = {
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          block = name: {
             type = "app";
-            program = "${pkgs.writeShellScript "tap" ''
+            program = "${pkgs.writeShellScript name ''
               export PYTHONPATH=${self}
-              exec ${pkgs.python3}/bin/python -m ratchet.tap "$@"
+              exec ${pkgs.python3}/bin/python -m ratchet.${name} "$@"
             ''}";
           };
+        in {
+          tap = block "tap";      # fetch:  datastore → raw blob
+          weave = block "weave";  # render: raw blob → cleaned blob
+          chunk = block "chunk";  # window: cleaned blob → chunkset
         });
     };
 }
