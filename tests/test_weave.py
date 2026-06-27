@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-weave-")
 
-from ratchet import blobstore, config, weave  # noqa: E402
+from ratchet import blobstore, block, config, weave  # noqa: E402
 
 config.ensure_layout()
 
@@ -128,6 +128,86 @@ assert m["render_version"] == weave.RENDER_VERSION and m["tags"]["project"] == "
 assert [x["content_hash"] for x in blobstore.derived_for(raw_h)] == [ch], "lineage links cleaned→raw"
 cleaned_text = blobstore.get(ch)
 assert "\n\n".join(cleaned_text[turn.start:turn.end] for turn in doc.turns) == cleaned_text, "turns tile the cleaned blob"
+
+# --- 3b. the WeaveBlock path: --all/--source-id, idempotency, the processed marker --------
+
+# A streaming-progress probe so we assert the driver streams per item (not batched to the end).
+class _Probe:
+    def __init__(self): self.lines = []
+    def __call__(self, report, item, key, n_out, cost, *, dry_run=False, errored=False):
+        self.lines.append((key, n_out, cost, report.processed, report.skipped, dry_run, errored))
+
+wb = weave.WeaveBlock()
+assert wb.name == "weave" and wb.commits_per_item is True
+assert wb.params == (("render_version", weave.RENDER_VERSION),), "weave keys on render_version only"
+assert isinstance(wb, block.Block), "WeaveBlock satisfies the structural Block protocol"
+assert wb.key(raw_h) == raw_h, "the item key IS the raw blob hash"
+
+# first run over just this session: the cleaned blob is already materialized (§3 above), so the
+# put_derived is a content-addressed no-op → outputs==0, BUT the item still PROCESSES and gets a
+# marker (the done-set must record it so the re-run skips). Use a FRESH raw blob to also assert the
+# outputs==1-on-first-write case cleanly.
+fresh_blob = jsonl([rec("f0", None, "user", message=umsg("a brand new session")),
+                    rec("f1", "f0", "assistant", message=amsg("MF", {"type": "text", "text": "hi there"}))])
+fresh_raw, _ = blobstore.ingest(fresh_blob, source_kind="transcript", source_id="weave-block-fresh",
+                                origin_ref={"project": "p", "session_id": "weave-block-fresh"})
+assert next(blobstore.derived_for(fresh_raw), None) is None, "the fresh raw has no cleaned blob yet"
+
+probe = _Probe()
+r1 = block.run(wb, source_id="weave-block-fresh", progress=probe)
+assert (r1.examined, r1.processed, r1.skipped, r1.errored) == (1, 1, 0, 0), "first run processes one"
+assert r1.outputs == 1, "a never-materialized raw yields one cleaned blob"
+assert r1.cost_usd == 0.0 and not r1.stopped_on_budget, "weave is deterministic, cost 0"
+assert probe.lines == [(fresh_raw, 1, 0.0, 1, 0, False, False)], "progress streamed exactly one landed item"
+
+# the cleaned blob is real and content-addressed (the block path produces the SAME bytes as render)
+fresh_cleaned = weave.render(fresh_blob).cleaned_hash
+assert blobstore.has(fresh_cleaned) and blobstore.get_meta(fresh_cleaned)["derived_from"] == fresh_raw
+assert blobstore.blob_hash(blobstore.get(fresh_cleaned)) == fresh_cleaned, "byte-exact, content-addressed"
+
+# the processed marker exists and keys on (raw_hash, render_version) — the done-set entry
+done = block.done_index("weave", config.ensure_layout())
+assert (fresh_raw, weave.RENDER_VERSION) in done, "marker keys on (raw_hash, render_version)"
+markers = [d for d in blobstore.decisions_for(fresh_raw, verb="processed", stage="weave")]
+assert len(markers) == 1 and markers[0]["render_version"] == weave.RENDER_VERSION, "one weave marker for the raw"
+assert markers[0]["n_outputs"] == 1 and markers[0]["target"] == fresh_raw
+
+# re-run: the marker skips it — no re-render, no new marker (idempotent)
+probe2 = _Probe()
+r2 = block.run(wb, source_id="weave-block-fresh", progress=probe2)
+assert (r2.examined, r2.processed, r2.skipped, r2.outputs) == (1, 0, 1, 0), "re-run skips the done item"
+assert probe2.lines == [], "a skipped item lands no progress line"
+assert len(list(blobstore.decisions_for(fresh_raw, verb="processed", stage="weave"))) == 1, "no duplicate marker"
+
+# bumping render_version flips the done-key → the item re-processes (the re-render-on-logic-change
+# semantic weave lacked). Simulate by a block whose params carry a new version.
+class _Bumped(weave.WeaveBlock):
+    def __init__(self):
+        super().__init__()
+        self.params = (("render_version", "weave/TEST-BUMP"),)
+r3 = block.run(_Bumped(), source_id="weave-block-fresh", progress=None)
+assert (r3.processed, r3.skipped) == (1, 0), "a bumped render_version re-processes (new done-key)"
+assert (fresh_raw, "weave/TEST-BUMP") in block.done_index("weave", config.ensure_layout())
+
+# --all sweeps every transcript's LATEST raw; --dry-run lists without writing a marker
+r4 = block.run(weave.WeaveBlock(), dry_run=True, progress=None)
+assert r4.would_process >= 0 and r4.processed == 0, "dry-run processes nothing"
+# error isolation: a raw whose render path is forced to raise is counted errored, run continues
+class _Boom(weave.WeaveBlock):
+    def process(self, raw_hash, *, root, run_id):
+        if raw_hash == fresh_raw:
+            raise RuntimeError("boom")
+        return super().process(raw_hash, root=root, run_id=run_id)
+# bump the param so fresh_raw is NOT already-done (else it'd skip before process)
+boom = _Boom(); boom.params = (("render_version", "weave/BOOM"),)
+r5 = block.run(boom, progress=None)
+assert r5.errored >= 1, "the raising item is isolated as errored, run completes"
+assert (fresh_raw, "weave/BOOM") not in block.done_index("weave", config.ensure_layout()), \
+    "an errored item writes NO marker (retried next run)"
+
+print("OK — WeaveBlock: --all/--source-id, idempotent re-run (marker skip), render_version bump re-does,")
+print("     per-item marker keyed (raw_hash, render_version), streaming progress, dry-run, error isolation")
+
 
 print("OK — active-path (turn-split, parallel fold, rewind, compact stitch + file-order bridge,")
 print("     sidechain/noise drop), surrogate + reused-id hardening, render spans, cleaned-blob lineage")

@@ -19,7 +19,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import blobstore, config, weave
+from . import blobstore, block, config, weave
 
 CHUNKSET_FORMAT = "transcript.chunkset/1"  # source-kind . shape . PACKING version (bump if `_group` changes)
 DEFAULT_BUDGET = 12000   # chars per chunk (~3k tokens); a single larger turn stands alone
@@ -146,34 +146,130 @@ def materialize(raw_hash: str, *, budget: int = DEFAULT_BUDGET,
     return cs_hash, written, chunks
 
 
-# --- CLI: materialize a chunkset for a blob, show the chunks -------------------------------
+# --- the Block: chunk as a uniform stage (item = a cleaned blob → chunkset; ADR-0009) ------
 
-def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(prog="chunk",
-                                 description="Materialize a chunkset (pointers) for a transcript blob.")
-    ap.add_argument("hash", nargs="?", help="raw blob hash (else --source-id)")
-    ap.add_argument("--source-id", help="resolve the latest blob of this logical source")
-    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="chars per chunk")
-    ap.add_argument("--show", action="store_true", help="print each chunk's resolved text preview")
-    args = ap.parse_args(argv)
+class ChunkBlock:
+    """chunk as a `block.Block` — the batch/idempotent surface over `materialize`. Per ADR-0009 the
+    item is the CLEANED blob (its identity downstream); `process` maps cleaned → its raw parent via
+    `derived_from`, then calls the workhorse `materialize(raw)` (which re-weaves + builds + freezes
+    the chunkset, all idempotent/content-addressed). Deterministic, no LLM, cost 0.
 
-    h = args.hash or (blobstore.latest_version(args.source_id) if args.source_id else None)
-    if not h:
-        ap.error("give a blob hash or --source-id")
-    if not blobstore.has(h):
-        ap.error(f"no such blob: {h}")
+    Idempotency keys on (cleaned_hash, render_version, budget): the chunkset is a pure function of
+    those three. Bumping budget re-chunks (a distinct chunkset by content already; the marker now
+    records it too); bumping RENDER_VERSION re-renders upstream → a new cleaned blob → a new item."""
 
-    cs_hash, written, chunks = materialize(h, budget=args.budget)
+    name = "chunk"
+    commits_per_item = True
+    finalize = block.no_finalize
+    marker_extra = block.no_marker_extra
+
+    def __init__(self, budget: int = DEFAULT_BUDGET) -> None:
+        self.budget = budget
+        self.params: tuple[tuple[str, str], ...] = (
+            ("render_version", weave.RENDER_VERSION), ("budget", str(budget)))
+
+    def items(self, root: Path, *, source_id: str | None = None):
+        """Enumerate cleaned blobs to chunk. --all → every derived blob of the cleaned-doc format
+        (one scan of iter_meta). --source-id → walk the source's latest raw → its cleaned blob(s)."""
+        if source_id is not None:
+            raw = blobstore.latest_version(source_id, root)
+            if raw is None:
+                return
+            for m in blobstore.derived_for(raw, root, fmt=weave.RENDER_FORMAT):
+                yield m["content_hash"]
+            return
+        for m in blobstore.iter_meta(root):
+            if m.get("kind") == "derived" and m.get("format") == weave.RENDER_FORMAT:
+                yield m["content_hash"]
+
+    def key(self, cleaned_hash: str) -> str:
+        """The cleaned blob hash — the chunkset is a deterministic function of
+        (cleaned_hash, render_version, budget)."""
+        return cleaned_hash
+
+    def process(self, cleaned_hash: str, *, root: Path, run_id: str) -> tuple[int, float]:
+        """cleaned → raw (via derived_from) → materialize(raw, budget). 1 output if the chunkset was
+        newly written else 0; cost always 0. A TTL-reclaimed raw parent (can't happen — raw is kept
+        forever, ADR-0003) would surface here as a KeyError/FileNotFoundError the driver isolates."""
+        raw = blobstore.get_meta(cleaned_hash, root)["derived_from"]
+        _, written, _ = materialize(raw, budget=self.budget, root=root)
+        return (1 if written else 0, 0.0)
+
+
+# --- CLI: batch-materialize chunksets via the block, or inspect ONE blob's chunks ----------
+
+def _show(cs_hash: str, h: str, chunks: list[Chunk], full: bool) -> None:
+    """Single-blob inspector: the chunk table (and, with --show, each resolved-text preview)."""
     cleaned = chunks[0].cleaned_hash if chunks else "—"
-    print(f"raw {h[:12]} → cleaned {cleaned[:12]} → chunkset {cs_hash[:12]} "
-          f"({'wrote' if written else 'exists'}, {len(chunks)} chunks)")
+    print(f"raw {h[:12]} → cleaned {cleaned[:12]} → chunkset {cs_hash[:12]} ({len(chunks)} chunks)")
     for c in chunks:
         text = resolve(c)
         head = text.splitlines()[0] if text else ""
         print(f"  [{c.turn_start:>3}–{c.turn_end:<3}] seg{c.segment} "
               f"{c.byte_end - c.byte_start:>6}B {'/'.join(c.kinds):<18} {head[:60]}")
-        if args.show:
+        if full:
             print(weave._truncate(text, 400), "\n")
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(prog="chunk",
+                                 description="Materialize chunksets (pointers) for transcript blobs.")
+    ap.add_argument("hash", nargs="?", help="raw blob hash (else --source-id / --all)")
+    ap.add_argument("--source-id", help="this logical source's latest blob")
+    ap.add_argument("--all", action="store_true", help="chunk every cleaned blob in the store")
+    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="chars per chunk")
+    ap.add_argument("--show", action="store_true",
+                    help="print one blob's chunk table + resolved-text previews (no batch)")
+    # uniform block knobs (per ADR-0009)
+    ap.add_argument("--limit", type=int, help="cap items EXAMINED")
+    ap.add_argument("--dry-run", action="store_true", help="list what would chunk; do nothing")
+    ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
+    ap.add_argument("--max-usd", type=float, help="(no cost; inert — chunk never calls an LLM)")
+    args = ap.parse_args(argv)
+
+    progress = None if args.quiet else block._default_progress
+
+    # --show is the single-blob inspector path (like weave --render): materialize this ONE blob and
+    # print its chunks. A bare hash here is a RAW hash (as today), so materialize takes it directly.
+    if args.show:
+        h = args.hash or (blobstore.latest_version(args.source_id) if args.source_id else None)
+        if not h:
+            ap.error("give a blob hash or --source-id to --show")
+        if not blobstore.has(h):
+            ap.error(f"no such blob: {h}")
+        cs_hash, _, chunks = materialize(h, budget=args.budget)
+        _show(cs_hash, h, chunks, full=True)
+        return
+
+    if not (args.all or args.source_id or args.hash):
+        ap.error("give a blob hash, --source-id, or --all")
+
+    # The batch/idempotent path: drive the block over cleaned blobs. A bare hash is a RAW hash today;
+    # map it to its cleaned blob (materialize the raw first) so the single-item key is the cleaned
+    # hash, matching the block's item identity — then run a one-item block over that cleaned hash.
+    blk = ChunkBlock(budget=args.budget)
+    if args.hash and not args.all:
+        if not blobstore.has(args.hash):
+            ap.error(f"no such blob: {args.hash}")
+        cleaned_hash, _, _ = weave.materialize(args.hash)   # raw → cleaned (idempotent)
+        block.run(_OneCleaned(cleaned_hash, budget=args.budget), dry_run=args.dry_run,
+                  progress=progress)
+        return
+    block.run(blk, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
+              dry_run=args.dry_run, progress=progress)
+
+
+class _OneCleaned(ChunkBlock):
+    """A ChunkBlock scoped to a single cleaned hash — the bare-`chunk <raw-hash>` path (the raw is
+    mapped to its cleaned blob first), kept on the shared driver (done-skip + marker)."""
+
+    def __init__(self, cleaned_hash: str, *, budget: int = DEFAULT_BUDGET) -> None:
+        super().__init__(budget=budget)
+        self._cleaned_hash = cleaned_hash
+
+    def items(self, root, *, source_id=None):
+        if blobstore.has(self._cleaned_hash, root):
+            yield self._cleaned_hash
 
 
 if __name__ == "__main__":

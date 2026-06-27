@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-chunk-")
 
-from ratchet import blobstore, chunk, config, weave  # noqa: E402
+from ratchet import blobstore, block, chunk, config, weave  # noqa: E402
 
 config.ensure_layout()
 
@@ -111,6 +111,95 @@ assert all(chunk.resolve(c) == cdoc.text[cdoc.turns[c.turn_start].start:cdoc.tur
 chunk.materialize(raw_h, budget=80)
 assert chunk.chunkset_for(cleaned_hash, budget=600) != chunk.chunkset_for(cleaned_hash, budget=80), \
     "chunkset_for disambiguates by budget"
+
+# --- 2b. the ChunkBlock path: item = a cleaned blob, idempotency, the processed marker -----
+
+class _Probe:
+    def __init__(self): self.lines = []
+    def __call__(self, report, item, key, n_out, cost, *, dry_run=False, errored=False):
+        self.lines.append((key, n_out, cost, report.processed, report.skipped, dry_run, errored))
+
+# A FRESH session so the chunkset for budget 600 is not already materialized (§2 used budget 600
+# on chunk-syn already), letting us assert the outputs==1-on-first-write case cleanly.
+brecords = [rec("b0", None, "user", message={"role": "user", "content": "fresh chunk session"})]
+bparent = "b0"
+for i in range(4):
+    u = f"b{i+1}"
+    brecords.append(rec(u, bparent, "assistant", message=amsg(f"BM{i}", f"step {i}: " + ("data " * 50))))
+    bparent = u
+bblob = "\n".join(json.dumps(r) for r in brecords) + "\n"
+braw, _ = blobstore.ingest(bblob, source_kind="transcript", source_id="chunk-block-fresh",
+                           origin_ref={"project": "p", "session_id": "chunk-block-fresh"})
+
+cb = chunk.ChunkBlock(budget=600)
+assert cb.name == "chunk" and cb.commits_per_item is True
+assert cb.params == (("render_version", weave.RENDER_VERSION), ("budget", "600")), \
+    "chunk keys on (render_version, budget)"
+assert isinstance(cb, block.Block), "ChunkBlock satisfies the structural Block protocol"
+
+bdoc = weave.render(bblob)
+bcleaned = bdoc.cleaned_hash  # the item identity per ADR-0009 (cleaned blob, not raw)
+
+# the cleaned blob does not exist YET — chunk's items() over a source walks raw → derived(cleaned);
+# but process() materializes the raw (which builds the cleaned blob first), so the first run must
+# create both. To enumerate, the cleaned blob must be discoverable: weave it first (the real
+# pipeline runs weave before chunk). This mirrors production (weave --all, then chunk --all).
+weave.materialize(braw)
+assert blobstore.has(bcleaned), "weave produced the cleaned blob chunk enumerates"
+assert cb.key(bcleaned) == bcleaned, "the item key IS the cleaned blob hash"
+
+probe = _Probe()
+r1 = block.run(cb, source_id="chunk-block-fresh", progress=probe)
+assert (r1.examined, r1.processed, r1.skipped, r1.errored) == (1, 1, 0, 0), "first run chunks one cleaned blob"
+assert r1.outputs == 1, "a never-chunked cleaned blob yields one chunkset"
+assert r1.cost_usd == 0.0 and not r1.stopped_on_budget, "chunk is deterministic, cost 0"
+assert probe.lines == [(bcleaned, 1, 0.0, 1, 0, False, False)], "progress streamed exactly one landed item"
+
+# the chunkset is real, lineage cleaned→chunkset holds, and its pointers resolve byte-exact through
+# the block path (the block must preserve pointer correctness, not just write a marker)
+bcs = chunk.chunkset_for(bcleaned, budget=600)
+assert bcs is not None and blobstore.get_meta(bcs)["derived_from"] == bcleaned, "lineage cleaned→chunkset"
+for c in chunk.load(bcs):
+    assert chunk.resolve(c) == bdoc.text[bdoc.turns[c.turn_start].start:bdoc.turns[c.turn_end].end], \
+        "block-produced chunkset resolves byte-exact to its turn span (trust anchor intact)"
+
+# the processed marker keys on (cleaned_hash, render_version, budget)
+done = block.done_index("chunk", config.ensure_layout())
+assert (bcleaned, weave.RENDER_VERSION, "600") in done, "marker keys on (cleaned, render_version, budget)"
+markers = list(blobstore.decisions_for(bcleaned, verb="processed", stage="chunk"))
+assert len(markers) == 1 and markers[0]["budget"] == "600" and markers[0]["target"] == bcleaned
+assert markers[0]["n_outputs"] == 1
+
+# re-run skips (idempotent); no re-chunk, no duplicate marker
+probe2 = _Probe()
+r2 = block.run(cb, source_id="chunk-block-fresh", progress=probe2)
+assert (r2.examined, r2.processed, r2.skipped, r2.outputs) == (1, 0, 1, 0), "re-run skips the done item"
+assert probe2.lines == [], "a skipped item lands no progress line"
+assert len(list(blobstore.decisions_for(bcleaned, verb="processed", stage="chunk"))) == 1, "no duplicate marker"
+
+# a DIFFERENT budget is a distinct done-key → re-chunks the same cleaned blob (new chunkset + marker)
+cb80 = chunk.ChunkBlock(budget=80)
+r3 = block.run(cb80, source_id="chunk-block-fresh", progress=None)
+assert (r3.processed, r3.skipped) == (1, 0), "a different budget re-processes (distinct done-key)"
+assert (bcleaned, weave.RENDER_VERSION, "80") in block.done_index("chunk", config.ensure_layout())
+assert chunk.chunkset_for(bcleaned, budget=80) != bcs, "budget 80 is a distinct chunkset"
+
+# --all enumerates every cleaned blob; error isolation: a forced raise is counted, run continues
+class _Boom(chunk.ChunkBlock):
+    def process(self, cleaned_hash, *, root, run_id):
+        if cleaned_hash == bcleaned:
+            raise RuntimeError("boom")
+        return super().process(cleaned_hash, root=root, run_id=run_id)
+boom = _Boom(budget=600); boom.params = (("render_version", weave.RENDER_VERSION), ("budget", "BOOM"))
+r4 = block.run(boom, progress=None)
+assert r4.errored >= 1, "the raising item is isolated as errored, run completes"
+assert (bcleaned, weave.RENDER_VERSION, "BOOM") not in block.done_index("chunk", config.ensure_layout()), \
+    "an errored item writes NO marker (retried next run)"
+
+print("OK — ChunkBlock: item=cleaned blob, --all/--source-id, idempotent re-run (marker skip),")
+print("     budget bump re-chunks, marker keyed (cleaned, render_version, budget), byte-exact pointers,")
+print("     streaming progress, error isolation")
+
 
 print("OK — chunkset materialized as byte-offset pointers, never-split/segment-safe tiling,")
 print("     resolve-by-slice (no render), cleaned→chunkset lineage, idempotent, trust primitive,")

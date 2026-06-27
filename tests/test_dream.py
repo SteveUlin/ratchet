@@ -4,7 +4,15 @@ content and is reproducible; synthesis VERIFIES citations (a hallucinated cite i
 with none yields no takeaway); the trust chain holds (a takeaway's evidence resolves to real bytes);
 idempotency skips unchanged clusters; and EVOLUTION works — a re-run supersedes prior takeaways
 (grow/split/merge) and the fold resolves "now". A live smoke is gated behind RATCHET_LIVE_TEST=1.
-Run: `python tests/test_dream.py`."""
+
+dream is now a `block.Block` (ADR-0009) — the ONE block that commits per RUN, not per item: `items()`
+gathers + clusters, `process()` synthesizes a cluster but only RECORDS it (`commits_per_item=False`,
+returns (0, cost)), and `finalize()` runs the coverage-conditioned supersession + every takeaway-blob
+and `processed`-marker commit. §0 drives `block.run(DreamBlock(...))` directly to pin the new
+mechanics — per-run commit, streaming progress per cluster, the uniform-marker shape, error isolation,
+the budget stop's commit-so-far — and the rest assert through `dream.run` (the shim over the driver),
+so both the substrate path and the preserved observable contract are tested. Run:
+`python tests/test_dream.py`."""
 import json
 import os
 import re
@@ -15,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-dream-")
 
-from ratchet import blobstore, chunk, completer, config, dream, glean  # noqa: E402
+from ratchet import blobstore, block, chunk, completer, config, dream, glean  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 ROOT = config.ensure_layout()
@@ -113,6 +121,117 @@ for sid, line in [("dream-s1", JJ1), ("dream-s2", JJ1), ("dream-s3", NIX)]:
     glean.run([cs], GleanFake([JJ1, NIX]), model="fake")
 
 
+# --- 0. THE BLOCK SUBSTRATE: dream's per-RUN-commit mechanics (ADR-0009) ---------------------
+# Driven directly through block.run(DreamBlock(...)) — the new shape — in an ISOLATED data dir so it
+# never perturbs the shared corpus §1+ depend on. Pins the four things the finalize/commits_per_item
+# refactor MUST get right: (a) structural Block conformance + the commits_per_item=False flag;
+# (b) per-RUN commit — process commits NOTHING durable (no takeaway blob, no marker until finalize),
+# returns (0, cost); finalize lands every takeaway blob + a uniform block.write_processed marker LAST;
+# (c) streaming progress fires once per cluster as it is synthesized; (d) error isolation + the budget
+# stop's "commit what was synthesized before the stop" semantic.
+
+def _run_block_substrate_checks():
+    import re as _re
+    prev_dir = os.environ["RATCHET_DATA_DIR"]
+    iso = tempfile.mkdtemp(prefix="ratchet-test-dream-block-")
+    os.environ["RATCHET_DATA_DIR"] = iso
+    try:
+        iroot = config.ensure_layout()
+        # build two disjoint clusters (JJ ×2 sessions, NIX ×1) in the isolated store
+        for sid, line in [("b-s1", JJ1), ("b-s2", JJ1), ("b-s3", NIX)]:
+            glean.run([make_session(sid, line)], GleanFake([JJ1, NIX]), model="fake")
+
+        class _DreamFake:                          # cites every id it is given (real, verifiable)
+            def __init__(self): self.calls = 0
+            def __call__(self, system, user):
+                self.calls += 1
+                ids = _re.findall(r"- id (\w+):", user)
+                return Completion(text=json.dumps(
+                    {"title": "t", "why": "w", "cites": ids, "confidence": 0.8, "drop": False}),
+                    model="fake", cost_usd=0.01)
+
+        # (a) structural conformance + the flag
+        blk = dream.DreamBlock(_DreamFake(), model="fake")
+        assert isinstance(blk, block.Block), "DreamBlock structurally satisfies the Block protocol"
+        assert blk.name == "dream" and blk.commits_per_item is False, \
+            "dream is the one block that commits per RUN (commits_per_item=False), not per item"
+        assert blk.params == (("prompt_version", dream.PROMPT_VERSION), ("model", "fake")), \
+            "params are the ordered (prompt_version, model) idempotency suffix"
+
+        # (b) process records but commits NOTHING durable; finalize commits everything
+        clusters = list(blk.items(iroot))
+        assert len(clusters) == 2 and blk.n_clusters == 2, "items() gathers + clusters into 2 items"
+        n_out, cost = blk.process(clusters[0], root=iroot, run_id="rid-probe")
+        assert n_out == 0 and cost > 0, "process returns (0, cost): nothing durable yet, cost feeds the gate"
+        assert blobstore.latest_by_kind("takeaway", iroot) == {}, \
+            "no takeaway blob lands in process (commit waits for finalize)"
+        assert not list(blobstore.decisions_for(None, iroot, verb="processed", stage="dream")), \
+            "no processed marker is written in process (the all-or-nothing commits_per_item=False rule)"
+
+        # the streaming printer is exercised once per cluster (capture the per-item lines)
+        lines = []
+        def _probe(report, item, key, n, c, **kw):
+            lines.append((report.examined, report.processed, key))
+        blk2 = dream.DreamBlock(_DreamFake(), model="fake-b")
+        rep = block.run(blk2, progress=_probe, root=iroot)
+        assert rep.stage == "dream" and rep.examined == 2 and rep.processed == 2, \
+            "uniform block.Report: 2 clusters examined + processed"
+        assert rep.outputs == 0, "Report.outputs is 0 for dream — outputs land in finalize, not per item"
+        assert len(lines) == 2 and lines[0][0] == 1 and lines[1][0] == 2, \
+            "(c) progress streams once per cluster as it is synthesized (examined ticks 1 then 2)"
+        # finalize landed the takeaways + a uniform marker per cluster
+        assert len(blk2.takeaways) == 2, "finalize committed both takeaway blobs"
+        assert len(blobstore.latest_by_kind("takeaway", iroot)) == 2, "two takeaway sources now exist"
+        markers = list(blobstore.decisions_for(None, iroot, verb="processed", stage="dream"))
+        assert len(markers) == 2, "finalize wrote one processed marker per cluster, LAST"
+        mk = markers[0]
+        assert mk["params"] == [["prompt_version", dream.PROMPT_VERSION], ["model", "fake-b"]], \
+            "the marker carries the authoritative ordered params list block.done_index keys on"
+        assert mk["n_outputs"] == 1 and "event_ids" in mk and "dropped" in mk, \
+            "the marker is a uniform block.write_processed body + dream's event_ids/dropped audit (extra)"
+        # block.done_index and the dream.processed_index shim agree on the same keys
+        assert block.done_index("dream", iroot) == dream.processed_index(iroot), \
+            "dream.processed_index is now block.done_index — same (sig, prompt, model) keys"
+        # a re-run for the same (clusters, prompt, model) does zero LLM work (done-skip in the driver)
+        again = _DreamFake()
+        rep2 = block.run(dream.DreamBlock(again, model="fake-b"), progress=None, root=iroot)
+        assert again.calls == 0 and rep2.skipped == 2 and rep2.processed == 0, \
+            "the done-skip lives in the driver: an unchanged re-run synthesizes nothing"
+
+        # (d) error isolation + budget stop's commit-so-far. A completer that raises on the SECOND call:
+        class _DieOnSecond:
+            def __init__(self): self.calls = 0
+            def __call__(self, system, user):
+                self.calls += 1
+                if self.calls == 2:
+                    raise ValueError("boom on the 2nd cluster")
+                ids = _re.findall(r"- id (\w+):", user)
+                return Completion(text=json.dumps(
+                    {"title": "t", "why": "w", "cites": ids, "confidence": 0.8, "drop": False}),
+                    model="fake", cost_usd=0.01)
+        die = _DieOnSecond()
+        bb = dream.DreamBlock(die, model="fake-die")
+        rb = block.run(bb, progress=None, root=iroot)
+        assert rb.errored == 1 and rb.processed == 1, "one cluster errored (isolated), the other committed"
+        assert len(bb.takeaways) == 1, "finalize committed only the survivor — the errored cluster is absent"
+        die_done = {k for k in block.done_index("dream", iroot) if k[2] == "fake-die"}
+        assert len(die_done) == 1, "only the survivor got a marker; the errored cluster is retried next run"
+
+        # budget stop: max_usd=0.0 stops before any synthesis → finalize commits nothing (no orphans)
+        bgt = dream.DreamBlock(_DreamFake(), model="fake-bgt")
+        rg = block.run(bgt, max_usd=0.0, progress=None, root=iroot)
+        assert rg.stopped_on_budget and rg.processed == 0 and bgt.takeaways == [], \
+            "a budget stop before the first cluster commits nothing (commit-so-far == nothing)"
+    finally:
+        os.environ["RATCHET_DATA_DIR"] = prev_dir
+        config.ensure_layout()
+
+
+_run_block_substrate_checks()
+print("OK — block substrate: dream commits per RUN (process records, finalize commits); streaming")
+print("     progress per cluster; uniform marker (params list + event_ids/dropped); error + budget isolation.")
+
+
 # --- 1. gather: events resolve to their TRUSTED quote; sessions resolve via lineage ----------
 
 events = dream.gather_events(ROOT)
@@ -202,10 +321,21 @@ done_now = dream.processed_index()
 for t in rep.takeaways:
     assert (t["cluster_signature"], dream.PROMPT_VERSION, "fake") in done_now, \
         "a processed decision marks the synthesized cluster done for (cluster_signature, prompt, model)"
-dec = next(blobstore.decisions_for(sig0, verb="processed", stage="dream"))
+# pick THIS run's marker (model="fake") — sig0 may have markers under several model keys by now
+# (the drop/hallucinate runs above each marked their clusters done under their own model).
+dec = next(d for d in blobstore.decisions_for(sig0, verb="processed", stage="dream")
+           if d.get("model") == "fake")
 m_dec = blobstore.get_meta(dec["content_hash"])
 assert m_dec["source_kind"] == "decision" and m_dec["source_id"] == dec["content_hash"] and m_dec["prev"] is None, \
     "a decision blob: source_id == its own content_hash, never re-versioned (prev=None)"
+# the marker is the UNIFORM block.write_processed body now (ADR-0009): the ordered params LIST that
+# block.done_index keys on, plus dream's per-cluster audit (event_ids/dropped) carried as `extra`.
+assert dec["params"] == [["prompt_version", dream.PROMPT_VERSION], ["model", "fake"]], \
+    "the dream marker carries the authoritative ordered params list (the done-key, reorder-proof)"
+assert dec["n_outputs"] == 1 and dec["dropped"] is False, \
+    "a committed (non-dropped) cluster's marker records 1 output and dropped=False"
+assert "event_ids" in dec and dec["event_ids"] == sorted(dec["event_ids"]), \
+    "dream's event_ids/dropped per-cluster audit survives in the uniform marker's extra"
 
 before = DreamFake(cite="all")
 rerun = dream.run(before, model="fake")

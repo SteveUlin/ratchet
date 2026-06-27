@@ -15,11 +15,16 @@ span-derived, deterministic `event_id`, and each extraction is an immutable VERS
 `blob_hash(canonical-json(record))`). ADR-0004's objection — content-addressing a non-deterministic
 output is wrong — dissolves by splitting identity (`event_id`) from content: a re-extraction with a
 changed summary/markers is just a new version under the same `event_id`, `prev`-linked, latest wins;
-a byte-identical re-extraction no-ops. The processed-ledger and the `events/*.jsonl` stream retire:
-"already done" is a `processed` decision blob (verb='processed', target=chunkset_hash, keyed on
-(stage, prompt_version, model)); the to-do is a query, not a stored queue. Lineage stays
-content-addressed: every event embeds `cleaned_hash`, and `get_meta(cleaned_hash).derived_from`
-walks to the raw blob, thence datastore.
+a byte-identical re-extraction no-ops. Lineage stays content-addressed: every event embeds
+`cleaned_hash`, and `get_meta(cleaned_hash).derived_from` walks to the raw blob, thence datastore.
+
+THE UNIT OF WORK IS THE CHUNK, not the chunkset (ADR-0009). glean is a `block.Block`: `items()`
+explodes each target chunkset into its individual chunks, `process()` extracts ONE chunk (one LLM
+call), and the driver writes a `processed` marker PER CHUNK — including a filter-skipped chunk (0
+events, 0 cost), so the done-set stays exact. "Already done" is that per-chunk `processed` decision
+blob, keyed on `(chunk_key, prompt_version, model)`; the chunkset is now just the container `items()`
+enumerates chunks from. This makes Ctrl-C cheap: a giant session no longer loses every chunk's work
+on a transient outage or kill — only the in-flight chunk re-does (the heart of ADR-0009 fix #2).
 
 The LLM call is the only impure step, so it is injected as a `Completer`; the core (prompt build,
 parse, quote verification, span math, cost, idempotency) is pure and tested offline. The shipped
@@ -30,10 +35,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from . import blobstore, chunk, completer, config, weave
+from . import blobstore, block, chunk, completer, config, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
 PROMPT_VERSION = "glean/2"     # bump to re-extract over the same frozen chunks (idempotency key)
@@ -184,79 +189,7 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
     }
 
 
-# --- extract one chunkset -------------------------------------------------------------------
-
-@dataclass
-class ChunksetResult:
-    chunkset_hash: str
-    cleaned_hash: str
-    events: list[dict]
-    rejected: int          # candidates whose quote failed verification (hallucinated/short)
-    calls: int             # LLM calls made (chunks that passed the pre-filter)
-    cost_usd: float        # authoritative: includes no-signal calls (events amortize only theirs)
-    errored: int = 0       # chunks whose LLM call failed after retries (isolated, run continued)
-
-    @classmethod
-    def empty(cls, chunkset_hash: str) -> "ChunksetResult":
-        """Nothing to extract (no chunks) — legitimately done."""
-        return cls(chunkset_hash, "", [], 0, 0, 0.0)
-
-    @classmethod
-    def absent(cls, chunkset_hash: str) -> "ChunksetResult":
-        """The chunkset or its cleaned blob is missing (e.g. a TTL-reclaimed derived blob): a failed
-        chunkset (calls==0, errored>0) so `run` retries it rather than marking it done."""
-        return cls(chunkset_hash, "", [], 0, 0, 0.0, errored=1)
-
-
-def extract_chunkset(chunkset_hash: str, complete: Completer, *, model: str, run_id: str,
-                     root: Path | None = None) -> ChunksetResult:
-    """Filter then extract over one materialized chunkset (consume only — no re-fetch, no re-render).
-    Each surviving chunk is resolved by slicing the immutable cleaned blob, sent to the model, and
-    every returned quote is verified against those same bytes."""
-    try:
-        chunks = chunk.load(chunkset_hash, root)
-        if not chunks:
-            return ChunksetResult.empty(chunkset_hash)
-        cleaned_hash = chunks[0].cleaned_hash
-        cleaned_bytes = blobstore.get(cleaned_hash, root).encode("utf-8")
-    except FileNotFoundError:
-        return ChunksetResult.absent(chunkset_hash)
-
-    events: list[dict] = []
-    seen: set[str] = set()
-    rejected = calls = errored = 0
-    total_cost = 0.0
-    for ch in chunks:
-        text = cleaned_bytes[ch.byte_start:ch.byte_end].decode("utf-8")
-        if not has_signal_potential(text):
-            continue
-        prompt = _user_prompt(text, structural_cues(text))   # our code, outside the try (bugs surface)
-        try:
-            comp = complete(SYSTEM_PROMPT, prompt)
-        except Exception:
-            errored += 1                         # the injected seam is untrusted; isolate ANY failure
-            continue
-        calls += 1
-        call_cost = completer.cost_of(comp)
-        total_cost += call_cost
-        accepted = []
-        for cand in parse_candidates(comp.text):
-            span = verify(cand, ch, cleaned_bytes)   # trust check first ...
-            if span is None:
-                rejected += 1
-                continue
-            ev = build_event(cand, ch, span, model=model, run_id=run_id)   # ... then build the record
-            if ev["id"] not in seen:             # same span twice in a run → one event
-                seen.add(ev["id"])
-                accepted.append(ev)
-        share = round(call_cost / len(accepted), 8) if accepted else 0.0  # amortize over its events
-        for ev in accepted:
-            ev["producer"]["cost_usd"] = share
-        events.extend(accepted)
-    return ChunksetResult(chunkset_hash, cleaned_hash, events, rejected, calls, total_cost, errored)
-
-
-# --- the event store + processed marker (blobs + decisions, derived views) -------------------
+# --- the event store (blobs, derived views) -------------------------------------------------
 
 
 def load_events(root: Path | None = None) -> list[dict]:
@@ -266,42 +199,6 @@ def load_events(root: Path | None = None) -> list[dict]:
     log lines; consumers no longer dedup by id. Lineage stays content-addressed via `cleaned_hash`."""
     return [json.loads(blobstore.get(h, root))
             for h in blobstore.latest_by_kind("event", root).values()]
-
-
-def processed_index(root: Path | None = None) -> set[tuple[str, str, str]]:
-    """The done-set keyed by (chunkset_hash, prompt_version, model) — DERIVED from `processed`
-    decision blobs, no stored ledger (ADR-0007 §3/§5). One scan over glean's processed decisions; the
-    tuple shape is preserved verbatim so `run`'s `key in done` logic is unchanged. Bumping
-    PROMPT_VERSION or model changes the key (re-extract over the same frozen chunks)."""
-    return {(b["target"], b["prompt_version"], b["model"])
-            for b in blobstore.decisions_for(None, root, verb="processed", stage="glean")
-            if b.get("target") and "prompt_version" in b and "model" in b}
-
-
-# --- run: orchestrate over a set of chunksets -----------------------------------------------
-
-@dataclass
-class RunReport:
-    run_id: str
-    results: list[ChunksetResult] = field(default_factory=list)
-    skipped: int = 0           # chunksets already done for (prompt_version, model)
-    stopped_on_budget: bool = False
-
-    @property
-    def events(self) -> int:
-        return sum(len(r.events) for r in self.results)
-
-    @property
-    def rejected(self) -> int:
-        return sum(r.rejected for r in self.results)
-
-    @property
-    def cost_usd(self) -> float:
-        return sum(r.cost_usd for r in self.results)
-
-    @property
-    def errored(self) -> int:
-        return sum(r.errored for r in self.results)
 
 
 def event_content(ev: dict) -> dict:
@@ -335,61 +232,171 @@ def _ingest_event(ev: dict, *, model: str, run_id: str, chunkset_hash: str,
         root=root)
 
 
-def _write_processed(res: ChunksetResult, *, model: str, run_id: str, root: Path | None) -> None:
-    """Write the `processed` decision blob — the producer 'done' marker (ADR-0007 §3/§5), the commit
-    that folds the old idempotency ledger into the blob model. target = the chunkset input hash; the
-    (stage, prompt_version, model) key lives at the top level so `processed_index` rebuilds the same
-    tuple set. The body is UNIQUE per logical fact (target+verb+stage+prompt+model+run_id+at) so
-    blob_hash never conflates two distinct decisions; source_id == its own content_hash, prev=None
-    (decisions are never re-versioned). Informational stats stay for audit."""
-    at = config.now()
-    body = {
-        "verb": "processed", "target": res.chunkset_hash,
-        "stage": "glean", "prompt_version": PROMPT_VERSION, "model": model,
-        "run_id": run_id, "at": at,
-        "producer": {"stage": "glean", "model": model, "run_id": run_id, "at": at},
-        "cleaned_hash": res.cleaned_hash,
-        "n_events": len(res.events), "n_rejected": res.rejected, "n_errored": res.errored,
-        "n_calls": res.calls, "cost_usd": round(res.cost_usd, 8),
-    }
-    s = blobstore.canonical_json(body)
-    blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
-                     origin_ref={"stage": "glean", "run_id": run_id}, fetched_at=at, root=root)
+# --- the Block: glean as a uniform PER-CHUNK stage (ADR-0009) -------------------------------
+
+@dataclass
+class ChunkItem:
+    """One enumerated unit of work — a single chunk plus the chunkset it came from. The chunkset is
+    carried only for the event's lineage `origin_ref` (which chunkset produced this event); the unit
+    of persistence and idempotency is the CHUNK, not the chunkset (ADR-0009)."""
+    chunk: chunk.Chunk
+    chunkset_hash: str
+
+
+def chunk_key(ch: chunk.Chunk) -> str:
+    """A per-chunk deterministic id over the CHUNK boundary span, kept provably DISJOINT from
+    event/takeaway source-ids by a `:chunk` suffix (events key on the evidence span — a sub-span of
+    the chunk — so without the suffix a single-turn chunk whose sole evidence is the whole chunk would
+    collide). The chunkset pins the spans, so two runs over the same frozen chunkset produce the same
+    chunk keys → idempotency is exact. The done-key is `(chunk_key, PROMPT_VERSION, model)`."""
+    return hashlib.sha256(
+        f"{ch.cleaned_hash}:{ch.byte_start}:{ch.byte_end}:chunk".encode()).hexdigest()[:16]
+
+
+class GleanBlock:
+    """glean as a `block.Block` — the per-chunk LLM extract stage (ADR-0009). `items()` enumerates the
+    target chunksets exactly as the old `run` did, then EXPLODES each into its chunks; `process()`
+    extracts ONE chunk (one LLM call) and ingests its event blobs; the driver writes a `processed`
+    marker per chunk — including a filter-skipped chunk (0 events) — so the done-set is exact.
+
+    Idempotency keys on (chunk_key, PROMPT_VERSION, model). Per-chunk commit makes Ctrl-C cheap: a
+    kill mid-backfill keeps every committed chunk and re-does only the in-flight one. A raised
+    completer is isolated by the driver (counts `errored`, writes NO marker, retried next run).
+
+    The run-total audit fields the old `RunReport` exposed (events/rejected/calls/errored) accumulate
+    on the INSTANCE — the uniform `block.Report` stays stage-agnostic; the shim and tests read the
+    rich tallies here."""
+
+    name = "glean"
+    commits_per_item = True
+    finalize = block.no_finalize
+
+    def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
+                 targets: list[str] | None = None) -> None:
+        self.complete = complete
+        self.model = model
+        self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
+        self.params: tuple[tuple[str, str], ...] = (
+            ("prompt_version", PROMPT_VERSION), ("model", model))
+        # run-total tallies (instance-scoped; the Report stays uniform)
+        self.events = 0           # events ingested this run (== block.Report.outputs)
+        self.rejected = 0         # candidates whose quote failed verification
+        self.calls = 0            # LLM calls made (signal-bearing chunks; filter-skips don't call)
+        # per-chunk audit recorded for marker_extra (set in process, read by the driver immediately after)
+        self._last: dict = {}
+
+    # -- enumeration: target chunksets → their chunks ----------------------------------------
+
+    def _target_chunksets(self, root: Path, source_id: str | None) -> list[str]:
+        if self._targets is not None:
+            return self._targets
+        if source_id is not None:
+            cs = chunkset_for_source(source_id, root)
+            return [cs] if cs else []
+        return all_chunksets(root)
+
+    def items(self, root: Path, *, source_id: str | None = None):
+        """Enumerate every chunk of every target chunkset. The chunkset is the CONTAINER; the chunk is
+        the item. `chunk.load` returns the chunk pointers even if the cleaned blob is TTL-gone — that
+        absence surfaces in `process` when it slices the cleaned bytes (→ FileNotFoundError → errored
+        → retried), not here, so a missing blob is isolated per chunk, never a crashed enumeration."""
+        for cs in self._target_chunksets(root, source_id):
+            try:
+                chunks = chunk.load(cs, root)
+            except FileNotFoundError:
+                continue                          # the chunkset blob itself is gone — nothing to enumerate
+            for ch in chunks:
+                yield ChunkItem(chunk=ch, chunkset_hash=cs)
+
+    def key(self, item: ChunkItem) -> str:
+        return chunk_key(item.chunk)
+
+    # -- extract ONE chunk -------------------------------------------------------------------
+
+    def process(self, item: ChunkItem, *, root: Path, run_id: str) -> tuple[int, float]:
+        """Extract one chunk → ingest its event blobs → return (n_events, call_cost). A filter-skipped
+        chunk returns (0, 0.0) immediately — the driver still writes its 0-output marker, so the
+        done-set stays exact and next run skips it with no LLM call (ADR-0009). The trust anchor is
+        unchanged: every returned quote is verified against THIS chunk's own bytes before any event
+        exists. A raised completer (or an absent cleaned blob) propagates — the driver isolates it as
+        `errored`, writes no marker, and the chunk is retried next run (per-chunk retry, ADR-0009)."""
+        ch = item.chunk
+        cleaned_bytes = blobstore.get(ch.cleaned_hash, root).encode("utf-8")   # FileNotFoundError → errored
+        text = cleaned_bytes[ch.byte_start:ch.byte_end].decode("utf-8")
+        if not has_signal_potential(text):
+            self._last = {"n_rejected": 0, "n_calls": 0, "cleaned_hash": ch.cleaned_hash}
+            return (0, 0.0)                       # filter-skip: still marked done (0-output marker)
+
+        prompt = _user_prompt(text, structural_cues(text))   # our code; a bug here surfaces (not isolated)
+        comp = self.complete(SYSTEM_PROMPT, prompt)           # the sole LLM call; raising → driver errored
+        self.calls += 1
+        call_cost = completer.cost_of(comp)
+
+        accepted: list[dict] = []
+        seen: set[str] = set()
+        rejected = 0
+        for cand in parse_candidates(comp.text):
+            span = verify(cand, ch, cleaned_bytes)            # trust check first ...
+            if span is None:
+                rejected += 1
+                continue
+            ev = build_event(cand, ch, span, model=self.model, run_id=run_id)   # ... then the record
+            if ev["id"] not in seen:              # same span twice in this chunk → one event
+                seen.add(ev["id"])
+                accepted.append(ev)
+        share = round(call_cost / len(accepted), 8) if accepted else 0.0   # amortize over its events
+        for ev in accepted:                       # event blobs committed durable first (the driver writes
+            ev["producer"]["cost_usd"] = share    # the chunk's marker LAST, after this returns)
+            _ingest_event(ev, model=self.model, run_id=run_id,
+                          chunkset_hash=item.chunkset_hash, root=root)
+
+        self.events += len(accepted)
+        self.rejected += rejected
+        self._last = {"n_events": len(accepted), "n_rejected": rejected, "n_calls": 1,
+                      "cleaned_hash": ch.cleaned_hash}
+        return (len(accepted), call_cost)
+
+    def marker_extra(self, item: ChunkItem) -> dict:
+        """The per-chunk audit fields for the marker body (n_rejected/n_calls/cleaned_hash for THIS
+        chunk). The driver calls this right after `process`, so `self._last` is the just-processed
+        chunk's tally."""
+        return dict(self._last)
+
+
+# --- run: a thin compat shim over the block driver (keeps dream/review setup untouched) -----
+
+class _ShimReport:
+    """The shape the old `glean.run` returned, projected from a `block.Report` + the GleanBlock
+    instance's tallies. dream/review call `glean.run([cs], fake, model='fake')` purely to populate the
+    event store; they read `.events`/`.skipped`. The richer fields (`rejected`/`errored`/`cost_usd`/
+    `stopped_on_budget`) mirror the block so test_glean reads them off the same object the driver
+    populated (no parallel construction — the spec's anti-desync discipline)."""
+    def __init__(self, report: block.Report, blk: GleanBlock) -> None:
+        self.run_id = report.run_id
+        self.events = blk.events           # == report.outputs
+        self.skipped = report.skipped
+        self.rejected = blk.rejected
+        self.errored = report.errored
+        self.cost_usd = report.cost_usd
+        self.stopped_on_budget = report.stopped_on_budget
+        self.examined = report.examined
+        self.processed = report.processed
+        self.outputs = report.outputs
 
 
 def run(chunkset_hashes: list[str], complete: Completer, *, model: str = completer.DEFAULT_MODEL,
-        max_usd: float | None = None, root: Path | None = None) -> RunReport:
-    """Extract over chunksets idempotently. A chunkset with a `processed` decision for this
-    (prompt_version, model) is skipped with zero LLM calls. Each event blob is committed durable FIRST
-    (content then meta, crash-safe on its own), then the `processed` decision LAST (the commit marker)
-    — so a crash before the decision reprocesses and never leaves a false 'done'; a reprocessed event
-    re-appears as a new VERSION under the same span-derived `event_id` (a no-op if its bytes are
-    unchanged, else latest wins), so the duplicate is absorbed, not conflicting (ADR-0007 §5). A
-    chunkset whose *every* call failed (transient outage / absent blob) writes no decision and is
-    retried next run; a partially failed one is marked done (its errored chunks need a prompt/model
-    re-key to retry). A budget stop is a clean exit (the committed-so-far events + decisions persist)."""
-    root = config.ensure_layout(root)
-    rid = config.run_id()
-    done = processed_index(root)
-    report = RunReport(run_id=rid)
-
-    for cs in chunkset_hashes:
-        key = (cs, PROMPT_VERSION, model)
-        if key in done:
-            report.skipped += 1
-            continue
-        if max_usd is not None and report.cost_usd >= max_usd:
-            report.stopped_on_budget = True
-            break
-        res = extract_chunkset(cs, complete, model=model, run_id=rid, root=root)
-        for ev in res.events:                     # event blobs committed durable first ...
-            _ingest_event(ev, model=model, run_id=rid, chunkset_hash=cs, root=root)
-        report.results.append(res)
-        if res.calls == 0 and res.errored:        # nothing succeeded (transient outage / absent blob) —
-            continue                              # don't write a 'done' decision; retry the chunkset next run
-        _write_processed(res, model=model, run_id=rid, root=root)   # ... then the commit (chunkset is done)
-        done.add(key)
-    return report
+        max_usd: float | None = None, limit: int | None = None, root: Path | None = None,
+        progress=None) -> _ShimReport:
+    """Compat shim: extract over the chunks of the given chunksets via the per-chunk `block.run`
+    driver (ADR-0009). Builds a `GleanBlock` over an explicit chunkset list and returns a
+    `_ShimReport` projecting the uniform `block.Report` + the block's tallies — so existing callers
+    (dream/review test setup, the old `glean.run([cs], fake, model=...)` shape) keep working with
+    minimal change. Idempotency, per-chunk commit, error isolation, and the budget stop are the
+    driver's (now at CHUNK granularity, not chunkset). `progress` defaults to None (silent) so a
+    setup helper doesn't spew per-chunk lines."""
+    blk = GleanBlock(complete, model=model, targets=list(chunkset_hashes))
+    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
+    return _ShimReport(report, blk)
 
 
 # --- target resolution: glean consumes existing chunksets (never re-chunks) -----------------
@@ -422,14 +429,17 @@ def main(argv=None) -> None:
     ap.add_argument("--all", action="store_true", help="every materialized chunkset in the store")
     ap.add_argument("--model", default=completer.DEFAULT_MODEL,
                     help=f"claude model (default: {completer.DEFAULT_MODEL})")
-    ap.add_argument("--limit", type=int, help="cap chunksets examined this run (before the done-skip)")
-    ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
+    ap.add_argument("--limit", type=int,
+                    help="cap CHUNKS examined this run, before the done-skip (per-chunk now, ADR-0009)")
+    ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this (between chunks)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="list chunksets that would be processed (skips done); no LLM calls")
+                    help="list chunks that would be processed (skips done); no LLM calls")
+    ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
     args = ap.parse_args(argv)
 
+    # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
     if args.all:
-        targets = all_chunksets()
+        targets: list[str] = all_chunksets()
     elif args.source_id:
         cs = chunkset_for_source(args.source_id)
         if not cs:
@@ -441,28 +451,22 @@ def main(argv=None) -> None:
         targets = [args.hash]
     else:
         ap.error("give a chunkset hash, --source-id, or --all")
-    if args.limit is not None:
-        targets = targets[:args.limit]
-
-    if args.dry_run:
-        done = processed_index()
-        todo = [c for c in targets if (c, PROMPT_VERSION, args.model) not in done]
-        print(f"{len(targets)} chunkset(s), {len(todo)} to process "
-              f"({len(targets) - len(todo)} already done for {PROMPT_VERSION}/{args.model}):")
-        for c in todo:
-            print(f"  would glean {c[:12]}")
-        return
 
     complete = completer.make_cli_completer(args.model)
-    report = run(targets, complete, model=args.model, max_usd=args.max_usd)
-    for r in report.results:
-        err = f", {r.errored} errored" if r.errored else ""
-        print(f"  {r.chunkset_hash[:12]} → cleaned {r.cleaned_hash[:12]}: "
-              f"{len(r.events)} events, {r.rejected} rejected, {r.calls} calls{err}, ${r.cost_usd:.4f}")
+    blk = GleanBlock(complete, model=args.model, targets=targets)
+    progress = None if args.quiet else block._default_progress
+    report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
+                       progress=progress)
+
+    if args.dry_run:
+        print(f"\nglean-{report.run_id}: {report.would_process} chunk(s) would process "
+              f"({report.skipped} already done for {PROMPT_VERSION}/{args.model}).")
+        return
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
     errs = f", {report.errored} errored" if report.errored else ""
-    print(f"\nglean-{report.run_id}: {len(report.results)} processed, {report.skipped} skipped, "
-          f"{report.events} events, {report.rejected} rejected{errs}, ${report.cost_usd:.4f}{tail}")
+    print(f"\nglean-{report.run_id}: {report.examined} examined, {report.processed} done, "
+          f"{report.skipped} skipped, {report.outputs} events, {blk.rejected} rejected{errs}, "
+          f"${report.cost_usd:.4f}{tail}")
 
 
 if __name__ == "__main__":

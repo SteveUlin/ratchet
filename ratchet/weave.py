@@ -28,7 +28,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import blobstore, config
+from . import blobstore, block, config
 
 RENDER_VERSION = "weave/1"             # bump when render logic changes — pins which logic made a span
 RENDER_FORMAT = "transcript.render/1"  # the cleaned-blob artifact's shape (source-kind . shape . ver)
@@ -326,38 +326,120 @@ def materialize(raw_hash: str, *, expires_at: str | None = None,
     return h, written, doc
 
 
-# --- CLI: inspect a blob (turn summary / full render), or materialize the cleaned doc ------
+# --- the Block: weave as a uniform stage (item = a raw blob → cleaned blob; ADR-0009) ------
 
-def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(prog="weave",
-                                 description="Render a transcript blob into one cleaned document.")
-    ap.add_argument("hash", nargs="?", help="raw blob hash (else --source-id)")
-    ap.add_argument("--source-id", help="resolve the latest blob of this logical source")
-    ap.add_argument("--render", action="store_true", help="print the full cleaned document")
-    ap.add_argument("--materialize", action="store_true",
-                    help="freeze the cleaned doc as a derived blob")
-    args = ap.parse_args(argv)
+class WeaveBlock:
+    """weave as a `block.Block` — the batch/idempotent surface over `materialize`. The item is a raw
+    transcript blob; `process` is `materialize` (deterministic, no LLM, cost 0). Idempotency keys on
+    (raw_hash, render_version): the cleaned blob is a pure function of those two, so bumping
+    RENDER_VERSION re-renders every raw blob (a new cleaned blob + a new marker) — the "re-render on
+    logic change" weave lacked when it relied purely on content-addressing.
 
-    h = args.hash or (blobstore.latest_version(args.source_id) if args.source_id else None)
-    if not h:
-        ap.error("give a blob hash or --source-id")
-    if not blobstore.has(h):
-        ap.error(f"no such blob: {h}")
+    `materialize` stays the public single-source workhorse (CLI/chunk reuse it); this just wraps it in
+    the shared driver for `--all` + streaming progress + the done-skip."""
 
-    if args.materialize:
-        ch, written, _ = materialize(h)
-        print(f"{'wrote' if written else 'exists'} cleaned {ch[:12]}  (from raw {h[:12]})")
-        return
+    name = "weave"
+    commits_per_item = True
+    finalize = block.no_finalize             # no cross-item dependency
+    marker_extra = block.no_marker_extra     # no per-item audit fields
+
+    def __init__(self) -> None:
+        # render_version is read at construction so a single instance pins one logic version per run.
+        self.params: tuple[tuple[str, str], ...] = (("render_version", RENDER_VERSION),)
+
+    def items(self, root: Path, *, source_id: str | None = None):
+        """Enumerate raw transcript blobs to render. --all → every transcript source's LATEST raw
+        version (a superseded snapshot need not be re-rendered: it is content-addressed and its
+        cleaned blob already exists if ever rendered). --source-id → just that session's latest."""
+        if source_id is not None:
+            h = blobstore.latest_version(source_id, root)
+            if h is not None:
+                yield h
+            return
+        yield from blobstore.latest_by_kind("transcript", root).values()
+
+    def key(self, raw_hash: str) -> str:
+        """The raw blob hash — content-addressed and stable; the cleaned blob is a deterministic
+        function of (raw_hash, render_version), so the marker keys on it."""
+        return raw_hash
+
+    def process(self, raw_hash: str, *, root: Path, run_id: str) -> tuple[int, float]:
+        """Materialize the cleaned blob (idempotent content-addressed put_derived, itself crash-safe
+        content-then-meta). 1 output if newly written, 0 if it already existed; cost always 0."""
+        _, written, _ = materialize(raw_hash, root=root)
+        return (1 if written else 0, 0.0)
+
+
+# --- CLI: inspect ONE blob (turn summary / full render), or batch-materialize via the block -
+
+def _inspect(h: str) -> None:
+    """Read-only single-blob view: the default turn summary (or --render's full doc)."""
     doc = render_blob(h)
-    if args.render:
-        print(doc.text)
-        return
     segs = sorted({t.segment for t in doc.turns})
     print(f"raw {h[:12]}  cleaned {doc.cleaned_hash[:12]}  {len(doc.turns)} turns  "
           f"{len(doc.text)} chars  segments {segs}")
     for t in doc.turns[:40]:
         head = doc.text[t.start:t.end].splitlines()[0] if t.end > t.start else ""
         print(f"  [{t.index:>3}] seg{t.segment} {t.end - t.start:>6}c {_truncate(head, 70)}")
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(prog="weave",
+                                 description="Render transcript blobs into cleaned documents.")
+    ap.add_argument("hash", nargs="?", help="raw blob hash (else --source-id / --all)")
+    ap.add_argument("--source-id", help="this logical source's latest blob")
+    ap.add_argument("--all", action="store_true", help="materialize every transcript's latest raw")
+    ap.add_argument("--render", action="store_true", help="print the full cleaned document (one blob)")
+    ap.add_argument("--inspect", action="store_true",
+                    help="print the turn summary of one blob (no materialize)")
+    # uniform block knobs (per ADR-0009)
+    ap.add_argument("--limit", type=int, help="cap items EXAMINED")
+    ap.add_argument("--dry-run", action="store_true", help="list what would materialize; do nothing")
+    ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
+    ap.add_argument("--max-usd", type=float, help="(no cost; inert — weave never calls an LLM)")
+    args = ap.parse_args(argv)
+
+    # READ-ONLY inspectors of ONE blob stay a separate path: --render (full doc) / --inspect (turn
+    # summary). Without them, a bare `weave <hash>` / `weave --source-id <id>` / `weave --all`
+    # MATERIALIZES (matching chunk/glean/dream where the bare invocation does the work).
+    if args.render or args.inspect:
+        h = args.hash or (blobstore.latest_version(args.source_id) if args.source_id else None)
+        if not h:
+            ap.error("give a blob hash or --source-id to inspect")
+        if not blobstore.has(h):
+            ap.error(f"no such blob: {h}")
+        if args.render:
+            print(render_blob(h).text)
+        else:
+            _inspect(h)
+        return
+
+    if not (args.all or args.source_id or args.hash):
+        ap.error("give a blob hash, --source-id, or --all")
+
+    # The batch/idempotent path: drive the block. A bare hash scopes to that one raw blob (a one-item
+    # block so the driver's done-skip + marker still apply — no bespoke materialize that bypasses them).
+    progress = None if args.quiet else block._default_progress
+    if args.hash and not args.all:
+        if not blobstore.has(args.hash):
+            ap.error(f"no such blob: {args.hash}")
+        block.run(_OneRaw(args.hash), dry_run=args.dry_run, progress=progress)
+        return
+    block.run(WeaveBlock(), source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
+              dry_run=args.dry_run, progress=progress)
+
+
+class _OneRaw(WeaveBlock):
+    """A WeaveBlock scoped to a single raw hash — the bare-`weave <hash>` path, kept on the shared
+    driver (done-skip + marker) rather than a direct materialize call that would bypass them."""
+
+    def __init__(self, raw_hash: str) -> None:
+        super().__init__()
+        self._raw_hash = raw_hash
+
+    def items(self, root, *, source_id=None):
+        if blobstore.has(self._raw_hash, root):
+            yield self._raw_hash
 
 
 if __name__ == "__main__":

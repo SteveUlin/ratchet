@@ -43,6 +43,16 @@ Idempotency mirrors glean: a `processed` decision is keyed by (cluster_signature
 model). An unchanged cluster is skipped; a changed one (new signature) re-synthesizes. Bump
 PROMPT_VERSION or the model to re-synthesize the same groupings with a sharper prompt.
 
+dream is a `block.Block` (ADR-0009) — but THE one block that commits per RUN, not per item. Its
+`items()` runs the global deterministic prelude (gather + cluster) and yields one cluster per item;
+`process()` synthesizes a cluster (one LLM call) but RECORDS it instead of committing — because the
+coverage-conditioned supersession needs the whole run's emitted takeaways before any `supersedes` is
+known. So `commits_per_item=False` and `finalize()` does every takeaway-blob + marker commit after
+the run's coverage is settled. The done-set / commit ordering is `block.done_index` /
+`block.write_processed`, generalized from this stage's old per-cluster ledger; the observable run
+contract (cluster → synthesize → coverage-supersede → commit, all per-run) is UNCHANGED. `dream.run`
+survives as a thin shim returning the old `RunReport` shape so callers stay untouched.
+
 The LLM call is injected as a `Completer`; everything else (clustering, parsing, citation
 verification, supersede linking, the fold) is pure and tested offline with a fake.
 """
@@ -57,7 +67,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import blobstore, completer, config
+from . import blobstore, block, completer, config
 from .completer import Completer
 from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dream carries it upward
 
@@ -401,29 +411,6 @@ def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) ->
         root=root)
 
 
-def _write_processed(sig: str, *, model: str, run_id: str, event_ids: list[str], dropped: bool,
-                     cost_usd: float, root: Path | None) -> None:
-    """Write the `processed` decision blob — dream's producer 'done' marker (ADR-0007 §3/§5), the
-    commit that folds the old idempotency ledger into the blob model. target = the cluster_signature
-    (the stable per-cluster input id — pinned; do NOT fork a separate event-set hash); the
-    (stage, prompt_version, model) key lives at the top level so `processed_index` rebuilds the same
-    (cluster_signature, prompt_version, model) tuple set. The body is UNIQUE per logical fact
-    (target+verb+stage+prompt+model+run_id+at) so blob_hash never conflates two distinct decisions;
-    source_id == its own content_hash, prev=None (decisions are never re-versioned). The per-cluster
-    audit (event_ids/dropped/cost) stays for forensics."""
-    at = config.now()
-    body = {
-        "verb": "processed", "target": sig,
-        "stage": "dream", "prompt_version": PROMPT_VERSION, "model": model,
-        "run_id": run_id, "at": at,
-        "producer": {"stage": "dream", "model": model, "run_id": run_id, "at": at},
-        "event_ids": event_ids, "dropped": dropped, "cost_usd": round(cost_usd, 8),
-    }
-    s = blobstore.canonical_json(body)
-    blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
-                     origin_ref={"stage": "dream", "run_id": run_id}, fetched_at=at, root=root)
-
-
 def load_takeaways(root: Path | None = None) -> list[dict]:
     """Every committed takeaway VERSION across all sources (ADR-0007). Raw — every snapshot, not just
     the latest; `current_takeaways` folds re-synthesis (latest per source) and supersession. Used where
@@ -442,15 +429,14 @@ def load_takeaways(root: Path | None = None) -> list[dict]:
     return out
 
 
-def processed_index(root: Path | None = None) -> set[tuple[str, str, str]]:
-    """The done-set keyed by (cluster_signature, prompt_version, model) — DERIVED from `processed`
-    decision blobs, no stored ledger (ADR-0007 §3/§5). One scan over dream's processed decisions; the
-    tuple shape is preserved verbatim so `run`'s `key in done` logic is unchanged. A re-run skips a
+def processed_index(root: Path | None = None) -> set[tuple]:
+    """The done-set keyed by (cluster_signature, prompt_version, model) — now `block.done_index`
+    (ADR-0009). dream's params are `((prompt_version, PV), (model, model))`, so the generic
+    `(target, *param-values)` key IS `(cluster_signature, prompt_version, model)` — the tuple shape is
+    preserved verbatim, so callers that read `dream.processed_index()` are unchanged. A re-run skips a
     cluster whose membership is unchanged; a changed cluster (new signature) re-synthesizes; bumping
-    PROMPT_VERSION or model changes the key."""
-    return {(b["target"], b["prompt_version"], b["model"])
-            for b in blobstore.decisions_for(None, root, verb="processed", stage="dream")
-            if b.get("target") and "prompt_version" in b and "model" in b}
+    PROMPT_VERSION or model flips the key."""
+    return block.done_index("dream", config.ensure_layout(root))
 
 
 def current_takeaways(root: Path | None = None) -> list[dict]:
@@ -475,10 +461,147 @@ def current_takeaways(root: Path | None = None) -> list[dict]:
     return [t for tid, t in by_id.items() if tid not in superseded]
 
 
-# --- run: cluster the whole event pile, synthesize the changed clusters --------------------------
+# --- the Block: dream as the per-RUN-commit stage (ADR-0009's one finalize exception) ------------
+
+@dataclass
+class _Pending:
+    """One synthesized-but-not-yet-committed cluster, recorded by `process` for `finalize`. dream is
+    the lone `commits_per_item=False` block: synthesis streams (per cluster) but commit waits for the
+    whole run's coverage. `cl` is kept so the marker's `event_ids` audit can list the cluster's full
+    membership; `tk` is None when the model dropped/cited-nothing (the cluster is still marked done)."""
+    cl: list[ResolvedEvent]
+    sig: str
+    tk: dict | None
+    cost: float
+
+
+class DreamBlock:
+    """dream as a `block.Block` — the synthesis stage, and the ONE block that commits per RUN, not per
+    item (ADR-0009). The coverage-conditioned supersession needs the whole run's emitted takeaways
+    before any `supersedes` is known, so `commits_per_item=False`: `process` synthesizes a cluster
+    (one LLM call) but only RECORDS it; `finalize` does the supersession pass + every takeaway-blob and
+    marker commit. The flag is all-or-nothing (block.py docstring): nothing durable is written in
+    `process`, everything in `finalize`.
+
+    `items()` runs the global deterministic prelude once — gather (re-anchoring every event to its
+    trusted quote) + cluster (the whole pile, recomputed each run) — and yields one cluster per item;
+    `source_id` is ignored (dream is a global pass). The `min_events` floor and the cluster/event tallies
+    land on the INSTANCE so the shim can surface the old `RunReport` fields; the uniform `block.Report`
+    stays stage-agnostic."""
+
+    name = "dream"
+    commits_per_item = False                       # THE exception: commit per run, in finalize
+    marker_extra = block.no_marker_extra           # never called (the driver writes no per-item marker
+                                                   # when commits_per_item=False) — declared for Block
+                                                   # conformance; dream's audit rides finalize's marker
+
+    def __init__(self, complete: Completer, *, model: str = DREAM_MODEL,
+                 threshold: float = SIM_THRESHOLD, min_confidence: float = 0.0,
+                 min_events: int = 0) -> None:
+        self.complete = complete
+        self.model = model
+        self.threshold = threshold
+        self.min_confidence = min_confidence
+        self.min_events = min_events
+        self.params: tuple[tuple[str, str], ...] = (
+            ("prompt_version", PROMPT_VERSION), ("model", model))
+        # the rich RunReport-shaped state the shim/CLI read; populated across items/process/finalize.
+        self.takeaways: list[dict] = []
+        self.n_events = 0
+        self.n_clusters = 0
+        self.dropped = 0                           # clusters the model judged noise (no takeaway)
+        self.below_threshold = False               # fewer than min_events → did nothing
+        # the global prelude's products, computed once in items() and reused by finalize.
+        self._concepts: list[dict] = []
+        self._known_ids: set[str] = set()
+        self._pending: list[_Pending] = []         # synthesized clusters awaiting the coverage commit
+
+    # -- enumeration: the global gather + cluster (recomputed each run) -----------------------
+
+    def items(self, root: Path, *, source_id: str | None = None):
+        """The global, deterministic prelude — yield one cluster per item. dream is a whole-pile pass,
+        so `source_id` is ignored. Below the `min_events` floor it yields NOTHING (and flags
+        `below_threshold`); else it clusters the whole event pile and yields each cluster. `concepts`
+        is loaded here (once) for `process` to reason against, and the event/cluster tallies land on the
+        instance for the Report."""
+        self._concepts = load_concepts(root)
+        self._known_ids = {c["id"] for c in self._concepts}   # all str (load_concepts guarantees it)
+        events = gather_events(root, min_confidence=self.min_confidence)
+        self.n_events = len(events)
+        if len(events) < self.min_events:          # a floor below which dreaming is pointless (not a
+            self.below_threshold = True            # change-detector — the done-skip handles unchanged work)
+            return
+        clusters = cluster(events, threshold=self.threshold)
+        self.n_clusters = len(clusters)
+        yield from clusters
+
+    def key(self, cl: list[ResolvedEvent]) -> str:
+        return cluster_signature(cl)
+
+    # -- synthesize ONE cluster — record, do NOT commit --------------------------------------
+
+    def process(self, cl: list[ResolvedEvent], *, root: Path, run_id: str) -> tuple[int, float]:
+        """Synthesize one cluster (one LLM call) and RECORD it — nothing durable is committed here
+        (commits_per_item=False). Returns (0, cost): 0 outputs because no blob lands yet; `cost` feeds
+        the driver's `--max-usd` gate (a budget stop simply means finalize commits the clusters
+        synthesized before the stop). A raised completer propagates — the driver isolates it as
+        `errored`, the cluster is absent from `_pending`, retried next run."""
+        tk, cost = synthesize_cluster(cl, self.complete, self._concepts,
+                                      known_concept_ids=self._known_ids,
+                                      model=self.model, run_id=run_id)
+        self._pending.append(_Pending(cl=cl, sig=cluster_signature(cl), tk=tk, cost=cost))
+        return (0, cost)
+
+    # -- finalize: coverage-conditioned supersession, then commit per cluster -----------------
+
+    def finalize(self, committed: list[block.Done], *, root: Path, run_id: str) -> None:
+        """The per-run commit — today's run() steps 2+3, lifted out of the loop (ADR-0009). The
+        `committed` list the driver hands us is unused: dream tracks its own `_pending` (it commits
+        nothing per item, so the driver's record is empty). Two steps:
+
+          2. COVERAGE-CONDITIONED SUPERSESSION (the orphan fix, preserved EXACTLY): a prior current
+             takeaway is eligible to fold out ONLY if ALL its events are re-covered by takeaways
+             emitted this run — so a dropped/errored split-child can never orphan its parent's events;
+             each emitted takeaway then supersedes every eligible prior it shares an event with
+             (`- {tk id}` guards a same-id re-synthesis from superseding itself).
+          3. COMMIT (crash-ordering preserved): each takeaway blob durable FIRST (content then meta),
+             then its cluster's `processed` marker LAST — a crash before a marker re-processes that
+             cluster; the re-synthesis re-appears as a new VERSION of the same cluster_signature (a
+             no-op if bytes unchanged, else latest wins). model-bump-replaces is free: a bumped model
+             is a new done-key, `_ingest_takeaway` writes a new version under the same source, and
+             `current_takeaways` folds to the newest."""
+        emitted = [p.tk for p in self._pending if p.tk is not None]
+        coverage = set().union(*(set(tk["member_events"]) for tk in emitted)) if emitted else set()
+        eligible = {p["id"]: set(p.get("member_events") or [])
+                    for p in current_takeaways(root)}
+        eligible = {pid: pev for pid, pev in eligible.items() if pev and pev <= coverage}
+        for tk in emitted:
+            ev = set(tk["member_events"])
+            tk["supersedes"] = sorted({pid for pid, pev in eligible.items() if pev & ev} - {tk["id"]})
+
+        for p in self._pending:
+            if p.tk is not None:
+                _ingest_takeaway(p.tk, model=self.model, run_id=run_id, root=root)   # durable first ...
+                self.takeaways.append(p.tk)
+            else:
+                self.dropped += 1
+            # ... then the cluster's commit marker LAST. event_ids/dropped/cost are the per-cluster
+            # audit (the old _write_processed body); block.write_processed appends the uniform fields.
+            block.write_processed(
+                "dream", p.sig, self.params, n_outputs=1 if p.tk is not None else 0,
+                cost_usd=p.cost, run_id=run_id, root=root,
+                extra={"event_ids": sorted(rv.id for rv in p.cl), "dropped": p.tk is None})
+
+
+# --- run: a thin compat shim over the block driver (keeps callers' RunReport reads untouched) -----
 
 @dataclass
 class RunReport:
+    """The shape the old `dream.run` returned, projected from a `block.Report` + the DreamBlock
+    instance's tallies. Callers (the CLI, test_dream/test_review setup) read `.takeaways`/`.n_clusters`/
+    `.skipped`/`.dropped`/`.errored`/`.cost_usd`/`.below_threshold`/`.stopped_on_budget`/`.min_events`.
+    Built from the SAME objects the driver populated (no parallel construction — the anti-desync
+    discipline): the uniform fields come from the block.Report, the rich ones off the instance."""
     run_id: str
     n_events: int = 0
     n_clusters: int = 0
@@ -494,79 +617,26 @@ class RunReport:
 
 def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM_THRESHOLD,
         min_confidence: float = 0.0, min_events: int = 0, max_usd: float | None = None,
-        root: Path | None = None) -> RunReport:
-    """Synthesize takeaways over the whole event pile, idempotently (ADR-0006). Clusters globally
-    (cheap, deterministic), then for each cluster not already done for this (prompt_version, model):
-    one LLM call. Supersession is **coverage-conditioned**: a prior current takeaway is folded out
-    only when ALL its events are re-covered by takeaways COMMITTED this run — so a dropped/errored
-    split-child can never orphan its parent's events — and a new takeaway supersedes EVERY eligible
-    prior it shares an event with. That needs the whole run's coverage, so synthesis completes before
-    any commit (a crash mid-run re-does the run — idempotent — trading crash-cost for correctness).
+        limit: int | None = None, root: Path | None = None, progress=None) -> RunReport:
+    """Synthesize takeaways over the whole event pile, idempotently (ADR-0006) — now a thin shim over
+    the per-run-commit `DreamBlock` + `block.run` (ADR-0009). The observable contract is UNCHANGED:
+    cluster globally (cheap, deterministic), one LLM call per not-yet-done cluster, coverage-conditioned
+    supersession over the whole run's emitted takeaways, then commit (takeaway blob first, processed
+    marker last). The driver streams synthesis progress per cluster and isolates a failing call
+    (counts `errored`, the cluster retries next run); the supersession + commit live in `finalize`.
 
-    Crash-safety mirrors glean: each takeaway blob durable first (content then meta, crash-safe on its
-    own), the processed DECISION last; a cluster whose call FAILED writes no decision (retried next
-    run); a cluster the model dropped IS marked done (noise not re-synthesized). A crash before the
-    decision re-processes; the re-synthesis re-appears as a new VERSION of the same cluster_signature
-    (a no-op if its bytes are unchanged, else latest wins), so the duplicate is absorbed (ADR-0007
-    §5)."""
-    root = config.ensure_layout(root)
-    rid = config.run_id()
-    done = processed_index(root)
-    concepts = load_concepts(root)
-    known_ids = {c["id"] for c in concepts}        # all str (load_concepts guarantees it) → set-safe
-    events = gather_events(root, min_confidence=min_confidence)
-    report = RunReport(run_id=rid, n_events=len(events), min_events=min_events)
-    if len(events) < min_events:                   # a floor below which dreaming is pointless (not a
-        report.below_threshold = True              # change-detector — the ledger skip handles unchanged work)
-        return report
-
-    clusters = cluster(events, threshold=threshold)
-    report.n_clusters = len(clusters)
-
-    # 1. synthesize every not-yet-done cluster. No supersede edges yet — those need the run's full
-    #    coverage (step 2). Collect (cluster, signature, takeaway-or-None, cost) for what we processed.
-    processed: list[tuple[list[ResolvedEvent], str, dict | None, float]] = []
-    for cl in clusters:
-        sig = cluster_signature(cl)
-        if (sig, PROMPT_VERSION, model) in done:
-            report.skipped += 1
-            continue
-        if max_usd is not None and report.cost_usd >= max_usd:
-            report.stopped_on_budget = True
-            break
-        try:
-            tk, cost = synthesize_cluster(cl, complete, concepts, known_concept_ids=known_ids,
-                                          model=model, run_id=rid)
-        except Exception:
-            report.errored += 1                    # the injected seam is untrusted; isolate ANY failure
-            continue
-        report.cost_usd += cost
-        processed.append((cl, sig, tk, cost))
-
-    # 2. coverage-conditioned supersession. A prior current takeaway is eligible to be folded out only
-    #    if ALL its events landed in a takeaway COMMITTED this run; each committed takeaway then
-    #    supersedes every eligible prior it shares an event with (`- {tk id}` guards a same-id re-synth).
-    emitted = [tk for _, _, tk, _ in processed if tk is not None]
-    coverage = set().union(*(set(tk["member_events"]) for tk in emitted)) if emitted else set()
-    eligible = {p["id"]: set(p.get("member_events") or [])
-                for p in current_takeaways(root)}
-    eligible = {pid: pev for pid, pev in eligible.items() if pev and pev <= coverage}
-    for tk in emitted:
-        ev = set(tk["member_events"])
-        tk["supersedes"] = sorted({pid for pid, pev in eligible.items() if pev & ev} - {tk["id"]})
-
-    # 3. commit: each takeaway blob durable first (content then meta), then its cluster's processed
-    #    decision last — the commit ordering that makes a crash re-process, never leave a false 'done'
-    #    (mirrors glean). A re-synthesis re-appears as a new VERSION of the same cluster_signature.
-    for cl, sig, tk, cost in processed:
-        if tk is not None:
-            _ingest_takeaway(tk, model=model, run_id=rid, root=root)   # durable first ...
-            report.takeaways.append(tk)
-        else:
-            report.dropped += 1
-        _write_processed(sig, model=model, run_id=rid, event_ids=sorted(rv.id for rv in cl),
-                         dropped=tk is None, cost_usd=cost, root=root)   # ... then the commit marker
-    return report
+    Returns a `RunReport` built from the SAME `block.Report` + `DreamBlock` instance the driver
+    populated, so existing callers' field reads are untouched. `progress` defaults to None (silent) so
+    a setup helper doesn't spew per-cluster lines."""
+    blk = DreamBlock(complete, model=model, threshold=threshold,
+                     min_confidence=min_confidence, min_events=min_events)
+    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
+    return RunReport(
+        run_id=report.run_id, n_events=blk.n_events, n_clusters=blk.n_clusters,
+        takeaways=blk.takeaways, skipped=report.skipped, dropped=blk.dropped,
+        errored=report.errored, cost_usd=report.cost_usd,
+        stopped_on_budget=report.stopped_on_budget, below_threshold=blk.below_threshold,
+        min_events=min_events)
 
 
 # --- CLI ------------------------------------------------------------------------------------------
@@ -582,9 +652,11 @@ def main(argv=None) -> None:
     ap.add_argument("--min-events", type=int, default=0,
                     help="do nothing unless at least this many events exist (trigger on accumulation)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
+    ap.add_argument("--limit", type=int, help="cap clusters examined this run (dream is global: no --all/--source-id)")
     ap.add_argument("--dry-run", action="store_true",
                     help="cluster only — print the groupings and a sample quote each; no LLM calls")
     ap.add_argument("--show", action="store_true", help="print each synthesized takeaway")
+    ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-cluster progress line")
     args = ap.parse_args(argv)
 
     if args.dry_run:                               # eyeball the deterministic grouping before spending
@@ -598,8 +670,10 @@ def main(argv=None) -> None:
         return
 
     complete = completer.make_cli_completer(args.model)
+    progress = None if args.quiet else block._default_progress
     report = run(complete, model=args.model, threshold=args.threshold,
-                 min_confidence=args.min_confidence, min_events=args.min_events, max_usd=args.max_usd)
+                 min_confidence=args.min_confidence, min_events=args.min_events,
+                 max_usd=args.max_usd, limit=args.limit, progress=progress)
     if report.below_threshold:
         print(f"dream-{report.run_id}: {report.n_events} events < min-events {report.min_events}, skipped")
         return
