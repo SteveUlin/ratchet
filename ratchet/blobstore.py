@@ -31,6 +31,15 @@ def blob_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def canonical_json(obj) -> str:
+    """The one serializer the producer stages (glean/dream) hash artifact records with. Stable bytes
+    are load-bearing now that events/takeaways/decisions are stored by content_hash=blob_hash(record)
+    (ADR-0007): a re-extraction whose logical output is unchanged must re-serialize to the SAME bytes
+    so it no-ops as a version (not a spurious new one). sort_keys pins dict order; compact separators
+    and ensure_ascii=False keep the bytes minimal and faithful."""
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def _paths(h: str, root: Path) -> tuple[Path, Path]:
     d = root / "blobs" / h[:2]
     return d / h, d / f"{h}.meta.json"
@@ -210,6 +219,77 @@ def derived_for(derived_from: str, root: Path | None = None, *,
         if m.get("kind") == "derived" and m.get("derived_from") == derived_from:
             if fmt is None or m.get("format") == fmt:
                 yield m
+
+
+def latest_by_kind(source_kind: str, root: Path | None = None) -> dict[str, str]:
+    """source_id -> latest content_hash, restricted to one raw `source_kind` (ADR-0007 §4).
+
+    The kind-scoped sibling of `latest_index`: every derived view (current events, current
+    takeaways, valid concepts) folds each source's version history to its newest snapshot, but
+    only over the kind it cares about. Filter on `source_kind` BEFORE the fold (a thin loop over
+    `iter_meta`, not over `latest_index`) so a view never loads kinds it does not need, and the
+    cross-kind source_id spaces stay disjoint. Same (fetched_at, content_hash) tie-break as
+    `latest_index` — max wins — so the answer is well-defined regardless of scan order and
+    consistent with `latest_version`."""
+    latest: dict[str, tuple[str, str]] = {}
+    for m in iter_meta(root):
+        if m.get("kind", "raw") != "raw" or m.get("source_kind") != source_kind:
+            continue
+        sid = m.get("source_id")
+        if not sid:
+            continue
+        key = (m.get("fetched_at", ""), m.get("content_hash", ""))
+        if sid not in latest or key > latest[sid]:
+            latest[sid] = key
+    return {sid: key[1] for sid, key in latest.items()}
+
+
+def decisions_for(target: str | None, root: Path | None = None, *,
+                  verb: str | None = None, stage: str | None = None) -> Iterator[dict]:
+    """Yield the parsed body of every `decision` blob whose body.target == `target` (ADR-0007 §3/§4).
+
+    The basis of every decision-fold: the current state of an artifact is the latest decision
+    referencing it. target/verb/key live IN the body (meta carries only source_kind/source_id/
+    fetched_at/prev), so this MUST read content, not just meta. Each yielded body is augmented
+    with its `content_hash` + `fetched_at` from meta so callers can recency-fold and dedup.
+    `target=None` matches ANY target — the producer-marker scan (`processed_index` folds every
+    glean/dream `processed` decision to its (input, prompt_version, model) key, with no single
+    target). `verb` filters body['verb']; `stage` filters body['producer']['stage'] (the
+    processed-marker query keys on (stage, prompt_version, model)). O(total blobs) per ADR-0002 — an
+    index is a later, deletable cache."""
+    for m in iter_meta(root):
+        if m.get("kind", "raw") != "raw" or m.get("source_kind") != "decision":
+            continue
+        ch = m.get("content_hash")
+        if not ch:
+            continue
+        try:
+            body = json.loads(get(ch, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if target is not None and body.get("target") != target:
+            continue
+        if verb is not None and body.get("verb") != verb:
+            continue
+        if stage is not None and (body.get("producer") or {}).get("stage") != stage:
+            continue
+        body = dict(body)
+        body["content_hash"] = ch
+        body["fetched_at"] = m.get("fetched_at", "")
+        yield body
+
+
+def latest_decision(target: str, root: Path | None = None) -> dict | None:
+    """The single decision currently in force for `target` — the recency-fold of `decisions_for`
+    to one body (max by (fetched_at, content_hash)), or None. "Current state = the latest decision
+    referencing it" (ADR-0007 §3) is the most common call, so it gets a name."""
+    best: dict | None = None
+    best_key: tuple[str, str] | None = None
+    for body in decisions_for(target, root):
+        key = (body.get("fetched_at", ""), body.get("content_hash", ""))
+        if best_key is None or key > best_key:
+            best, best_key = body, key
+    return best
 
 
 def ingest(

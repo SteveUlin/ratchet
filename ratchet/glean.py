@@ -10,12 +10,16 @@ model `summary` — UNTRUSTED. The trust anchor (the whole point): the model ret
 glean accepts the event only if that quote is a real substring of `resolve(chunk)`; a hallucinated
 or paraphrased quote dies deterministically, before any event is written.
 
-Events are NOT blobstore blobs. A chunkset→chunks step is a *deterministic* function (so `chunk`
-content-addresses it); an LLM extraction is *not* — the same `derived_from` yields different bytes
-across runs/models, and a per-run shard spans many cleaned blobs. So events go to an append-only
-log (`events/glean-<run_id>.jsonl`, `.partial`→rename on clean exit; readers glob+merge), exactly
-the event store of ADR-0001 §1/§4. Lineage stays content-addressed: every event embeds
-`cleaned_hash`, and `get_meta(cleaned_hash).derived_from` walks to the raw blob, thence datastore.
+Events ARE blobs now (ADR-0007): a logical event is a RAW blob whose `source_id` is the
+span-derived, deterministic `event_id`, and each extraction is an immutable VERSION (content =
+`blob_hash(canonical-json(record))`). ADR-0004's objection — content-addressing a non-deterministic
+output is wrong — dissolves by splitting identity (`event_id`) from content: a re-extraction with a
+changed summary/markers is just a new version under the same `event_id`, `prev`-linked, latest wins;
+a byte-identical re-extraction no-ops. The processed-ledger and the `events/*.jsonl` stream retire:
+"already done" is a `processed` decision blob (verb='processed', target=chunkset_hash, keyed on
+(stage, prompt_version, model)); the to-do is a query, not a stored queue. Lineage stays
+content-addressed: every event embeds `cleaned_hash`, and `get_meta(cleaned_hash).derived_from`
+walks to the raw blob, thence datastore.
 
 The LLM call is the only impure step, so it is injected as a `Completer`; the core (prompt build,
 parse, quote verification, span math, cost, idempotency) is pure and tested offline. The shipped
@@ -25,10 +29,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import blobstore, chunk, completer, config, runlog, weave
+from . import blobstore, chunk, completer, config, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
 PROMPT_VERSION = "glean/2"     # bump to re-extract over the same frozen chunks (idempotency key)
@@ -157,9 +162,14 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
                 model: str, run_id: str) -> dict:
     """Assemble the event record for a verified span — the event FORMAT lives here (ADR-0004/0005). An
     event is a thin pointer (the span, never the quote text) + the untrusted, hygiene-cleaned model
-    fields (summary, markers, confidence) + producer provenance. It stays a plain dict, deliberately:
-    an event is a JSONL serialization boundary the downstream judge reads as JSON, not an in-memory
-    value type like `Chunk` (ADR-0004)."""
+    fields (summary, markers, confidence) + intrinsic provenance. It stays a plain dict, deliberately:
+    an event is a JSON serialization boundary (now a blob's content) the downstream judge reads as
+    JSON, not an in-memory value type like `Chunk` (ADR-0004).
+
+    ADR-0007 reshapes the record: `id` is now the blob's `source_id` (authoritative in meta), kept
+    here only as a convenience content mirror; `status` is DROPPED (state is a decision, never an
+    in-record field). `producer` stays in content (the cost-amortization target) and is mirrored into
+    `origin_ref` at ingest so "who/when/how produced this version" is answerable from meta alone."""
     bstart, bend = span
     return {
         "id": event_id(ch.cleaned_hash, bstart, bend),
@@ -171,7 +181,6 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
         "producer": {"stage": "glean", "model": model, "prompt_version": PROMPT_VERSION,
                      "run_id": run_id, "cost_usd": None},
         "supersedes": None,
-        "status": "extracted",
     }
 
 
@@ -247,21 +256,26 @@ def extract_chunkset(chunkset_hash: str, complete: Completer, *, model: str, run
     return ChunksetResult(chunkset_hash, cleaned_hash, events, rejected, calls, total_cost, errored)
 
 
-# --- the event store + processed ledger (runlog: append-only shards, glob+merge) -------------
-
-GLEAN_KEY = ("chunkset_hash", "prompt_version", "model")   # the processed-ledger idempotency key
+# --- the event store + processed marker (blobs + decisions, derived views) -------------------
 
 
 def load_events(root: Path | None = None) -> list[dict]:
-    """Every committed event (`events/glean-*.jsonl`; `.partial` shards ignored). Raw — consumers
-    dedup by id (ADR-0004). Thin wrapper over the shared `runlog` substrate."""
-    return runlog.read_stream("glean", root)
+    """The current event of every source — for each `event_id`, its LATEST version (ADR-0007 §4).
+    `latest_by_kind('event')` already folds each source's version history to its newest snapshot, so
+    re-extraction churn is absorbed by the TimeMap (latest wins) rather than surfacing as duplicate
+    log lines; consumers no longer dedup by id. Lineage stays content-addressed via `cleaned_hash`."""
+    return [json.loads(blobstore.get(h, root))
+            for h in blobstore.latest_by_kind("event", root).values()]
 
 
 def processed_index(root: Path | None = None) -> set[tuple[str, str, str]]:
-    """The done-set keyed by (chunkset_hash, prompt_version, model). A re-run skips a key already
-    here; bumping PROMPT_VERSION or model changes the key (re-extract over the same frozen chunks)."""
-    return runlog.processed_index("glean", GLEAN_KEY, root)
+    """The done-set keyed by (chunkset_hash, prompt_version, model) — DERIVED from `processed`
+    decision blobs, no stored ledger (ADR-0007 §3/§5). One scan over glean's processed decisions; the
+    tuple shape is preserved verbatim so `run`'s `key in done` logic is unchanged. Bumping
+    PROMPT_VERSION or model changes the key (re-extract over the same frozen chunks)."""
+    return {(b["target"], b["prompt_version"], b["model"])
+            for b in blobstore.decisions_for(None, root, verb="processed", stage="glean")
+            if b.get("target") and "prompt_version" in b and "model" in b}
 
 
 # --- run: orchestrate over a set of chunksets -----------------------------------------------
@@ -290,43 +304,91 @@ class RunReport:
         return sum(r.errored for r in self.results)
 
 
+def event_content(ev: dict) -> dict:
+    """The STORED content of an event version — model output + intrinsic provenance pointers ONLY
+    (ADR-0007 blob_shape). `producer` (model/run_id/cost_usd, all run-varying) is DROPPED here and
+    moves to meta.origin_ref; `status` is gone (state is a decision). This projection is what makes
+    "a re-extraction with unchanged output is a no-op" hold: the canonical-json of this view re-hashes
+    identically run-to-run, so only a changed summary/markers/confidence forks a new version. `id`
+    stays as a convenience mirror (it == source_id, deterministic, so it never perturbs the hash)."""
+    return {
+        "id": ev["id"],
+        "cleaned_hash": ev["cleaned_hash"],
+        "evidence": ev["evidence"],
+        "summary": ev["summary"],
+        "markers": ev["markers"],
+        "confidence": ev["confidence"],
+        "supersedes": ev.get("supersedes"),
+    }
+
+
+def _ingest_event(ev: dict, *, model: str, run_id: str, chunkset_hash: str,
+                  root: Path | None) -> None:
+    """Freeze one event as a RAW blob VERSION keyed on its span-derived `event_id` (ADR-0007). The
+    content is `event_content(ev)` (run-invariant => byte-identical re-extraction no-ops); `producer`
+    is mirrored into `origin_ref` so provenance is answerable from meta alone."""
+    blobstore.ingest(
+        blobstore.canonical_json(event_content(ev)), source_kind="event", source_id=ev["id"],
+        origin_ref={"stage": "glean", "model": model, "prompt_version": PROMPT_VERSION,
+                    "run_id": run_id, "cost_usd": ev["producer"].get("cost_usd"),
+                    "cleaned_hash": ev["cleaned_hash"], "chunkset_hash": chunkset_hash},
+        root=root)
+
+
+def _write_processed(res: ChunksetResult, *, model: str, run_id: str, root: Path | None) -> None:
+    """Write the `processed` decision blob — the producer 'done' marker (ADR-0007 §3/§5), the commit
+    that folds the old idempotency ledger into the blob model. target = the chunkset input hash; the
+    (stage, prompt_version, model) key lives at the top level so `processed_index` rebuilds the same
+    tuple set. The body is UNIQUE per logical fact (target+verb+stage+prompt+model+run_id+at) so
+    blob_hash never conflates two distinct decisions; source_id == its own content_hash, prev=None
+    (decisions are never re-versioned). Informational stats stay for audit."""
+    at = config.now()
+    body = {
+        "verb": "processed", "target": res.chunkset_hash,
+        "stage": "glean", "prompt_version": PROMPT_VERSION, "model": model,
+        "run_id": run_id, "at": at,
+        "producer": {"stage": "glean", "model": model, "run_id": run_id, "at": at},
+        "cleaned_hash": res.cleaned_hash,
+        "n_events": len(res.events), "n_rejected": res.rejected, "n_errored": res.errored,
+        "n_calls": res.calls, "cost_usd": round(res.cost_usd, 8),
+    }
+    s = blobstore.canonical_json(body)
+    blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
+                     origin_ref={"stage": "glean", "run_id": run_id}, fetched_at=at, root=root)
+
+
 def run(chunkset_hashes: list[str], complete: Completer, *, model: str = completer.DEFAULT_MODEL,
         max_usd: float | None = None, root: Path | None = None) -> RunReport:
-    """Extract over chunksets idempotently. A chunkset already in the processed ledger for this
-    (prompt_version, model) is skipped with zero LLM calls. Events are written durable FIRST, then
-    the processed marker (commit) — so a crash reprocesses and never leaves a false 'done' (a
-    reprocessed event re-appears under the same id; consumers dedup by id, ADR-0001 §6). `.partial`
-    shards rename to final only on clean exit (incl. a budget stop). A chunkset whose *every* call
-    failed (transient outage / absent blob) writes no marker and is retried next run; a partially
-    failed one is marked done (its errored chunks need a prompt/model re-key to retry)."""
+    """Extract over chunksets idempotently. A chunkset with a `processed` decision for this
+    (prompt_version, model) is skipped with zero LLM calls. Each event blob is committed durable FIRST
+    (content then meta, crash-safe on its own), then the `processed` decision LAST (the commit marker)
+    — so a crash before the decision reprocesses and never leaves a false 'done'; a reprocessed event
+    re-appears as a new VERSION under the same span-derived `event_id` (a no-op if its bytes are
+    unchanged, else latest wins), so the duplicate is absorbed, not conflicting (ADR-0007 §5). A
+    chunkset whose *every* call failed (transient outage / absent blob) writes no decision and is
+    retried next run; a partially failed one is marked done (its errored chunks need a prompt/model
+    re-key to retry). A budget stop is a clean exit (the committed-so-far events + decisions persist)."""
     root = config.ensure_layout(root)
-    runlog.sweep_partials(root)
-    rid = runlog.run_id()
+    rid = config.run_id()
     done = processed_index(root)
     report = RunReport(run_id=rid)
 
-    with runlog.ShardRun("glean", rid, root) as sh:
-        for cs in chunkset_hashes:
-            key = (cs, PROMPT_VERSION, model)
-            if key in done:
-                report.skipped += 1
-                continue
-            if max_usd is not None and report.cost_usd >= max_usd:
-                report.stopped_on_budget = True
-                break
-            res = extract_chunkset(cs, complete, model=model, run_id=rid, root=root)
-            for ev in res.events:                 # events durable first ...
-                sh.emit(ev)
-            report.results.append(res)
-            if res.calls == 0 and res.errored:    # nothing succeeded (transient outage / absent blob) —
-                continue                          # don't write a 'done' marker; retry the chunkset next run
-            sh.mark({                             # ... then the commit marker (the chunkset is done)
-                "chunkset_hash": cs, "cleaned_hash": res.cleaned_hash,
-                "prompt_version": PROMPT_VERSION, "model": model, "run_id": rid, "at": runlog.now(),
-                "n_events": len(res.events), "n_rejected": res.rejected, "n_errored": res.errored,
-                "n_calls": res.calls, "cost_usd": round(res.cost_usd, 8),
-            })
-            done.add(key)
+    for cs in chunkset_hashes:
+        key = (cs, PROMPT_VERSION, model)
+        if key in done:
+            report.skipped += 1
+            continue
+        if max_usd is not None and report.cost_usd >= max_usd:
+            report.stopped_on_budget = True
+            break
+        res = extract_chunkset(cs, complete, model=model, run_id=rid, root=root)
+        for ev in res.events:                     # event blobs committed durable first ...
+            _ingest_event(ev, model=model, run_id=rid, chunkset_hash=cs, root=root)
+        report.results.append(res)
+        if res.calls == 0 and res.errored:        # nothing succeeded (transient outage / absent blob) —
+            continue                              # don't write a 'done' decision; retry the chunkset next run
+        _write_processed(res, model=model, run_id=rid, root=root)   # ... then the commit (chunkset is done)
+        done.add(key)
     return report
 
 

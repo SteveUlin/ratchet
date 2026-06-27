@@ -106,7 +106,7 @@ assert span["byte_start"] != cleaned.find(REAL_QUOTE), "offsets are bytes, not c
 assert ev["id"] == glean.event_id(cleaned_hash, span["byte_start"], span["byte_end"]), "id = sha256(cleaned+span)[:12]"
 assert ev["cleaned_hash"] == cleaned_hash and "quote" not in ev, "event points into the cleaned blob; never copies its text"
 assert set(ev["markers"]) == set(glean.MARKER_KINDS) and ev["markers"]["insight"] == 0.8, "markers scored per kind"
-assert ev["status"] == "extracted"
+assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record status field"
 assert ev["producer"]["stage"] == "glean" and ev["producer"]["model"] == "fake"
 assert ev["producer"]["prompt_version"] == glean.PROMPT_VERSION and ev["producer"]["cost_usd"] > 0
 
@@ -127,35 +127,80 @@ assert glean.verify({"quote": SHORT_QUOTE}, owner, cleaned.encode("utf-8")) is N
 print("OK — trust anchor: real quote → exact byte span that resolves back; fabricated/short quotes")
 print("     rejected deterministically; event is a pointer (no copied text); fields coerced/clamped.")
 
-# --- 4. the append-only event store + lineage -----------------------------------------------
+# --- 4. events ARE blobs (versioned by event_id) + a processed decision; lineage holds -------
 
+# (ADR-0007) an event is a RAW blob whose source_id is the span-derived event_id; load_events is the
+# latest version per source. The event's content is the model output + provenance pointers — never
+# its `status` (state is a decision) — and producer is mirrored into meta.origin_ref.
 loaded = glean.load_events()
-assert len(loaded) == 1 and loaded[0]["id"] == ev["id"], "events committed to events/glean-*.jsonl and reloaded"
-shards = _glob.glob(os.path.join(os.environ["RATCHET_DATA_DIR"], "events", "glean-*.jsonl"))
-assert len(shards) == 1 and not shards[0].endswith(".partial"), ".partial renamed to final on clean exit"
-# lineage is content-addressed without making events blobs: event → cleaned → raw → datastore
+assert len(loaded) == 1 and loaded[0]["id"] == ev["id"], "event committed as a blob and reloaded by load_events"
+by_kind = blobstore.latest_by_kind("event")
+assert ev["id"] in by_kind, "the event's source_id (event_id) is in latest_by_kind('event')"
+ev_meta = blobstore.get_meta(by_kind[ev["id"]])
+assert ev_meta["source_kind"] == "event" and ev_meta["kind"] == "raw", "meta.source_kind == event, kind == raw"
+assert ev_meta["source_id"] == ev["id"] and ev_meta["prev"] is None, "first version: source_id == event_id, prev None"
+assert ev_meta["origin_ref"]["stage"] == "glean" and ev_meta["origin_ref"]["chunkset_hash"] == cs_hash, \
+    "producer/provenance mirrored into meta.origin_ref (answerable without parsing content)"
+# the stored content is the canonical-json of the record (stable bytes => stable content_hash)
+assert blobstore.get(by_kind[ev["id"]]) == blobstore.canonical_json(loaded[0]), "content is canonical-json of the record"
+assert "status" not in loaded[0], "no in-record status field in the stored event"
+# lineage is content-addressed: event → cleaned → raw → datastore (unchanged by ADR-0007)
 assert blobstore.get_meta(cleaned_hash)["derived_from"] == raw_h, "event.cleaned_hash → derived_from → raw"
 
-# a leftover .partial (a crashed run's output) is invisible to readers
-part = Path(os.environ["RATCHET_DATA_DIR"]) / "events" / "glean-crashed.jsonl.partial"
-part.write_text(json.dumps(ev) + "\n", encoding="utf-8")
-assert len(glean.load_events()) == 1, "a .partial shard is ignored (crashed run reprocessed, not read)"
-part.unlink()
+# the commit marker is a `processed` decision blob (verb='processed', target=chunkset), not a ledger
+done_decisions = list(blobstore.decisions_for(cs_hash, verb="processed", stage="glean"))
+assert len(done_decisions) == 1 and done_decisions[0]["target"] == cs_hash, "a processed decision marks the chunkset done"
+assert done_decisions[0]["prompt_version"] == glean.PROMPT_VERSION and done_decisions[0]["model"] == "fake", \
+    "the decision carries the (prompt_version, model) key at top level"
+d_meta = blobstore.get_meta(done_decisions[0]["content_hash"])
+assert d_meta["source_kind"] == "decision" and d_meta["source_id"] == done_decisions[0]["content_hash"], \
+    "decision: source_kind == decision, source_id == its own content_hash"
+assert d_meta["prev"] is None, "decisions are never re-versioned (prev=None)"
+assert (cs_hash, glean.PROMPT_VERSION, "fake") in glean.processed_index(), \
+    "processed_index derives the (chunkset, prompt_version, model) tuple from the decision"
 
 # --- 5. idempotency: a re-run for the same (chunkset, prompt_version, model) does no work -----
 
 before = fake.calls
 again = glean.run([cs_hash], fake, model="fake")
-assert fake.calls == before, "the processed ledger skips a done chunkset — zero LLM calls"
+assert fake.calls == before, "a processed decision exists for the key → skipped, zero LLM calls"
 assert again.skipped == 1 and not again.results, "re-run skips, produces nothing new"
-assert len(glean.load_events()) == 1, "no duplicate events written on re-run"
-# a different model is a different ledger key → it re-extracts over the same frozen chunks
+assert len(glean.load_events()) == 1, "no duplicate event source on re-run (latest_by_kind folds by event_id)"
+# a second processed decision is NOT appended on a skip (the chunkset never reaches the marker)
+assert len(list(blobstore.decisions_for(cs_hash, verb="processed", stage="glean"))) == 1, \
+    "a skipped re-run writes no new processed decision"
+
+# even forced re-extraction (a fresh model key) of a byte-IDENTICAL event no-ops the event VERSION:
+# the span-derived event_id is the source_id and the canonical-json bytes are unchanged => same blob.
+ev_versions_before = sum(1 for m in blobstore.iter_meta()
+                         if m.get("source_kind") == "event" and m.get("source_id") == ev["id"])
+fake_same = FakeCompleter([{"quote": REAL_QUOTE, "summary": "Commit with jj, never git.",
+                            "markers": {"insight": 0.8, "surprise": 0.1}, "confidence": 0.9},
+                           {"quote": FAKE_QUOTE, "summary": "A hallucinated claim.",
+                            "markers": {"insight": 0.9}, "confidence": 0.9}])
+glean.run([cs_hash], fake_same, model="fake-same")
+ev_versions_after = sum(1 for m in blobstore.iter_meta()
+                        if m.get("source_kind") == "event" and m.get("source_id") == ev["id"])
+assert ev_versions_after == ev_versions_before, "a byte-identical re-extraction is a no-op (no spurious version)"
+
+# a CHANGED extraction (different summary) for the SAME event_id is a NEW VERSION, prev-linked, latest wins
+fake_changed = FakeCompleter([{"quote": REAL_QUOTE, "summary": "Refined: commit with jj, never git.",
+                               "markers": {"insight": 0.8, "surprise": 0.1}, "confidence": 0.95}])
+glean.run([cs_hash], fake_changed, model="fake-changed")
+latest_h = blobstore.latest_by_kind("event")[ev["id"]]
+latest_ev = json.loads(blobstore.get(latest_h))
+assert latest_ev["summary"].startswith("Refined:"), "the latest version is the newer (changed) extraction"
+assert blobstore.get_meta(latest_h)["prev"] is not None, "the new version prev-links to a prior version"
+assert sum(1 for e in glean.load_events() if e["id"] == ev["id"]) == 1, "load_events returns ONE current event per id"
+
+# a different model is a different processed-decision key → it re-extracts over the same frozen chunks
 fake2 = FakeCompleter([{"quote": REAL_QUOTE, "summary": "Commit with jj.", "signal": "preference", "confidence": 0.9}])
 rerun = glean.run([cs_hash], fake2, model="fake-v2")
 assert fake2.calls > 0 and rerun.events == 1, "bumping the model re-extracts (idempotency is per prompt+model)"
 
-print("OK — append-only event store (glob+merge), content-addressed lineage to raw, .partial ignored,")
-print("     idempotent re-runs (skip done; re-extract on a new model/prompt key).")
+print("OK — events versioned by event_id (re-extraction = a new version, latest wins; identical = no-op),")
+print("     content-addressed lineage to raw, idempotent re-runs via processed decisions (skip done;")
+print("     re-extract on a new model/prompt key).")
 
 # --- 6. budget stop is a clean exit ----------------------------------------------------------
 

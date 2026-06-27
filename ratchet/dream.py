@@ -15,11 +15,20 @@ reproducible, the LLM call is not:
   1. CLUSTER (deterministic, stdlib, no LLM): group events by lexical similarity over their trusted
      quotes. Cheap enough to recompute every run, so it is NOT a stored blob — the blobstore models
      single-parent lineage and a clustering is a fan-in over many events. The partition is recorded
-     where it is actually useful: each cluster's member ids land in the processed ledger, and each
-     takeaway cites its events. Auditable and re-derivable without a new artifact.
+     where it is actually useful: each cluster's member ids land in its `processed` decision blob, and
+     each takeaway cites its events. Auditable and re-derivable without a new artifact.
   2. SYNTHESIZE (LLM, one call per cluster): write the cluster's "why" + a name, judge how it relates
      to already-known CONCEPTS, and cite the events it relied on. The trust chain extends one level:
      takeaway → cited event ids → each event's verified byte span → immutable cleaned blob.
+
+Takeaways ARE blobs now (ADR-0007): a logical takeaway is a RAW blob whose `source_id` is the
+deterministic `cluster_signature` (the hash of its sorted member event ids), and each synthesis is an
+immutable VERSION (content = `blob_hash(canonical-json(record))`). Identical membership => the same
+source_id => a re-synthesis is a new version under it, `prev`-linked, latest wins; a membership change
+=> a new source_id => a distinct logical takeaway. The append-only `events/dream-*.jsonl` stream and
+the `state/` processed ledger retire: "already done" is a `processed` decision blob (verb='processed',
+target=cluster_signature, keyed on (stage, prompt_version, model)), and `current_takeaways` derives
+from the blobstore TimeMap, not a log-fold.
 
 EVOLUTION is first-class (sulin): names, summaries, and groupings change over time — a cluster may
 need to split or merge as more evidence arrives. We never mutate a takeaway in place (that would
@@ -30,7 +39,7 @@ when ALL its events are re-covered by takeaways committed in the same run, so a 
 split-child can never orphan its parent's events (`run`). `current_takeaways` folds the supersede
 links to "now"; nothing is edited, only appended.
 
-Idempotency mirrors glean: the processed ledger is keyed by (cluster_signature, prompt_version,
+Idempotency mirrors glean: a `processed` decision is keyed by (cluster_signature, prompt_version,
 model). An unchanged cluster is skipped; a changed one (new signature) re-synthesizes. Bump
 PROMPT_VERSION or the model to re-synthesize the same groupings with a sharper prompt.
 
@@ -48,7 +57,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import blobstore, completer, config, runlog
+from . import blobstore, completer, config
 from .completer import Completer
 from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dream carries it upward
 
@@ -59,7 +68,6 @@ TITLE_MAX = 80
 WHY_MAX = 280
 NOTE_MAX = 160
 
-DREAM_KEY = ("cluster_signature", "prompt_version", "model")   # processed-ledger idempotency key
 _RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
 
 SYSTEM_PROMPT = (
@@ -157,18 +165,24 @@ def _session_of(cleaned_hash: str, root: Path, cache: dict) -> str | None:
 
 
 def gather_events(root: Path, *, min_confidence: float = 0.0) -> list[ResolvedEvent]:
-    """Every committed glean event, deduped by id, **re-anchored** to its trusted quote. dream must
-    not trust the recorded span: glean's substring anchor runs at the WRITE boundary, but the event
-    log is plain append-only JSONL (a crash or out-of-band write can plant a malformed span), and
-    Python slicing silently accepts `None` (the whole blob) and clamps overshoot. So the span is
-    accepted here only after it validates as in-bounds ints `0 <= start < end <= len(blob)` and the
-    bytes decode — re-establishing "the quote is real bytes of an immutable blob" at dream's READ
-    boundary. An event whose blob is gone (TTL-reclaimed) or whose span fails is dropped. The quote,
-    not the summary, is what dream clusters and reasons over."""
+    """The current glean event of every source (latest version each), **re-anchored** to its trusted
+    quote. dream must not trust the recorded span: glean's substring anchor runs at the WRITE
+    boundary, but an event is now a blob version whose content is just model output + a span (a buggy
+    producer or an out-of-band write can plant a malformed span), and Python slicing silently accepts
+    `None` (the whole blob) and clamps overshoot. So the span is accepted here only after it validates
+    as in-bounds ints `0 <= start < end <= len(blob)` and the bytes decode — re-establishing "the
+    quote is real bytes of an immutable blob" at dream's READ boundary. An event whose blob is gone
+    (TTL-reclaimed) or whose span fails is dropped. The quote, not the summary, is what dream clusters
+    and reasons over."""
     by_id: dict[str, dict] = {}
-    for e in runlog.read_stream("glean", root):
-        if isinstance(e, dict) and e.get("id"):
-            by_id[e["id"]] = e        # dedup by id; newest-run record wins (read_stream is run-id sorted) —
+    for sid, h in blobstore.latest_by_kind("event", root).items():
+        try:
+            e = json.loads(blobstore.get(h, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(e, dict):
+            e.setdefault("id", sid)   # source_id (event_id) is authoritative; mirror it in case content dropped it
+            by_id[sid] = e            # latest_by_kind already folds each event_id to its newest VERSION —
                                       # only the untrusted summary can differ across re-extractions, the
                                       # span-derived quote is invariant, so clustering is unaffected
     resolved: list[ResolvedEvent] = []
@@ -345,8 +359,7 @@ def build_takeaway(parsed: dict, cl: list[ResolvedEvent], signature: str, *,
         "cluster_signature": signature,
         "supersedes": [],                         # filled by run() once the run's coverage is known
         "producer": {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
-                     "run_id": run_id, "cost_usd": None},
-        "status": "synthesized",
+                     "run_id": run_id, "cost_usd": None},   # in-memory only; mirrored to origin_ref, not stored in content
     }
 
 
@@ -376,30 +389,98 @@ def _user_prompt(cl: list[ResolvedEvent], concepts: list[dict]) -> str:
 
 # --- the takeaway store + the derived "current" view (fold the supersede links) ------------------
 
+def takeaway_content(tk: dict) -> dict:
+    """The STORED content of a takeaway version — model output + intrinsic provenance ONLY (ADR-0007
+    blob_shape). `producer` (model/run_id/cost_usd, all run-varying) is DROPPED here and moves to
+    meta.origin_ref; `status` is gone (state is a decision). This projection is what makes "a re-
+    synthesis with unchanged output is a no-op" hold: the canonical-json of this view re-hashes
+    identically run-to-run, so only changed content (title/why/cites/supersedes/…) forks a new version.
+    `id`/`cluster_signature` stay as convenience mirrors (== source_id, deterministic, hash-stable).
+    `supersedes` is INTRINSIC (computed by run() from this run's coverage — ADR-0007 §1)."""
+    return {k: tk[k] for k in (
+        "id", "title", "why", "relation", "member_events", "cites", "evidence",
+        "support", "markers", "confidence", "cluster_signature", "supersedes")}
+
+
+def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) -> None:
+    """Freeze one takeaway as a RAW blob VERSION keyed on its `cluster_signature` (ADR-0007). The
+    content is `takeaway_content(tk)` (run-invariant => an unchanged re-synthesis no-ops); `producer`
+    is mirrored into `origin_ref` so provenance is answerable from meta alone."""
+    blobstore.ingest(
+        blobstore.canonical_json(takeaway_content(tk)), source_kind="takeaway",
+        source_id=tk["cluster_signature"],
+        origin_ref={"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
+                    "run_id": run_id, "cost_usd": tk["producer"].get("cost_usd")},
+        root=root)
+
+
+def _write_processed(sig: str, *, model: str, run_id: str, event_ids: list[str], dropped: bool,
+                     cost_usd: float, root: Path | None) -> None:
+    """Write the `processed` decision blob — dream's producer 'done' marker (ADR-0007 §3/§5), the
+    commit that folds the old idempotency ledger into the blob model. target = the cluster_signature
+    (the stable per-cluster input id — pinned; do NOT fork a separate event-set hash); the
+    (stage, prompt_version, model) key lives at the top level so `processed_index` rebuilds the same
+    (cluster_signature, prompt_version, model) tuple set. The body is UNIQUE per logical fact
+    (target+verb+stage+prompt+model+run_id+at) so blob_hash never conflates two distinct decisions;
+    source_id == its own content_hash, prev=None (decisions are never re-versioned). The per-cluster
+    audit (event_ids/dropped/cost) stays for forensics."""
+    at = config.now()
+    body = {
+        "verb": "processed", "target": sig,
+        "stage": "dream", "prompt_version": PROMPT_VERSION, "model": model,
+        "run_id": run_id, "at": at,
+        "producer": {"stage": "dream", "model": model, "run_id": run_id, "at": at},
+        "event_ids": event_ids, "dropped": dropped, "cost_usd": round(cost_usd, 8),
+    }
+    s = blobstore.canonical_json(body)
+    blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
+                     origin_ref={"stage": "dream", "run_id": run_id}, fetched_at=at, root=root)
+
+
 def load_takeaways(root: Path | None = None) -> list[dict]:
-    """Every committed takeaway (`events/dream-*.jsonl`; `.partial` shards ignored). Raw — the fold
-    in `current_takeaways` resolves re-synthesis (by id) and supersession (split/merge/grow)."""
-    return runlog.read_stream("dream", root)
+    """Every committed takeaway VERSION across all sources (ADR-0007). Raw — every snapshot, not just
+    the latest; `current_takeaways` folds re-synthesis (latest per source) and supersession. Used where
+    a full history is wanted; the "now" view needs only `latest_by_kind`."""
+    out: list[dict] = []
+    for m in blobstore.iter_meta(root):
+        if m.get("kind", "raw") != "raw" or m.get("source_kind") != "takeaway":
+            continue
+        ch = m.get("content_hash")
+        if not ch:
+            continue
+        try:
+            out.append(json.loads(blobstore.get(ch, root)))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return out
 
 
 def processed_index(root: Path | None = None) -> set[tuple[str, str, str]]:
-    """The done-set keyed by (cluster_signature, prompt_version, model). A re-run skips a cluster
-    whose membership is unchanged; a changed cluster (new signature) re-synthesizes."""
-    return runlog.processed_index("dream", DREAM_KEY, root)
+    """The done-set keyed by (cluster_signature, prompt_version, model) — DERIVED from `processed`
+    decision blobs, no stored ledger (ADR-0007 §3/§5). One scan over dream's processed decisions; the
+    tuple shape is preserved verbatim so `run`'s `key in done` logic is unchanged. A re-run skips a
+    cluster whose membership is unchanged; a changed cluster (new signature) re-synthesizes; bumping
+    PROMPT_VERSION or model changes the key."""
+    return {(b["target"], b["prompt_version"], b["model"])
+            for b in blobstore.decisions_for(None, root, verb="processed", stage="dream")
+            if b.get("target") and "prompt_version" in b and "model" in b}
 
 
 def current_takeaways(root: Path | None = None) -> list[dict]:
-    """The live takeaway set, folded from the append-only log: keep the latest record per id (a re-
-    synthesis — or a prompt/model bump — replaces its prior self), then drop every takeaway that some
-    surviving takeaway supersedes. This is how groupings/names/summaries evolve without editing
-    anything in place. Recency is taken from the record's `producer.run_id` (which sorts by creation
-    time — see runlog.run_id), NOT the shard glob order, so the fold can't surface a stale record."""
-    records = sorted(load_takeaways(root), key=lambda t: t.get("producer", {}).get("run_id", ""))
+    """The live takeaway set, derived from the blobstore TimeMap: take the LATEST version of every
+    takeaway source (`latest_by_kind('takeaway')` — the prev-chain IS the per-source recency fold, so a
+    re-synthesis or a prompt/model bump replaces its prior self by construction), then drop every
+    takeaway that some surviving takeaway supersedes. This is how groupings/names/summaries evolve
+    without editing anything in place. Recency is the TimeMap's (fetched_at, content_hash) — true
+    lineage, not glob order — so the fold can't surface a stale record."""
     by_id: dict[str, dict] = {}
-    for t in records:
-        tid = t.get("id")
-        if tid:
-            by_id[tid] = t            # later run_id wins
+    for sid, h in blobstore.latest_by_kind("takeaway", root).items():
+        try:
+            t = json.loads(blobstore.get(h, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        tid = t.get("id") or sid      # id mirrors cluster_signature == source_id; fall back to meta
+        by_id[tid] = t
     superseded: set[str] = set()
     for t in by_id.values():
         for s in t.get("supersedes") or []:
@@ -435,12 +516,14 @@ def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM
     prior it shares an event with. That needs the whole run's coverage, so synthesis completes before
     any commit (a crash mid-run re-does the run — idempotent — trading crash-cost for correctness).
 
-    Crash-safety mirrors glean: takeaways durable first, the processed marker last; a cluster whose
-    call FAILED writes no marker (retried next run); a cluster the model dropped IS marked done (noise
-    not re-synthesized)."""
+    Crash-safety mirrors glean: each takeaway blob durable first (content then meta, crash-safe on its
+    own), the processed DECISION last; a cluster whose call FAILED writes no decision (retried next
+    run); a cluster the model dropped IS marked done (noise not re-synthesized). A crash before the
+    decision re-processes; the re-synthesis re-appears as a new VERSION of the same cluster_signature
+    (a no-op if its bytes are unchanged, else latest wins), so the duplicate is absorbed (ADR-0007
+    §5)."""
     root = config.ensure_layout(root)
-    runlog.sweep_partials(root)
-    rid = runlog.run_id()
+    rid = config.run_id()
     done = processed_index(root)
     concepts = load_concepts(root)
     known_ids = {c["id"] for c in concepts}        # all str (load_concepts guarantees it) → set-safe
@@ -485,19 +568,17 @@ def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM
         ev = set(tk["member_events"])
         tk["supersedes"] = sorted({pid for pid, pev in eligible.items() if pev & ev} - {tk["id"]})
 
-    # 3. commit: each takeaway durable first, then its cluster's done marker (mirrors glean's ordering).
-    with runlog.ShardRun("dream", rid, root) as sh:
-        for cl, sig, tk, cost in processed:
-            if tk is not None:
-                sh.emit(tk)
-                report.takeaways.append(tk)
-            else:
-                report.dropped += 1
-            sh.mark({
-                "cluster_signature": sig, "prompt_version": PROMPT_VERSION, "model": model,
-                "run_id": rid, "at": runlog.now(), "event_ids": sorted(rv.id for rv in cl),
-                "dropped": tk is None, "cost_usd": round(cost, 8),
-            })
+    # 3. commit: each takeaway blob durable first (content then meta), then its cluster's processed
+    #    decision last — the commit ordering that makes a crash re-process, never leave a false 'done'
+    #    (mirrors glean). A re-synthesis re-appears as a new VERSION of the same cluster_signature.
+    for cl, sig, tk, cost in processed:
+        if tk is not None:
+            _ingest_takeaway(tk, model=model, run_id=rid, root=root)   # durable first ...
+            report.takeaways.append(tk)
+        else:
+            report.dropped += 1
+        _write_processed(sig, model=model, run_id=rid, event_ids=sorted(rv.id for rv in cl),
+                         dropped=tk is None, cost_usd=cost, root=root)   # ... then the commit marker
     return report
 
 

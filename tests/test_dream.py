@@ -5,7 +5,6 @@ with none yields no takeaway); the trust chain holds (a takeaway's evidence reso
 idempotency skips unchanged clusters; and EVOLUTION works — a re-run supersedes prior takeaways
 (grow/split/merge) and the fold resolves "now". A live smoke is gated behind RATCHET_LIVE_TEST=1.
 Run: `python tests/test_dream.py`."""
-import glob as _glob
 import json
 import os
 import re
@@ -96,6 +95,18 @@ class DreamFake:
         return Completion(text=json.dumps(obj), model="fake", cost_usd=0.01)
 
 
+def seed_takeaway(*, id, member_events, supersedes, cites, fetched_at):
+    """Ingest a takeaway BLOB directly (source_id = its cluster_signature), bypassing synthesis, to
+    drive the fold deterministically. ADR-0007: current_takeaways folds latest_by_kind('takeaway')
+    by (fetched_at, content_hash), so a controlled `fetched_at` sets recency (replacing the old
+    run_id-glob ordering). `id` == cluster_signature == source_id, so the fold keys on it."""
+    rec = {"id": id, "cluster_signature": id, "member_events": member_events,
+           "supersedes": supersedes, "cites": cites, "evidence": [], "support": {"events": 0, "sessions": 0}}
+    h, _ = blobstore.ingest(blobstore.canonical_json(rec), source_kind="takeaway", source_id=id,
+                            origin_ref={"stage": "dream", "model": "seed"}, fetched_at=fetched_at)
+    return h
+
+
 # Seed events: two sessions on the JJ theme (→ 2 distinct sessions), one on NIX.
 for sid, line in [("dream-s1", JJ1), ("dream-s2", JJ1), ("dream-s3", NIX)]:
     cs = make_session(sid, line)
@@ -140,7 +151,8 @@ assert jj_tk["support"]["sessions"] == 2, "support weighted by DISTINCT sessions
 assert set(jj_tk["cites"]) == {e.id for e in jj_cluster}, "cites are the cluster's real event ids"
 assert jj_tk["markers"]["insight"] == 0.7 and jj_tk["markers"]["surprise"] == 0.2, "markers aggregate (max) over cited events"
 assert jj_tk["relation"]["kind"] == "new", "no concepts yet → every takeaway is new"
-assert jj_tk["status"] == "synthesized" and jj_tk["producer"]["stage"] == "dream"
+assert "status" not in jj_tk, "status is DROPPED (state is a decision now, never an in-record field)"
+assert jj_tk["producer"]["stage"] == "dream"   # producer stays on the in-memory/report record (cost amortization)
 assert jj_tk["producer"]["cost_usd"] > 0 and jj_tk["id"] == jj_tk["cluster_signature"]
 
 # the trust chain extends: every cited piece of evidence resolves to real bytes in an immutable blob
@@ -162,21 +174,65 @@ print("OK — synthesize: citations verified (hallucination rejected, no-evidenc
 print("     resolves to immutable bytes, support counts distinct sessions, drop marked done.")
 
 
-# --- 4. the takeaway store + idempotency ----------------------------------------------------
+# --- 4. the takeaway store (BLOBS) + idempotency (processed DECISIONS) -----------------------
 
-shards = _glob.glob(os.path.join(ROOT, "events", "dream-*.jsonl"))
-assert shards and not any(s.endswith(".partial") for s in shards), ".partial renamed to final on clean exit"
+# takeaways ARE blobs now (ADR-0007): source_id == cluster_signature, kind=raw/source_kind=takeaway.
+latest_tk = blobstore.latest_by_kind("takeaway")
+assert {t["cluster_signature"] for t in rep.takeaways} <= set(latest_tk), \
+    "each takeaway is a blob version keyed on its cluster_signature (latest_by_kind contains its source)"
 loaded = dream.load_takeaways()
 assert {t["id"] for t in rep.takeaways} <= {t["id"] for t in loaded}, "takeaways committed and reloadable"
+# meta of a committed takeaway blob: kind=raw, source_kind=takeaway, source_id=cluster_signature, prev linkage.
+sig0 = rep.takeaways[0]["cluster_signature"]
+m_tk = blobstore.get_meta(latest_tk[sig0])
+assert m_tk["kind"] == "raw" and m_tk["source_kind"] == "takeaway" and m_tk["source_id"] == sig0, \
+    "takeaway blob meta carries raw/takeaway/cluster_signature"
+assert m_tk["origin_ref"]["stage"] == "dream" and m_tk["origin_ref"]["model"] == "fake", \
+    "producer/provenance is mirrored into origin_ref (answerable from meta alone)"
+# the STORED content is the run-invariant projection: NO producer, NO status (those moved to origin_ref / decisions).
+stored = json.loads(blobstore.get(latest_tk[sig0]))
+assert "producer" not in stored and "status" not in stored, \
+    "stored takeaway content drops run-varying producer + status (else a re-synthesis forks a spurious version)"
+assert json.loads(blobstore.get(latest_tk[sig0])) == json.loads(
+    blobstore.canonical_json(dream.takeaway_content(
+        [t for t in rep.takeaways if t["cluster_signature"] == sig0][0]))), \
+    "content == canonical_json(takeaway_content(record)) — the byte-stable projection"
+# a `processed` DECISION exists per synthesized cluster (verb/target/key); its meta is a decision blob.
+done_now = dream.processed_index()
+for t in rep.takeaways:
+    assert (t["cluster_signature"], dream.PROMPT_VERSION, "fake") in done_now, \
+        "a processed decision marks the synthesized cluster done for (cluster_signature, prompt, model)"
+dec = next(blobstore.decisions_for(sig0, verb="processed", stage="dream"))
+m_dec = blobstore.get_meta(dec["content_hash"])
+assert m_dec["source_kind"] == "decision" and m_dec["source_id"] == dec["content_hash"] and m_dec["prev"] is None, \
+    "a decision blob: source_id == its own content_hash, never re-versioned (prev=None)"
 
 before = DreamFake(cite="all")
 rerun = dream.run(before, model="fake")
 assert before.calls == 0 and rerun.skipped == rerun.n_clusters and not rerun.takeaways, \
-    "a re-run for the same (clusters, prompt, model) does zero LLM work"
-# a different model is a different ledger key → re-synthesizes the same clusters
-rerun2 = dream.run(DreamFake(cite="all"), model="fake-v2")
-assert len(rerun2.takeaways) == 2, "bumping the model re-synthesizes over the same clusters"
-print("OK — append-only takeaway store, idempotent re-run (skip done; re-synthesize on a new model key).")
+    "a re-run for the same (clusters, prompt, model) does zero LLM work (a processed decision exists → skipped)"
+def _n_versions(sig):
+    return sum(1 for m in blobstore.iter_meta()
+               if m.get("source_kind") == "takeaway" and m.get("source_id") == sig)
+
+# a model bump with BYTE-IDENTICAL output is a NO-OP version (the projection drops producer, so only
+# the origin_ref.model differs — that lives in meta, not content): the content blob is shared, no churn.
+n0 = _n_versions(sig0)
+noop = dream.run(DreamFake(cite="all"), model="fake-v2-sametitle")   # same DreamFake defaults → same content
+assert len(noop.takeaways) == 2, "the new model key re-synthesizes the clusters (LLM called)"
+assert _n_versions(sig0) == n0, \
+    "byte-identical re-synthesis no-ops as a version (only origin_ref.model differs → meta, not content)"
+# a model bump with CHANGED output (different title) is a NEW prev-linked VERSION of the SAME source:
+changed = dream.run(DreamFake(cite="all", title="a sharper title"), model="fake-v3-newtitle")
+assert len(changed.takeaways) == 2, "the changed re-synthesis emits takeaways"
+assert _n_versions(sig0) == n0 + 1, "changed content forks exactly one new version under the same source"
+m_v3 = blobstore.get_meta(blobstore.latest_by_kind("takeaway")[sig0])
+assert m_v3["origin_ref"]["model"] == "fake-v3-newtitle" and m_v3["prev"] is not None, \
+    "the changed version is a new prev-linked snapshot of the same source (the TimeMap, latest wins)"
+assert json.loads(blobstore.get(blobstore.latest_by_kind("takeaway")[sig0]))["title"] == "a sharper title", \
+    "current content is the newest version's"
+print("OK — takeaway BLOB store (source_id=cluster_signature) + processed-decision idempotency;")
+print("     re-run zero-work; identical re-synthesis no-ops, changed = a new prev-linked version.")
 
 
 # --- 5. EVOLUTION by supersession: grow/split/merge are one append-only mechanism -----------
@@ -184,8 +240,10 @@ print("OK — append-only takeaway store, idempotent re-run (skip done; re-synth
 # (a) GROW: a new session adds a JJ-similar line → it joins the JJ cluster → the cluster's membership
 #     changes → a NEW takeaway supersedes the prior JJ takeaway; the unchanged NIX cluster is skipped.
 prior_current = {t["id"]: t for t in dream.current_takeaways()}
-prior_jj = [t for t in prior_current.values() if t["support"]["events"] == 2 and t["producer"]["model"] == "fake"]
-# (use the original "fake"-model takeaways as the baseline current set for this check)
+prior_jj = [t for t in prior_current.values() if t["support"]["events"] == 2]
+# (the 2-event JJ takeaways are the baseline current set this grow must supersede; stored content has
+#  no `producer`, so the model is read from origin_ref if needed — recency is meta.fetched_at now)
+assert prior_jj, "a prior 2-event JJ takeaway is current before the grow"
 cs4 = make_session("dream-s4", JJ2)
 glean.run([cs4], GleanFake([JJ1, JJ2, NIX]), model="fake")
 events2 = dream.gather_events(ROOT)
@@ -207,38 +265,37 @@ assert all(t["support"]["events"] == 3 for t in grow.takeaways), "only the chang
 print("OK — evolution/GROW: a changed cluster re-synthesizes and SUPERSEDES its prior; the fold drops")
 print("     the superseded takeaway; the unchanged cluster is skipped (no churn).")
 
-# (b) The fold resolves arbitrary supersede links (split = one→many, merge = many→one) — unit-level.
-seed = Path(ROOT) / "events" / "dream-seedfold.jsonl"
-A = {"id": "aaaa", "member_events": ["e1"], "supersedes": [], "cites": ["e1"]}
-B = {"id": "bbbb", "member_events": ["e2"], "supersedes": [], "cites": ["e2"]}
-C = {"id": "cccc", "member_events": ["e1", "e2"], "supersedes": ["aaaa", "bbbb"], "cites": ["e1", "e2"]}
-seed.write_text("\n".join(json.dumps(r) for r in (A, B, C)) + "\n", encoding="utf-8")
+# (b) The fold resolves arbitrary supersede links (split = one→many, merge = many→one). The seams are
+#     now takeaway BLOBS (distinct source_ids = distinct logical takeaways); current_takeaways folds
+#     latest_by_kind('takeaway') + the supersede links — no log, no hand-written shard.
+seed_takeaway(id="seedfoldaaaa", member_events=["e1"], supersedes=[], cites=["e1"],
+              fetched_at="2000-01-01T00:00:00+00:00")
+seed_takeaway(id="seedfoldbbbb", member_events=["e2"], supersedes=[], cites=["e2"],
+              fetched_at="2000-01-01T00:00:01+00:00")
+seed_takeaway(id="seedfoldcccc", member_events=["e1", "e2"], supersedes=["seedfoldaaaa", "seedfoldbbbb"],
+              cites=["e1", "e2"], fetched_at="2000-01-01T00:00:02+00:00")
 folded = {t["id"] for t in dream.current_takeaways()}
-assert "cccc" in folded and "aaaa" not in folded and "bbbb" not in folded, \
-    "merge (many→one): the merged takeaway supersedes both, which fold out"
-seed.unlink()
+assert "seedfoldcccc" in folded and "seedfoldaaaa" not in folded and "seedfoldbbbb" not in folded, \
+    "merge (many→one): the merged takeaway supersedes both, which fold OUT of the current view"
 
-print("OK — evolution/FOLD: supersede links resolve split (one→many) and merge (many→one) by append only.")
+print("OK — evolution/FOLD: supersede links resolve split (one→many) and merge (many→one) over BLOBS.")
 
 # (c) supersession is COVERAGE-CONDITIONED (the orphan fix): a prior is folded out ONLY if ALL its
 #     events are re-covered this run. Seed a prior owning a real event + a ghost event no cluster covers;
 #     a re-run that re-synthesizes the real cluster must NOT supersede it (else the ghost's coverage is
-#     orphaned). The old owner-overlap logic WOULD have wrongly folded it out (it shares the real event).
+#     orphaned). The owner-overlap logic WOULD wrongly fold it out (it shares the real event). The prior
+#     is now a takeaway BLOB seeded with an EARLIER fetched_at (the recency knob replacing run_id order);
+#     its own source_id, so the fold drops it ONLY via a survivor's supersede link — which coverage gates.
 real_id = dream.gather_events(ROOT)[0].id
-guard = Path(ROOT) / "events" / "dream-00000000T000000-000000-000000-0000.jsonl"   # oldest run_id → loses the fold
-guard.write_text(json.dumps({
-    "id": "guardtk", "member_events": sorted([real_id, "ghost-never-covered"]), "supersedes": [],
-    "cites": [real_id], "evidence": [], "status": "synthesized",
-    "producer": {"stage": "dream", "model": "seed", "run_id": "00000000T000000-000000-000000-0000"}}) + "\n",
-    encoding="utf-8")
+seed_takeaway(id="guardtk", member_events=sorted([real_id, "ghost-never-covered"]), supersedes=[],
+              cites=[real_id], fetched_at="2000-01-01T00:00:00+00:00")
 assert "guardtk" in {t["id"] for t in dream.current_takeaways()}, "the seeded prior is current before the run"
 cov = dream.run(DreamFake(cite="all"), model="fake-cov")          # fresh key → re-synthesizes the real clusters
 assert cov.takeaways and any(real_id in (t.get("member_events") or []) for t in cov.takeaways), \
     "the re-synthesis emits a takeaway that SHARES the guard's real event (overlap exists)"
 assert "guardtk" in {t["id"] for t in dream.current_takeaways()}, \
     "a prior with an UNcovered event survives — a dropped/split child never orphans its parent's events"
-guard.unlink()
-print("OK — evolution/COVERAGE: supersession is coverage-conditioned (no orphan), fold keys recency on run_id.")
+print("OK — evolution/COVERAGE: supersession is coverage-conditioned (no orphan), recency keys on fetched_at.")
 
 
 # --- 6. concept seam + belief-change relation -----------------------------------------------
@@ -286,20 +343,23 @@ print("     non-finite scores scrubbed.")
 
 # --- 8. regression (review-battery fixes): span re-anchoring, concept id hygiene, model-bump fold --
 
-# (a) TRUST CHAIN re-anchored at dream's READ boundary: a glean event with a malformed span (null /
-#     overshoot / inverted) against a REAL blob is dropped — never resolved to the whole blob or to
-#     silently-clamped bytes and labelled "verified". (A foreign log line is the reachability vector.)
+# (a) TRUST CHAIN re-anchored at dream's READ boundary: a glean event whose stored span is malformed
+#     (null / overshoot / inverted) against a REAL blob is dropped — never resolved to the whole blob
+#     or to silently-clamped bytes and labelled "verified". Events are blobs now (ADR-0007), so the
+#     reachability vector is a malformed EVENT BLOB version (a buggy producer or out-of-band write),
+#     injected via ingest exactly as a real glean event would be — gather_events re-validates it.
 real_ev = [e for e in glean.load_events() if e["evidence"][0].get("byte_start") is not None][0]
 ch = real_ev["cleaned_hash"]
 blen = len(blobstore.get(ch).encode("utf-8"))
 bad = [{"id": "bad-null", "cleaned_hash": ch, "evidence": [{"byte_start": None, "byte_end": None}], "confidence": 0.9},
        {"id": "bad-over", "cleaned_hash": ch, "evidence": [{"byte_start": 0, "byte_end": blen + 999}], "confidence": 0.9},
        {"id": "bad-inv", "cleaned_hash": ch, "evidence": [{"byte_start": 50, "byte_end": 10}], "confidence": 0.9}]
-mal = Path(ROOT) / "events" / "glean-malformed.jsonl"
-mal.write_text("\n".join(json.dumps(r) for r in bad) + "\n", encoding="utf-8")
+for r in bad:
+    blobstore.ingest(blobstore.canonical_json(r), source_kind="event", source_id=r["id"],
+                     origin_ref={"stage": "glean", "model": "malformed"})
+assert {r["id"] for r in bad} <= set(blobstore.latest_by_kind("event")), "the malformed event blobs are committed (reachable)"
 assert {e.id for e in dream.gather_events(ROOT)}.isdisjoint({"bad-null", "bad-over", "bad-inv"}), \
-    "malformed/foreign spans are rejected at the read boundary (no whole-blob or clamped 'verified' bytes)"
-mal.unlink()
+    "malformed spans are rejected at the read boundary (no whole-blob or clamped 'verified' bytes)"
 
 # (b) a concept file with a non-string id is skipped (load_concepts' 'never fatal' contract) — a non-
 #     string id is unhashable and would otherwise make the known-id set build error EVERY cluster.
@@ -309,14 +369,24 @@ assert dream.run(DreamFake(cite="all"), model="fake-badconcept").errored == 0, "
 (Path(ROOT) / "concepts" / "bad.json").unlink()
 
 # (c) a model bump re-synthesizes the same grouping and REPLACES it in the current fold (one current
-#     takeaway per grouping; the older model's record is not also current) — the intended semantics.
+#     takeaway per grouping; the older model's version is not also current). Recency is now the
+#     TimeMap's meta.fetched_at (the prev-chain), NOT glob/run_id order. The stored content has no
+#     `producer` (it moved to origin_ref), so the visible change is the title (ONE→TWO) plus the latest
+#     version's origin_ref.model — both must flip to bumpB.
 m1 = dream.run(DreamFake(cite="all", title="ONE"), model="bumpA")
 if m1.takeaways:
-    tid = m1.takeaways[0]["id"]
-    assert {t["id"]: t for t in dream.current_takeaways()}[tid]["producer"]["model"] == "bumpA"
+    tid = m1.takeaways[0]["id"]                                   # == cluster_signature == source_id
+    cur = {t["id"]: t for t in dream.current_takeaways()}[tid]
+    assert cur["title"] == "ONE", "bumpA's version is current after its run"
+    m_a = blobstore.get_meta(blobstore.latest_by_kind("takeaway")[tid])
+    assert m_a["origin_ref"]["model"] == "bumpA", "latest version's provenance is bumpA"
     dream.run(DreamFake(cite="all", title="TWO"), model="bumpB")
-    assert {t["id"]: t for t in dream.current_takeaways()}[tid]["producer"]["model"] == "bumpB", \
-        "a model bump replaces the grouping's current takeaway (fold keys recency on run_id, not glob order)"
+    cur2 = {t["id"]: t for t in dream.current_takeaways()}[tid]
+    assert cur2["title"] == "TWO", \
+        "a model bump REPLACES the grouping's current takeaway (the TimeMap latest wins, fetched_at recency)"
+    m_b = blobstore.get_meta(blobstore.latest_by_kind("takeaway")[tid])
+    assert m_b["origin_ref"]["model"] == "bumpB" and m_b["prev"] is not None, \
+        "the bumpB version is a new prev-linked snapshot of the SAME source_id (one current per grouping)"
 print("OK — regression: span re-anchored, malformed concept id non-fatal, model bump replaces in the fold.")
 
 
