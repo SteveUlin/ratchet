@@ -13,6 +13,7 @@ This is the crash-safety-critical core, factored out of the stages so it lives i
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from datetime import datetime, timezone
@@ -20,13 +21,23 @@ from pathlib import Path
 
 from . import config
 
+_SEQ = itertools.count()   # per-process monotonic disambiguator (see run_id)
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def run_id() -> str:
-    return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    """A unique, recency-sortable id per ShardRun: timestamp + pid + a ZERO-PADDED process-local
+    counter + a small RANDOM suffix. Every part earns its place: `strftime` is only second-precision,
+    so the counter disambiguates (and orders) runs within one process-second; zero-padding keeps the
+    lexical shard-name sort equal to creation order (an unpadded counter inverts at 10 — `-10` sorts
+    before `-9` — and the `current` fold leans on shard order for recency); the random suffix removes
+    the last collision (a recycled pid in the same second across *sequential* processes resets the
+    counter to 0 and would otherwise overwrite a committed shard, since ShardRun opens `"w"`)."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return f"{ts}-{os.getpid()}-{next(_SEQ):06d}-{os.urandom(2).hex()}"
 
 
 def sweep_partials(root: Path) -> None:
@@ -51,7 +62,10 @@ def read_stream(stage: str, root: Path | None = None) -> list[dict]:
     if not d.exists():
         return out
     for shard in sorted(d.glob(f"{stage}-*.jsonl")):
-        for line in shard.read_text(encoding="utf-8").splitlines():
+        # decode tolerantly: a hard crash can tear the final line mid-write — even inside a multibyte
+        # UTF-8 char — and `read_text` would raise on the WHOLE file, defeating the per-line skip below.
+        # `errors="replace"` turns the torn tail into a line that simply fails json.loads and is skipped.
+        for line in shard.read_bytes().decode("utf-8", errors="replace").splitlines():
             line = line.strip()
             if line:
                 try:
@@ -70,7 +84,7 @@ def processed_index(stage: str, key_fields: tuple[str, ...], root: Path | None =
     if not d.exists():
         return done
     for shard in sorted(d.glob(f"{stage}-processed-*.jsonl")):
-        for line in shard.read_text(encoding="utf-8").splitlines():
+        for line in shard.read_bytes().decode("utf-8", errors="replace").splitlines():  # tolerant: see read_stream
             line = line.strip()
             if not line:
                 continue

@@ -16,8 +16,10 @@ def data_root() -> Path:
 
 
 def ensure_layout(root: Path | None = None) -> Path:
-    """Create the data subtree (blobs, state, tmp, events) and return the root."""
+    """Create the data subtree and return the root. `concepts/` is the curated-knowledge layer the
+    human-review gate writes and `dream` reads (empty until review exists) — the source of truth that
+    skills/CLAUDE.md are later generated *from*, kept distinct from that generated output."""
     root = root or data_root()
-    for sub in ("blobs", "state", "tmp", "events"):
+    for sub in ("blobs", "state", "tmp", "events", "concepts"):
         (root / sub).mkdir(parents=True, exist_ok=True)
     return root

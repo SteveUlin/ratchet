@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -112,21 +110,10 @@ def _user_prompt(chunk_text: str, cues: list[str]) -> str:
 
 
 def parse_candidates(text: str) -> list[dict]:
-    """Pull the `events` array out of the model's text, tolerating the ```json fences the CLI adds.
-    Defensive: any malformed output yields no candidates (a bad call costs nothing downstream)."""
-    s = text.strip()
-    if s.startswith("```"):                       # strip a ```json ... ``` fence
-        s = s.split("\n", 1)[1] if "\n" in s else ""
-        if s.rstrip().endswith("```"):
-            s = s.rstrip()[:-3]
-    start, end = s.find("{"), s.rfind("}")
-    if start < 0 or end <= start:
-        return []
-    try:
-        obj = json.loads(s[start:end + 1])
-    except json.JSONDecodeError:
-        return []
-    events = obj.get("events") if isinstance(obj, dict) else None
+    """Pull the `events` array out of the model's object (the ```json fence is handled by the shared
+    `completer.parse_json_object`). Defensive: malformed output → no candidates, no crash."""
+    obj = completer.parse_json_object(text)
+    events = obj.get("events") if obj else None
     return [c for c in events if isinstance(c, dict)] if isinstance(events, list) else []
 
 
@@ -136,12 +123,7 @@ def event_id(cleaned_hash: str, byte_start: int, byte_end: int) -> str:
     return hashlib.sha256(f"{cleaned_hash}:{byte_start}:{byte_end}".encode()).hexdigest()[:12]
 
 
-def _clean_score(v, default: float = 0.0) -> float:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return default
-    return max(0.0, min(1.0, f)) if math.isfinite(f) else default  # NaN/inf → default, never the store
+_clean_score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
 
 
 def _clean_markers(v) -> dict:
@@ -246,7 +228,7 @@ def extract_chunkset(chunkset_hash: str, complete: Completer, *, model: str, run
             errored += 1                         # the injected seam is untrusted; isolate ANY failure
             continue
         calls += 1
-        call_cost = comp.cost_usd if comp.cost_usd is not None else completer.estimate_cost(comp)
+        call_cost = completer.cost_of(comp)
         total_cost += call_cost
         accepted = []
         for cand in parse_candidates(comp.text):

@@ -7,8 +7,8 @@ The unifying `ratchet` service does not exist yet — the project is built as co
 over a content-addressed **blobstore**, each step a materialized, lineage-linked artifact:
 
 ```
-tap → raw blob → weave → cleaned blob → chunk → chunkset → glean → events
-   (fetch)            (render)              (window)           (extract, LLM, future)
+tap → raw blob → weave → cleaned blob → chunk → chunkset → glean → events → dream → takeaways
+   (fetch)            (render)              (window)         (extract, LLM)     (synthesize, LLM)
 ```
 
 - `tap` — locate new/changed Claude Code transcripts and copy each in as an immutable **raw** blob.
@@ -20,14 +20,21 @@ tap → raw blob → weave → cleaned blob → chunk → chunkset → glean →
   re-render. Deterministic, no LLM.
 - `glean` — filter chunks for durable signal and extract **events**: thin pointers into the cleaned
   blob (a byte span whose verbatim quote is *trusted*, plus an *untrusted* one-sentence summary and
-  scored *markers* — surprise / insight / research — that classify why the learning matters). The
-  only LLM stage. A quote is accepted only if it is a real substring of the chunk, so a hallucinated
-  quote is rejected deterministically. Events are an append-only log, not blobstore blobs.
+  scored *markers* — surprise / insight / research — that classify why the learning matters). A quote
+  is accepted only if it is a real substring of the chunk, so a hallucinated quote is rejected
+  deterministically. Events are an append-only log, not blobstore blobs.
+- `dream` — cluster events and synthesize each cluster into a durable, evidence-cited **takeaway**
+  (a "why" + name). Deterministic stdlib clustering first, then one LLM call per cluster with a
+  *sharper* model (sleep-time: rare, batched). A takeaway cites its events, extending the trust chain
+  to the immutable blob. Takeaways are append-only and **evolve by supersession** — a re-run
+  re-clusters and a new takeaway supersedes those it shares evidence with (grow/split/merge are one
+  mechanism), so "current" is a fold over the log; nothing is edited in place.
 
 ## Layout
 
-- `ratchet/` — the Python package: `config`, `blobstore`, `tap`, `weave`, `chunk`, `glean`, and
-  `completer` (the injected LLM seam — a `Completion` + the default `claude` CLI binding).
+- `ratchet/` — the Python package: `config`, `blobstore`, `tap`, `weave`, `chunk`, `glean`, `dream`,
+  `completer` (the injected LLM seam — a `Completion` + the default `claude` CLI binding), and
+  `runlog` (the append-only producer-run substrate the LLM stages share).
 - `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.
 
 ## Data
@@ -35,9 +42,10 @@ tap → raw blob → weave → cleaned blob → chunk → chunkset → glean →
 The data lives **outside** this repo, in `$RATCHET_DATA_DIR`
 (default `${XDG_DATA_HOME:-~/.local/share}/ratchet`), append-only and local-only; the repo holds
 only code. The **blobstore** (`blobs/`) holds deterministic, content-addressed artifacts (raw +
-cleaned + chunkset). The **event store** (`events/glean-*.jsonl`) is a separate append-only log of
-non-deterministic LLM output that *points into* the blobstore — each event verifiable forever
-against its frozen cleaned blob.
+cleaned + chunkset). The **stream store** (`events/glean-*.jsonl`, `events/dream-*.jsonl`) is a
+separate append-only log of non-deterministic LLM output that *points into* the blobstore — each
+event/takeaway verifiable forever against its frozen cleaned blob. `concepts/` is the curated-
+knowledge layer the human-review gate will write and `dream` reads.
 
 ## Run
 
@@ -52,11 +60,15 @@ python -m ratchet.chunk --source-id <session>            # materialize + list it
 nix run .#glean -- --source-id <session> --dry-run       # show which chunksets would be gleaned
 nix run .#glean -- --source-id <session>                 # extract events (default model: haiku)
 nix run .#glean -- --all --max-usd 2.00                  # glean every chunkset, capped at $2
+
+nix run .#dream -- --dry-run                             # cluster events, print groupings (no LLM)
+nix run .#dream -- --show --max-usd 2.00                 # synthesize takeaways (default model: sonnet)
 ```
 
-`glean` is the only step that calls an LLM — by default it shells out to your authed `claude` CLI.
-It re-runs idempotently (a processed ledger skips done chunksets); a bumped prompt or `--model`
-re-extracts over the same frozen chunks.
+`glean` and `dream` are the LLM stages — by default they shell out to your authed `claude` CLI.
+Both re-run idempotently (a processed ledger skips done work); a bumped prompt or `--model` re-does
+it over the same frozen inputs. `dream --dry-run` shows the deterministic clustering for free, so you
+can eyeball the groupings before spending on synthesis.
 
 ## Develop
 
@@ -66,8 +78,9 @@ From the dev shell (picks up uncommitted changes):
 direnv allow                        # or: nix develop
 python -m ratchet.tap --dry-run
 python tests/test_storage.py && python tests/test_tap.py && \
-  python tests/test_weave.py && python tests/test_chunk.py && python tests/test_glean.py
+  python tests/test_weave.py && python tests/test_chunk.py && \
+  python tests/test_glean.py && python tests/test_dream.py
 ```
 
-`test_glean.py` runs offline with a fake extractor; set `RATCHET_LIVE_TEST=1` to also smoke-test the
-real `claude` CLI against one transcript.
+`test_glean.py` and `test_dream.py` run offline with fake completers; set `RATCHET_LIVE_TEST=1` to
+also smoke-test the real `claude` CLI against one transcript.

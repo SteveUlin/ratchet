@@ -8,6 +8,7 @@ never touching the core (ADR-0004). Cost *policy* (`_PRICES`) travels with the b
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import time
 from dataclasses import dataclass
@@ -49,6 +50,45 @@ def estimate_cost(c: Completion) -> float:
     if price is None or c.input_tokens is None or c.output_tokens is None:
         return 0.0
     return c.input_tokens / 1e6 * price[0] + c.output_tokens / 1e6 * price[1]
+
+
+def cost_of(c: Completion) -> float:
+    """A call's cost: the binding's reported `cost_usd` if it has one, else the price-table estimate.
+    The LLM stages all account cost this way — one policy, one place."""
+    return c.cost_usd if c.cost_usd is not None else estimate_cost(c)
+
+
+# --- untrusted-output hygiene shared by the LLM stages ---------------------------------------
+
+def clean_score(v, default: float = 0.0) -> float:
+    """Clamp an untrusted model score into [0,1]; a non-numeric or non-finite (NaN/inf) value falls
+    back to `default`. A scrubbed score, never a raw one, reaches the store — glean and dream share
+    this exact contract, so it lives here once."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, f)) if math.isfinite(f) else default
+
+
+def parse_json_object(text: str) -> dict | None:
+    """Recover the outermost JSON object from a model response, tolerating the ```json fence the CLI
+    wraps results in. The fence is a property of the *binding's* output, so its handling lives with
+    the binding, not in each stage. Returns None on anything malformed — the caller owns the empty
+    case (no candidates / skip the chunk)."""
+    s = text.strip()
+    if s.startswith("```"):                       # strip a ```json ... ``` fence
+        s = s.split("\n", 1)[1] if "\n" in s else ""
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    start, end = s.find("{"), s.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(s[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def make_cli_completer(model: str = DEFAULT_MODEL, *, timeout: int = 240, retries: int = 2,
