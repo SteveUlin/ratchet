@@ -85,7 +85,7 @@ class Probe:
     def __init__(self):
         self.lines = []
 
-    def start(self, *, total, todo, already):
+    def start(self, *, total, todo, already, backlog=0):
         pass
 
     def tick(self, key, outcome, *, outputs=0, cost=0.0):
@@ -428,6 +428,26 @@ assert shim2.events == 0 and shim2.skipped == len(schunks), "the shim re-run ski
 assert fake_s.calls == s_signal, "no new LLM calls on the shim's idempotent re-run"
 
 print("OK — the glean.run shim drives the per-chunk block (dream/review setup untouched), idempotent.")
+
+
+# --- 8b. priority(): the amortization queue orders by likely yield from the chunk POINTER alone ----
+# A --limit/--max-usd-capped tick must glean the RICHEST chunks first so the backlog drains best-first.
+# priority() reads ONLY the chunk's free structural cues (kinds + turn span) — never the content — so
+# prioritizing adds no per-tick O(bytes) scan (the overhead amortization is meant to avoid).
+def _ci(kinds, turns):
+    return glean.ChunkItem(chunk=chunk.Chunk(cleaned_hash="h", byte_start=0, byte_end=10,
+                                             turn_start=0, turn_end=turns, segment=0, kinds=kinds),
+                           chunkset_hash="cs")
+pb = glean.GleanBlock(FakeCompleter([]), model="prio")
+rich = _ci(["user", "assistant", "tool"], 3)    # a real exchange WITH the human → highest yield
+useronly = _ci(["user"], 1)                      # the human present, even tersely → still high
+work = _ci(["assistant", "tool"], 8)             # assistant + tools, no human steer
+dump = _ci(["tool"], 40)                          # a long tool-output monologue → bytes-heavy, low yield
+assert pb.priority(rich) > pb.priority(useronly) > pb.priority(work) > pb.priority(dump), \
+    f"user-bearing + diverse ranks first: {[pb.priority(c) for c in (rich, useronly, work, dump)]}"
+assert pb.priority(useronly) > pb.priority(dump), "a terse human turn outranks a long tool dump (NOT length)"
+assert pb.priority(work) == pb.priority(_ci(["assistant", "tool"], 8)), "priority is pure in the pointer"
+print("OK — priority: capped tick drains best-first by free pointer cues (user-presence > diversity > turns, not bytes).")
 
 
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------

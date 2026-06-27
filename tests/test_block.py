@@ -36,11 +36,13 @@ ROOT = config.data_root()
 class ProbeProgress:
     def __init__(self):
         self.started = None                         # (total, todo, already)
+        self.backlog = None                         # the full pre-limit un-done count start() received
         self.ticks: list[dict] = []                 # one per landed/skipped/dry/errored item, in order
         self.stopped = False
 
-    def start(self, *, total, todo, already):
+    def start(self, *, total, todo, already, backlog=0):
         self.started = (total, todo, already)
+        self.backlog = backlog
 
     def tick(self, key, outcome, *, outputs=0, cost=0.0):
         self.ticks.append({"key": key, "outcome": outcome, "outputs": outputs, "cost": cost})
@@ -111,6 +113,7 @@ assert rep.stage == "fake"
 assert rep.examined == 3, f"all three examined: {rep}"
 assert rep.processed == 2 and rep.errored == 1, f"a,c done; BOOM isolated: {rep}"
 assert rep.outputs == 2, f"two output blobs: {rep}"
+assert rep.pending == 1, f"the errored item is the remaining backlog (no marker → still un-done): {rep}"
 assert blk.processed_keys == ["a", "c"], "BOOM never reached the commit; run continued past it"
 
 # earlier items' WORK persisted (the blob) AND their commit marker exists — that is per-item commit.
@@ -126,6 +129,7 @@ assert len(markers) == 1 and markers[0]["n_outputs"] == 1, f"a's marker is a dec
 # the driver drove the Progress PROTOCOL: start() got the driver-computed counts, tick() fired once per
 # item with the SINGLE outcome (a→done, BOOM→errored, c→done), stop() ran. The driver constructed nothing.
 assert probe.started == (3, 3, 0), f"driver computed total/todo/already and passed them to start: {probe.started}"
+assert probe.backlog == 3, f"start() got the full pre-limit un-done backlog: {probe.backlog}"
 assert [(t["key"], t["outcome"]) for t in probe.ticks] == [("a", "done"), ("BOOM", "errored"), ("c", "done")]
 assert probe.ticks[0]["outputs"] == 1, "a done tick carries its outputs"
 assert probe.ticks[1]["outputs"] == 0, "an errored tick carries no outputs"
@@ -145,6 +149,7 @@ r2 = fresh_root("idem")
 b_v1 = FakeBlock(["x", "y", "z"], version="v1")
 rep_a = block.run(b_v1, root=r2, progress=None)
 assert rep_a.processed == 3 and rep_a.skipped == 0, f"first run does all: {rep_a}"
+assert rep_a.pending == 0, f"a full drain leaves nothing pending: {rep_a}"
 
 b_v1_again = FakeBlock(["x", "y", "z"], version="v1")
 probe_idem = ProbeProgress()
@@ -153,6 +158,7 @@ assert rep_b.processed == 0 and rep_b.skipped == 3, f"re-run skips all (same par
 assert b_v1_again.processed_keys == [], "no item re-processed on an unchanged re-run"
 # a fully-done re-run: start sees 0 todo, every tick is the single "skipped" outcome.
 assert probe_idem.started == (3, 0, 3), f"all already-done: 0 todo, 3 already: {probe_idem.started}"
+assert probe_idem.backlog == 0 and rep_b.pending == 0, f"nothing un-done → no backlog: {probe_idem.backlog}, {rep_b}"
 assert [t["outcome"] for t in probe_idem.ticks] == ["skipped", "skipped", "skipped"], "every item ticked skipped"
 
 # bump the idempotency param → a new done-key → every item re-processes (the "re-do on logic change").
@@ -174,6 +180,7 @@ rep_bud = block.run(b_budget, root=r3, max_usd=0.25, progress=None)
 assert rep_bud.stopped_on_budget, f"budget stop flagged: {rep_bud}"
 assert rep_bud.processed == 3, f"three landed before the gate tripped: {rep_bud}"
 assert abs(rep_bud.cost_usd - 0.30) < 1e-9, f"cost accumulated: {rep_bud}"
+assert rep_bud.pending == 2, f"budget stop leaves the un-processed remainder pending (i4,i5): {rep_bud}"
 assert b_budget.processed_keys == ["i1", "i2", "i3"], "committed-so-far is exactly the first three"
 # the stop is CLEAN: the three that landed are durable (blob + marker); the rest never ran.
 assert ("i3", "v1") in block.done_index("fake", r3), "i3 (the last before stop) is marked"
@@ -182,6 +189,7 @@ assert ("i4", "v1") not in block.done_index("fake", r3), "i4 never processed →
 b_resume = FakeBlock(["i1", "i2", "i3", "i4", "i5"], cost=0.10)
 rep_res = block.run(b_resume, root=r3, progress=None)
 assert rep_res.skipped == 3 and rep_res.processed == 2, f"resume does the remaining two: {rep_res}"
+assert rep_res.pending == 0, f"resume drained the backlog to zero: {rep_res}"
 print("OK §3 — --max-usd: clean stop, committed-so-far persists, resumable")
 
 
@@ -194,6 +202,10 @@ assert rep_lim.examined == 2 and rep_lim.processed == 2, f"--limit caps examinat
 assert b_lim.processed_keys == ["p", "q"], "exactly the first two were processed"
 # --limit feeds the bar's TOTAL: the driver enumerated, capped to 2, and that 2 is what start sees.
 assert probe_lim.started == (2, 2, 0), f"--limit caps the progress total too: {probe_lim.started}"
+# amortization visibility: the bar's total is this tick's slice (2), but backlog is the FULL un-done set
+# (5) and pending is what survives the tick (5-2=3) — so a capped run advertises the work it deferred.
+assert probe_lim.backlog == 5, f"start() saw the full pre-limit backlog, not the capped slice: {probe_lim.backlog}"
+assert rep_lim.pending == 3, f"--limit 2 over 5 un-done leaves 3 pending for the next tick: {rep_lim}"
 
 # --limit caps EXAMINED, not processed: re-running a done corpus with --limit still examines `limit`
 # items and stops (it does not scan past them hunting for undone work). p,q are done → both skip.

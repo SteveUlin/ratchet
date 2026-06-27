@@ -247,6 +247,8 @@ def main(argv=None) -> None:
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — tap never calls an LLM)")
+    ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
+                    help="ordering policy (inert — tap emits no per-item signal, so every policy is arrival order)")
     args = ap.parse_args(argv)
 
     blk = TapBlock(datastore=args.datastore, project=args.project)
@@ -255,7 +257,7 @@ def main(argv=None) -> None:
     progress = None if (args.quiet or args.dry_run) else block.Progress(
         blk.name, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
     block.run(blk, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
-              dry_run=args.dry_run, progress=progress)
+              dry_run=args.dry_run, priority=block.priority_strategy(args.priority), progress=progress)
 
 
 if __name__ == "__main__":

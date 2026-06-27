@@ -28,11 +28,12 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from . import blobstore, config
 
 Item = Any   # opaque to the driver — only the block's key()/process() interpret it
+ScoreOf = Callable[[Item], float]   # a stage's `priority` signal fn, handed to a PriorityStrategy
 
 
 @runtime_checkable
@@ -70,12 +71,13 @@ class Block(Protocol):
         ...
 
     def priority(self, item: Item) -> float:
-        """The item's processing PRIORITY — the one composable knob that turns enumeration into a
-        priority queue (ADR-0010 §8). The driver stably sorts items DESCENDING by this before the
-        --limit cap, so the highest-value work runs first and a budget/limit ceiling takes the top
-        slice. Default (`no_priority`) returns 0.0, so a stable sort preserves enumeration order — a
-        stage that does not care (tap/weave/chunk/glean) stays byte-for-byte identical. dream orders
-        its working set by event salience."""
+        """The item's value SCORE — the stage-owned half of priority (the POLICY half is the driver's
+        `PriorityStrategy`, ADR-0011). This is just the signal: how much does processing THIS item next
+        buy us. The default `Greedy` strategy stably sorts items DESCENDING by it before the --limit cap,
+        so the highest-value work runs first and a budget/limit ceiling takes the top slice. Default
+        (`no_priority`) returns 0.0, so Greedy's stable sort preserves enumeration order — a stage that
+        does not care (tap/weave/chunk/glean) stays byte-for-byte identical. dream scores by event
+        salience, glean by pre-LLM structural cues."""
         ...
 
 
@@ -97,10 +99,89 @@ def no_marker_extra(_self, item: Item) -> dict:
 
 
 def no_priority(_self, item: Item) -> float:
-    """The default `priority` — every item ties at 0.0. Python's sort is stable, so a uniform priority
-    leaves enumeration order untouched: a stage that never opts in (tap/weave/chunk/glean) processes
-    in exactly the order it always did. dream overrides with event salience to make a priority queue."""
+    """The default `priority` SIGNAL — every item ties at 0.0. Under the default `Greedy` policy Python's
+    sort is stable, so a uniform score leaves enumeration order untouched: a stage that never opts in
+    (tap/weave/chunk/glean) processes in exactly the order it always did. dream overrides with event
+    salience, glean with structural cues, to feed the priority queue."""
     return 0.0
+
+
+# --- the priority POLICY: a pluggable ordering strategy over the per-stage SIGNAL ------------------
+
+# Priority couples two SEPARABLE concerns. The SIGNAL — `block.priority(item)->float`, the item's value
+# score — is OWNED BY THE STAGE (dream's salience, glean's structural cues); it stays above. The POLICY
+# — how that signal becomes a processing order — is the DRIVER's, the same for every stage, so it is the
+# modular seam: a `PriorityStrategy` the driver applies to the eager enumeration BEFORE --limit (the cap
+# takes the head) and BEFORE the backlog count. A stage never sees the policy; selecting one (by code or
+# `--priority`) re-orders every stage at once without touching a single stage. The default reproduces the
+# pre-strategy driver byte-for-byte, so this is a refactor + extension, never a behavior change.
+
+@runtime_checkable
+class PriorityStrategy(Protocol):
+    """The ordering POLICY — `order(items, score_of) -> list[item]`, where `score_of` is the stage's
+    `block.priority`. The driver hands it the eager enumeration and the signal function; the strategy
+    returns the processing order. A `Protocol` (not a base class) so a strategy is any object exposing
+    `order` — stdlib-only, no inheritance, no registry coupling."""
+
+    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+        ...
+
+
+class Greedy:
+    """The DEFAULT policy: a STABLE descending sort by score — highest-value work first, a budget/limit
+    ceiling takes the top slice (ADR-0009/0010 §8). Byte-for-byte the pre-strategy driver: `sorted(...,
+    reverse=True)` is the same stable Timsort the old in-place `items.sort(key=…, reverse=True)` ran, so
+    the default `no_priority` (0.0 everywhere) still preserves enumeration order and every stage is
+    identical. Greedy is value-of-information optimal under a myopic, stationary signal — the right
+    default; the anti-starvation/anti-ossification policies below trade myopic optimality for fairness."""
+
+    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+        return sorted(items, key=score_of, reverse=True)
+
+
+class Arrival:
+    """Identity: enumeration order, score IGNORED. The trivial alternative that PROVES the seam — same
+    items, same driver, a different processing order with zero stage change. (It is also where a
+    no-signal stage already lands via the stable Greedy default on a uniform 0.0 score, so `--priority
+    arrival` only differs once a stage emits a non-uniform signal.)"""
+
+    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+        return list(items)
+
+
+# The name→strategy registry the CLIs' `--priority` resolves against. Values are zero-arg FACTORIES (the
+# classes themselves), so each run gets a FRESH instance — load-bearing for a future STATEFUL strategy
+# (Stochastic/PER carries a seeded RNG; a shared singleton would leak draw state across runs).
+PRIORITY_STRATEGIES: dict[str, Callable[[], PriorityStrategy]] = {
+    "greedy": Greedy,
+    "arrival": Arrival,
+}
+
+
+def priority_strategy(name: str) -> PriorityStrategy:
+    """Resolve a `--priority` name to a FRESH strategy instance via the registry. An unknown name raises
+    (argparse `choices=` normally catches it first; this guards a programmatic caller)."""
+    try:
+        return PRIORITY_STRATEGIES[name]()
+    except KeyError:
+        raise ValueError(f"unknown priority strategy {name!r}; "
+                         f"choose from {sorted(PRIORITY_STRATEGIES)}") from None
+
+
+# EXTENSION SEAM (documented, NOT built — ADR-0011): a new policy is a new `PriorityStrategy` class
+# registered above. The spine is value-of-information — Greedy is myopically optimal; these trade a
+# little of that for anti-starvation / anti-ossification:
+#   Stochastic — PER (Prioritized Experience Replay): sample WITHOUT replacement with `P ∝ score^α` plus
+#                an ε-floor so every item keeps nonzero mass (anti-starvation) and the high scorers don't
+#                ossify the head (anti-ossification). Needs a SEEDED `random.Random` (a constructor arg)
+#                for deterministic tests — exactly why the registry hands out fresh instances per run.
+#   RankBased  — PER's outlier-robust variant: `P ∝ 1/rank(score)`, insensitive to score scale, so one
+#                runaway salience cannot monopolize the head. Same seeded-RNG sampling shape as Stochastic.
+# Stochastic + RankBased drop in with ZERO driver/stage change (RNG via the constructor, value via
+# `score_of`). Aging is the one foreseeable PRESSURE POINT: `score + λ·age` needs a SECOND per-item
+# scalar — age — that the `order(items, score_of)` seam does not carry (items are opaque; `fetched_at`
+# lives in blob meta the strategy can't reach). So Aging EXTENDS the seam (a second `age_of` fn, or the
+# driver passing a feature map) rather than slotting into it — the single bend in the decoupling.
 
 
 # --- the done-set + the processed marker (0007's per-input decisions, generalized to per-item) ------
@@ -172,6 +253,9 @@ class Report:
     cost_usd: float = 0.0
     stopped_on_budget: bool = False
     would_process: int = 0     # --dry-run only
+    pending: int = 0           # un-done items STILL in the store after this run (the amortized backlog):
+                               # full enumeration minus markers minus what this run processed. >0 means
+                               # a capped/budgeted run left work for the next tick (errored items count).
 
 
 # --- live progress: spinner + ▰▱ bar + spend on a TTY; idempotent per-item lines when piped --------
@@ -211,14 +295,18 @@ class Progress:
     def _c(self, code: str, s) -> str:
         return f"{code}{s}{_RESET}" if self.tty else str(s)    # color ONLY on a TTY
 
-    def start(self, *, total: int, todo: int, already: int) -> None:
-        """Open the run: the driver passes the enumerated `total` (it owns enumeration) plus the
-        done-skip split (`todo`/`already`). A TTY spawns the animator thread here, once the count is known."""
+    def start(self, *, total: int, todo: int, already: int, backlog: int = 0) -> None:
+        """Open the run: the driver passes this run's enumerated `total` (post --limit) plus the done-skip
+        split (`todo`/`already`), and the FULL un-done `backlog` (pre --limit). When the backlog exceeds
+        this run's `todo`, a `--limit`/budget is deferring work, so the line surfaces "<N> pending" — the
+        amortization signal: how much is still un-done at this stage beyond the slice this tick takes. A
+        TTY spawns the animator thread here, once the count is known."""
         self.total = total
         ps = " · ".join(f"{k}={v}" for k, v in self.params.items())
         cap = f" · cap {self._c(_YEL, f'${self.cap:.2f}')}" if self.cap is not None else ""
+        pend = f" · {self._c(_YEL, f'{backlog} pending')}" if backlog > todo else ""
         self._println(f"{self._c(_BOLD, self.stage)}: {self.total} items · {todo} to do · "
-                      f"{already} done{cap}" + (f" · {self._c(_DIM, ps)}" if ps else ""))
+                      f"{already} done{pend}{cap}" + (f" · {self._c(_DIM, ps)}" if ps else ""))
         if self.tty and self.total:
             self._thread = threading.Thread(target=self._animate, daemon=True)
             self._thread.start()
@@ -296,13 +384,19 @@ class Progress:
 # --- the driver: one loop, identical for every stage ------------------------------------------------
 
 def run(block: Block, *, source_id: str | None = None, max_usd: float | None = None,
-        limit: int | None = None, dry_run: bool = False,
+        limit: int | None = None, dry_run: bool = False, priority: PriorityStrategy | None = None,
         progress: Progress | None = None, root: Path | None = None) -> Report:
     """Drive a block over its items, IDENTICALLY for every stage. The per-item contract:
 
-      1. enumerate (eager, so the bar knows the total) → 2. --limit cap → 3. done-skip (a marker for
+      1. enumerate (eager, so the bar knows the total) → 1b. ORDER by the `priority` POLICY (default
+      Greedy: stable descending by the stage's signal) → 2. --limit cap → 3. done-skip (a marker for
       (key, *params)) → 4. budget gate (--max-usd, clean exit) → 5. dry-run list-only → 6. process
       (commit blobs) → 7. the marker LAST (per-item commit) → 8. progress.tick → 9. optional finalize.
+
+    PRIORITY is split like PROGRESS: the SIGNAL (`block.priority(item)`) is the stage's, the POLICY
+    (`priority.order`, ADR-0011) is the driver's, default `Greedy`. The order is applied to the eager
+    enumeration BEFORE the cap and the backlog count, so the cap takes the top slice and dream's
+    `commits_per_item=False` path is unaffected (it re-orders the same working set, commits in finalize).
 
     The four invariants the driver guarantees so no stage re-implements them:
       PER-ITEM COMMIT — output blobs (in process) then the marker (here, LAST), so a kill/crash keeps
@@ -323,21 +417,27 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     per-item marker; `finalize` does every blob+marker commit off the block's own `_pending`. All-or-nothing."""
     root = config.ensure_layout(root)
     run_id = config.run_id()
+    priority = priority or Greedy()                # resolve the default HERE, not as a shared default-arg
+                                                   # instance, so every run gets a FRESH strategy (a future
+                                                   # seeded/stateful policy must not leak state across runs).
     params = block.params                          # snapshot once (a stage must not mutate mid-run)
     pvals = tuple(v for _, v in params)
     done = done_index(block.name, root)            # one scan
     items = list(block.items(root, source_id=source_id))   # eager: the bar + startup summary need the total
-    items.sort(key=block.priority, reverse=True)   # ADR-0010 §8: a PRIORITY QUEUE — highest-value work
-                                                   # first. Stable, so the default 0.0 priority preserves
-                                                   # enumeration order (other stages byte-identical); the
-                                                   # sort precedes --limit so the cap takes the TOP slice.
+    items = priority.order(items, block.priority)  # apply the ordering POLICY over the stage's SIGNAL — see
+                                                   # the run() docstring + ADR-0011 (default Greedy is a stable
+                                                   # no-op on the 0.0 signal, so a non-opting stage is identical).
+    backlog = sum(1 for it in items if (block.key(it), *pvals) not in done)  # FULL un-done count, pre-limit:
+                                                   # the amortized backlog this run draws from (AMORTIZATION
+                                                   # VISIBILITY — what is still pending at this stage, not
+                                                   # just this tick's slice). Same O(total) the loop pays.
     if limit is not None:
         items = items[:limit]                      # --limit caps items EXAMINED (the first `limit`)
     report = Report(stage=block.name, run_id=run_id)
 
     if progress:                                   # the driver owns enumeration → it computes the counts
         todo = sum(1 for it in items if (block.key(it), *pvals) not in done)
-        progress.start(total=len(items), todo=todo, already=len(items) - todo)
+        progress.start(total=len(items), todo=todo, already=len(items) - todo, backlog=backlog)
 
     for item in items:
         report.examined += 1
@@ -372,6 +472,9 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
         if progress:
             progress.tick(k, "done", outputs=n_out, cost=cost)
 
+    report.pending = backlog - report.processed    # what's STILL un-done after this run: a capped/budgeted
+                                                   # tick leaves >0 (errored items stay pending — no marker);
+                                                   # a full drain (or --dry-run, processed=0) leaves backlog.
     if progress:
         progress.stop()
     if not dry_run:

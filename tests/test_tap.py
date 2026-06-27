@@ -46,7 +46,7 @@ class Probe:
         self.lines = []
         self.examined = self.processed = self.skipped = self.errored = 0
 
-    def start(self, *, total, todo, already):
+    def start(self, *, total, todo, already, backlog=0):
         pass
 
     def tick(self, key, outcome, *, outputs=0, cost=0.0):

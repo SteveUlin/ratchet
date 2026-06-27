@@ -400,6 +400,8 @@ def main(argv=None) -> None:
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — weave never calls an LLM)")
+    ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
+                    help="ordering policy (inert — weave emits no per-item signal, so every policy is arrival order)")
     args = ap.parse_args(argv)
 
     # READ-ONLY inspectors of ONE blob stay a separate path: --render (full doc) / --inspect (turn
@@ -429,15 +431,16 @@ def main(argv=None) -> None:
 
     # The batch/idempotent path: drive the block. A bare hash scopes to that one raw blob (a one-item
     # block so the driver's done-skip + marker still apply — no bespoke materialize that bypasses them).
+    prio = block.priority_strategy(args.priority)
     if args.hash and not args.all:
         if not blobstore.has(args.hash):
             ap.error(f"no such blob: {args.hash}")
         one = _OneRaw(args.hash)
-        block.run(one, dry_run=args.dry_run, progress=make_progress(one))
+        block.run(one, dry_run=args.dry_run, priority=prio, progress=make_progress(one))
         return
     wb = WeaveBlock()
     block.run(wb, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
-              dry_run=args.dry_run, progress=make_progress(wb))
+              dry_run=args.dry_run, priority=prio, progress=make_progress(wb))
 
 
 class _OneRaw(WeaveBlock):

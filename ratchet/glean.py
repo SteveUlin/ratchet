@@ -271,7 +271,6 @@ class GleanBlock:
     name = "glean"
     commits_per_item = True
     finalize = block.no_finalize
-    priority = block.no_priority             # arrival order (a future salience prefilter is ADR-0010 §8)
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
                  targets: list[str] | None = None) -> None:
@@ -312,6 +311,24 @@ class GleanBlock:
 
     def key(self, item: ChunkItem) -> str:
         return chunk_key(item.chunk)
+
+    def priority(self, item: ChunkItem) -> float:
+        """Pre-LLM salience for the amortized queue (ADR-0010 §8): order chunks by LIKELY durable yield
+        so a `--limit`/`--max-usd`-capped tick gleans the richest chunks FIRST and the backlog drains
+        best-first. Uses ONLY the chunk POINTER's free structural cues — `kinds` (speaker kinds present)
+        and the turn span — so it costs NO content read: prioritizing must not re-introduce the very
+        per-tick O(bytes) scan amortization is meant to avoid. Signals, strongest first: a USER turn is
+        present (where the human steers / corrects / states a preference — the gold source of durable
+        learnings), speaker-kind diversity (a real exchange beats a tool-output monologue), and a small
+        interaction-count term. Deliberately NOT byte length — a long tool dump is bytes-heavy but
+        low-yield. Recall-first: this only ORDERS, never gates; a richer content-salience hint computed
+        once at chunk-time is the deferred upgrade."""
+        ch = item.chunk
+        kinds = set(ch.kinds or [])
+        has_user = 2.0 if "user" in kinds else 0.0
+        diversity = 0.5 * len(kinds)
+        interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
+        return has_user + diversity + interaction
 
     # -- extract ONE chunk -------------------------------------------------------------------
 
@@ -415,7 +432,7 @@ class _ShimReport:
 
 def run(chunkset_hashes: list[str], complete: Completer, *, model: str = completer.DEFAULT_MODEL,
         max_usd: float | None = None, limit: int | None = None, root: Path | None = None,
-        progress=None) -> _ShimReport:
+        priority: block.PriorityStrategy | None = None, progress=None) -> _ShimReport:
     """Compat shim: extract over the chunks of the given chunksets via the per-chunk `block.run`
     driver (ADR-0009). Builds a `GleanBlock` over an explicit chunkset list and returns a
     `_ShimReport` WRAPPING the uniform `block.Report` + the block's tallies — so existing callers
@@ -424,7 +441,7 @@ def run(chunkset_hashes: list[str], complete: Completer, *, model: str = complet
     driver's (now at CHUNK granularity, not chunkset). `progress` defaults to None (silent) so a
     setup helper doesn't spew per-chunk lines — the caller injects a Progress to see them."""
     blk = GleanBlock(complete, model=model, targets=list(chunkset_hashes))
-    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
+    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, priority=priority, progress=progress)
     return _ShimReport(report, blk)
 
 
@@ -465,6 +482,8 @@ def main(argv=None) -> None:
                     help="list chunks that would be processed (skips done); no LLM calls")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
+    ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
+                    help="ordering policy over enumerated chunks (default: greedy = highest-yield first)")
     args = ap.parse_args(argv)
 
     # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
@@ -489,7 +508,7 @@ def main(argv=None) -> None:
     progress = None if (args.quiet or args.dry_run) else block.Progress(
         blk.name, cap=args.max_usd, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
     report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
-                       progress=progress)
+                       priority=block.priority_strategy(args.priority), progress=progress)
 
     if args.dry_run:
         print(f"\nglean-{report.run_id}: {report.would_process} chunk(s) would process "

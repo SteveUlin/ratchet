@@ -902,6 +902,7 @@ def run(complete_route: Completer, complete_synth: Completer, *, route_model: st
         synth_model: str = SYNTH_MODEL, min_confidence: float = 0.0,
         drift_threshold: float = DRIFT_THRESHOLD, maturity: int = MATURITY_SESSIONS,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
+        priority: block.PriorityStrategy | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> RunReport:
     """Consolidate the working set incrementally — a thin shim over `block.run(DreamBlock(...))` (mirrors
     v1's run/RunReport-wrapper pattern), so callers/CLI keep a stable surface. TWO separate injected
@@ -910,7 +911,7 @@ def run(complete_route: Completer, complete_synth: Completer, *, route_model: st
     blk = DreamBlock(complete_route, complete_synth, route_model=route_model, synth_model=synth_model,
                      min_confidence=min_confidence, drift_threshold=drift_threshold, maturity=maturity,
                      forget=forget)
-    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
+    report = block.run(blk, max_usd=max_usd, limit=limit, root=root, priority=priority, progress=progress)
     return RunReport(report, blk)
 
 
@@ -934,10 +935,12 @@ def main(argv=None) -> None:
     ap.add_argument("--merge", action="store_true", help="run the maintenance de-dup pass (list near-dup pairs)")
     ap.add_argument("--merge-threshold", type=float, default=0.5, help="lexical similarity for merge candidates")
     ap.add_argument("--dry-run", action="store_true",
-                    help="list the salience-ordered working set + catalog sizes; no LLM calls")
+                    help="list the priority-ordered working set + catalog sizes; no LLM calls")
     ap.add_argument("--show", action="store_true", help="print each new/strengthened takeaway")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-event progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
+    ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
+                    help="ordering policy over the working set (default: greedy = highest-salience first)")
     args = ap.parse_args(argv)
 
     if args.merge:                                  # maintenance de-dup: list the candidate pairs
@@ -954,10 +957,11 @@ def main(argv=None) -> None:
     if args.dry_run:                                # eyeball the queue + catalog before spending
         root = config.ensure_layout()
         ws = working_set(root, min_confidence=args.min_confidence)
-        ws.sort(key=lambda rv: salience(rv.event), reverse=True)
+        ws = block.priority_strategy(args.priority).order(ws, lambda rv: salience(rv.event))   # mirror the
+                                                   # real run's POLICY so the preview can't lie about order
         cat = catalog(root)
         mature = current_takeaways(root, min_sessions=args.maturity)
-        print(f"{len(ws)} un-consolidated events (salience-ordered) · catalog {len(cat)} takeaways "
+        print(f"{len(ws)} un-consolidated events ({args.priority}-ordered) · catalog {len(cat)} takeaways "
               f"({len(mature)} mature):")
         for rv in ws[:40]:
             sample = rv.quote.strip().replace("\n", " ")
@@ -972,7 +976,7 @@ def main(argv=None) -> None:
     report = run(complete_route, complete_synth, route_model=args.route_model, synth_model=args.synth_model,
                  min_confidence=args.min_confidence, drift_threshold=args.drift_threshold,
                  maturity=args.maturity, forget=not args.no_forget, max_usd=args.max_usd,
-                 limit=args.limit, progress=progress)
+                 limit=args.limit, priority=block.priority_strategy(args.priority), progress=progress)
     if args.show:
         for t in report.takeaways:
             sup, rel = t["support"], t["relation"]["kind"]

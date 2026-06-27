@@ -139,7 +139,7 @@ class _Probe:
     def __init__(self):
         self.lines = []
         self.processed = self.skipped = 0
-    def start(self, *, total, todo, already): pass
+    def start(self, *, total, todo, already, backlog=0): pass
     def tick(self, key, outcome, *, outputs=0, cost=0.0):
         if outcome == "done":
             self.processed += 1

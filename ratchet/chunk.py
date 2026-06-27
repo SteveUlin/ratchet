@@ -228,6 +228,8 @@ def main(argv=None) -> None:
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — chunk never calls an LLM)")
+    ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
+                    help="ordering policy (inert — chunk emits no per-item signal, so every policy is arrival order)")
     args = ap.parse_args(argv)
 
 
@@ -256,16 +258,17 @@ def main(argv=None) -> None:
     # The batch/idempotent path: drive the block over cleaned blobs. A bare hash is a RAW hash today;
     # map it to its cleaned blob (materialize the raw first) so the single-item key is the cleaned
     # hash, matching the block's item identity — then run a one-item block over that cleaned hash.
+    prio = block.priority_strategy(args.priority)
     blk = ChunkBlock(budget=args.budget)
     if args.hash and not args.all:
         if not blobstore.has(args.hash):
             ap.error(f"no such blob: {args.hash}")
         cleaned_hash, _, _ = weave.materialize(args.hash)   # raw → cleaned (idempotent)
         one = _OneCleaned(cleaned_hash, budget=args.budget)
-        block.run(one, dry_run=args.dry_run, progress=make_progress(one))
+        block.run(one, dry_run=args.dry_run, priority=prio, progress=make_progress(one))
         return
     block.run(blk, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
-              dry_run=args.dry_run, progress=make_progress(blk))
+              dry_run=args.dry_run, priority=prio, progress=make_progress(blk))
 
 
 class _OneCleaned(ChunkBlock):

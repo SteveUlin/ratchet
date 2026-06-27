@@ -1,0 +1,9 @@
+{
+  "_comment": "Golden expected processing order per PriorityStrategy (ADR-0011). The driver orders the eager enumeration by the named policy before --limit; the test fabricates these items+scores, drives block.run once per strategy, and asserts the recorded process() order equals `expected[name]`. d1/d2 tie at 2.0 to pin Greedy's STABLE tie-break (enumeration order: d1 before d2). Regenerate only when the seam's semantics change.",
+  "items": ["d1", "c", "a", "d2", "b"],
+  "scores": {"a": 3.0, "b": 1.0, "c": 5.0, "d1": 2.0, "d2": 2.0},
+  "expected": {
+    "greedy": ["c", "a", "d1", "d2", "b"],
+    "arrival": ["d1", "c", "a", "d2", "b"]
+  }
+}
