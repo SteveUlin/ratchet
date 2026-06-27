@@ -31,6 +31,7 @@
           chunk = block "chunk";  # window:    cleaned blob → chunkset
           glean = block "glean";  # extract:   chunkset → events (LLM)
           dream = block "dream";  # synthesize: events → takeaways (LLM)
+          review = block "review"; # gate:      takeaways → concepts (human + the /ratchet-review skill)
         });
     };
 }

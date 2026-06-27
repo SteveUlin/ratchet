@@ -292,6 +292,63 @@ def latest_decision(target: str, root: Path | None = None) -> dict | None:
     return best
 
 
+def latest_decisions(root: Path | None = None) -> dict[str, dict]:
+    """target -> the latest LIFECYCLE decision in force for it, folded over decisions in ONE scan — the
+    batch sibling of `latest_decision` for derived views that filter MANY targets at once (the review
+    queue over every takeaway, valid-concepts over every concept). Same (fetched_at, content_hash)
+    recency tie-break.
+
+    Producer `processed` markers are EXCLUDED. They are not lifecycle state, and their target space
+    COLLIDES with review state: a takeaway's source_id is its `cluster_signature`, which is also what
+    dream's per-cluster `processed` marker targets. Folding them in would let a later dream run's
+    marker (a newer decision on the same target) shadow an `accept`/`reject`/`snooze` and resurrect a
+    reviewed takeaway. Producer idempotency reads markers via the verb-scoped `decisions_for(...,
+    verb='processed')`, never this fold."""
+    best: dict[str, tuple[tuple[str, str], dict]] = {}
+    for body in decisions_for(None, root):
+        if body.get("verb") == "processed":           # producer bookkeeping, not lifecycle state
+            continue
+        target = body.get("target")
+        if not target:
+            continue
+        key = (body.get("fetched_at", ""), body.get("content_hash", ""))
+        if target not in best or key > best[target][0]:
+            best[target] = (key, body)
+    return {t: b for t, (k, b) in best.items()}
+
+
+def validate_span(data: bytes, byte_start, byte_end) -> tuple[int, int] | None:
+    """Re-anchor a recorded byte span at a READ boundary — the single source of the trust anchor's
+    read-side check (glean writes the span; dream and review re-validate it here, never trust it).
+    Accept it ONLY as in-bounds plain ints (0 <= start < end <= len) so a malformed/foreign span can
+    never resolve to the whole blob or silently-clamped bytes. `bool` is an int subclass → rejected
+    (a span is never a flag). Returns the (start, end) span or None."""
+    if isinstance(byte_start, bool) or isinstance(byte_end, bool):
+        return None
+    if not (isinstance(byte_start, int) and isinstance(byte_end, int) and 0 <= byte_start < byte_end <= len(data)):
+        return None
+    return byte_start, byte_end
+
+
+def session_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> str | None:
+    """The originating session id for a cleaned blob via content-addressed lineage: cleaned blob →
+    `derived_from` (raw) → its `source_id`. An optional `cache` dict memoizes across calls. Absent or
+    broken meta → None, never fatal. Single-sourced here (both dream and review walk this lineage)."""
+    root = root or config.data_root()
+    if cache is not None and cleaned_hash in cache:
+        return cache[cleaned_hash]
+    sid = None
+    try:
+        raw = get_meta(cleaned_hash, root).get("derived_from")
+        if raw:
+            sid = get_meta(raw, root).get("source_id")
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        sid = None
+    if cache is not None:
+        cache[cleaned_hash] = sid
+    return sid
+
+
 def ingest(
     text: str,
     *,

@@ -7,8 +7,8 @@ The unifying `ratchet` service does not exist yet — the project is built as co
 over a content-addressed **blobstore**, each step a materialized, lineage-linked artifact:
 
 ```
-tap → raw blob → weave → cleaned blob → chunk → chunkset → glean → events → dream → takeaways
-   (fetch)            (render)              (window)         (extract, LLM)     (synthesize, LLM)
+tap → raw → weave → cleaned → chunk → chunkset → glean → events → dream → takeaways → review → concepts
+  (fetch)      (render)            (window)        (extract, LLM)    (synthesize, LLM)   (human gate)
 ```
 
 - `tap` — locate new/changed Claude Code transcripts and copy each in as an immutable **raw** blob.
@@ -26,15 +26,21 @@ tap → raw blob → weave → cleaned blob → chunk → chunkset → glean →
 - `dream` — cluster events and synthesize each cluster into a durable, evidence-cited **takeaway**
   (a "why" + name). Deterministic stdlib clustering first, then one LLM call per cluster with a
   *sharper* model (sleep-time: rare, batched). A takeaway cites its events, extending the trust chain
-  to the immutable blob. Takeaways are append-only and **evolve by supersession** — a re-run
-  re-clusters and a new takeaway supersedes those it shares evidence with (grow/split/merge are one
-  mechanism), so "current" is a fold over the log; nothing is edited in place.
+  to the immutable blob. Takeaways **evolve by supersession** — a re-run re-clusters and a new takeaway
+  supersedes those it re-covers (grow/split/merge are one mechanism); "current" is a derived fold.
+- `review` — the **human gate**: promote takeaways to **concepts** (ratchet's curated knowledge).
+  `review.py` is the pure backend; the interaction is the `/ratchet-review` skill, where Claude is an
+  active faithfulness-checker (the `why` is untrusted — Claude checks it against the verified evidence
+  and escalates to investigate the doubtful cases) and you make every call. accept/reject/snooze/edit
+  are append-only decision blobs; an accept mints a concept, closing the loop (dream reads concepts to
+  judge belief-change). The queue and the valid concept set are derived queries, never stored lists.
 
 ## Layout
 
-- `ratchet/` — the Python package: `config`, `blobstore`, `tap`, `weave`, `chunk`, `glean`, `dream`,
-  `completer` (the injected LLM seam — a `Completion` + the default `claude` CLI binding), and
-  `runlog` (the append-only producer-run substrate the LLM stages share).
+- `ratchet/` — the Python package: `config`, `blobstore` (every artifact is a content-addressed,
+  versioned blob — ADR-0007), `tap`, `weave`, `chunk`, `glean`, `dream`, `review`, and `completer`
+  (the injected LLM seam — a `Completion` + the default `claude` CLI binding).
+- `.claude/skills/ratchet-review/` — the `/ratchet-review` skill (the human gate's interaction).
 - `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.
 
 ## Data
@@ -63,7 +69,14 @@ nix run .#glean -- --all --max-usd 2.00                  # glean every chunkset,
 
 nix run .#dream -- --dry-run                             # cluster events, print groupings (no LLM)
 nix run .#dream -- --show --max-usd 2.00                 # synthesize takeaways (default model: sonnet)
+
+nix run .#review -- --pending                            # the review queue (takeaways + verified evidence)
+nix run .#review -- --accept <takeaway> --assessment ".."  # promote a takeaway → concept
 ```
+
+The review gate is meant to be driven by the **`/ratchet-review` skill** (Claude presents each
+takeaway with its verified evidence, checks the untrusted `why`, and records your verdict); the CLI
+above is the same backend it calls.
 
 `glean` and `dream` are the LLM stages — by default they shell out to your authed `claude` CLI.
 Both re-run idempotently (a processed ledger skips done work); a bumped prompt or `--model` re-does
@@ -79,7 +92,7 @@ direnv allow                        # or: nix develop
 python -m ratchet.tap --dry-run
 python tests/test_storage.py && python tests/test_tap.py && \
   python tests/test_weave.py && python tests/test_chunk.py && \
-  python tests/test_glean.py && python tests/test_dream.py
+  python tests/test_glean.py && python tests/test_dream.py && python tests/test_review.py
 ```
 
 `test_glean.py` and `test_dream.py` run offline with fake completers; set `RATCHET_LIVE_TEST=1` to

@@ -301,16 +301,19 @@ print("OK — evolution/COVERAGE: supersession is coverage-conditioned (no orpha
 # --- 6. concept seam + belief-change relation -----------------------------------------------
 
 assert dream.load_concepts(ROOT) == [], "no concepts yet → empty (the seam is wired, review fills it)"
-(Path(ROOT) / "concepts" / "c1.json").write_text(
-    json.dumps({"id": "c1", "title": "Use jj", "statement": "Use jj, never git."}), encoding="utf-8")
-assert [c["id"] for c in dream.load_concepts(ROOT)] == ["c1"], "a concept file is read once present"
+blobstore.ingest(blobstore.canonical_json({"id": "c1", "title": "Use jj", "statement": "Use jj, never git."}),
+                 source_kind="concept", source_id="c1", origin_ref={"stage": "review"})
+assert [c["id"] for c in dream.load_concepts(ROOT)] == ["c1"], "an ingested concept BLOB is read once present (ADR-0007)"
 # the relation is coerced against KNOWN ids: a real concept id sticks; an unknown one falls back to new
 assert dream._clean_relation({"kind": "contradicts", "concept_id": "c1"}, {"c1"})["kind"] == "contradicts"
 assert dream._clean_relation({"kind": "contradicts", "concept_id": "ghost"}, {"c1"})["kind"] == "new", \
     "a relation to a non-existent concept can't be trusted → new"
 assert dream._clean_relation({"kind": "bogus"}, {"c1"})["kind"] == "new", "unknown relation kind → new"
-(Path(ROOT) / "concepts" / "c1.json").unlink()
-print("OK — concept seam reads the curated layer; belief-change relation coerced against known concepts.")
+# retire c1 (immutable — no file to unlink; a retire decision is how a concept leaves the valid set)
+blobstore.ingest(blobstore.canonical_json({"verb": "retire", "target": "c1", "at": config.now()}),
+                 source_kind="decision", source_id="dec-retire-c1", prev=None, origin_ref={"stage": "review"})
+assert dream.load_concepts(ROOT) == [], "a retired concept leaves the valid set"
+print("OK — concept seam reads VALID concept blobs (retire drops them); belief-change relation coerced.")
 
 
 # --- 7. adversarial hardening: flaky completer isolated, budget stop, non-finite scrubbed ----
@@ -361,12 +364,12 @@ assert {r["id"] for r in bad} <= set(blobstore.latest_by_kind("event")), "the ma
 assert {e.id for e in dream.gather_events(ROOT)}.isdisjoint({"bad-null", "bad-over", "bad-inv"}), \
     "malformed spans are rejected at the read boundary (no whole-blob or clamped 'verified' bytes)"
 
-# (b) a concept file with a non-string id is skipped (load_concepts' 'never fatal' contract) — a non-
+# (b) a concept blob with a non-string id is skipped (load_concepts' 'never fatal' contract) — a non-
 #     string id is unhashable and would otherwise make the known-id set build error EVERY cluster.
-(Path(ROOT) / "concepts" / "bad.json").write_text(json.dumps({"id": ["oops"], "title": "x"}), encoding="utf-8")
-assert dream.load_concepts(ROOT) == [], "a non-string concept id is malformed, skipped — never fatal"
-assert dream.run(DreamFake(cite="all"), model="fake-badconcept").errored == 0, "a bad concept file wedges nothing"
-(Path(ROOT) / "concepts" / "bad.json").unlink()
+blobstore.ingest(blobstore.canonical_json({"id": ["oops"], "title": "x"}),
+                 source_kind="concept", source_id="badconcept", origin_ref={"stage": "review"})
+assert all(c["id"] != ["oops"] for c in dream.load_concepts(ROOT)), "a non-string concept id is skipped — never fatal"
+assert dream.run(DreamFake(cite="all"), model="fake-badconcept").errored == 0, "a bad concept blob wedges nothing"
 
 # (c) a model bump re-synthesizes the same grouping and REPLACES it in the current fold (one current
 #     takeaway per grouping; the older model's version is not also current). Recency is now the

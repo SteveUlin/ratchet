@@ -108,22 +108,24 @@ _STOPWORDS = frozenset(
 # --- the concept seam: dream reads the curated-knowledge layer the review gate writes ----------
 
 def load_concepts(root: Path | None = None) -> list[dict]:
-    """The current concept set — the human-reviewed source of truth dream judges belief-change
-    against (ADR-0006). Empty until the review stage exists, so every takeaway is `new` for now; the
-    seam is wired so the loop closes with zero re-architecture once concepts land. A concept file is
-    a JSON object `{id, title, statement, ...}`; malformed files are skipped, never fatal."""
+    """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
+    against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
+    derived, not stored: the latest version of each concept source, minus any whose latest decision is
+    `retire`. This is the loop closing — review's accepts become the concepts dream reads next run.
+    Empty until review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal."""
     root = root or config.data_root()
-    d = root / "concepts"
+    decisions = blobstore.latest_decisions(root)
     out: list[dict] = []
-    if not d.exists():
-        return out
-    for f in sorted(d.glob("*.json")):
+    for sid, h in blobstore.latest_by_kind("concept", root).items():
+        d = decisions.get(sid)
+        if d and d.get("verb") == "retire":      # retired out of the valid set (ADR-0007 §4)
+            continue
         try:
-            obj = json.loads(f.read_text(encoding="utf-8"))
+            obj = json.loads(blobstore.get(h, root))
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
-            out.append(obj)           # a non-string id is "malformed" too (it must be set-hashable downstream)
+            out.append(obj)
     return out
 
 
@@ -146,22 +148,6 @@ class ResolvedEvent:
     @property
     def id(self) -> str:
         return self.event["id"]
-
-
-def _session_of(cleaned_hash: str, root: Path, cache: dict) -> str | None:
-    """The originating session id for an event, via content-addressed lineage: cleaned blob →
-    `derived_from` (raw blob) → its `source_id`. Cached per cleaned blob. Absent meta → unknown."""
-    if cleaned_hash in cache:
-        return cache[cleaned_hash]
-    sid = None
-    try:
-        raw = blobstore.get_meta(cleaned_hash, root).get("derived_from")
-        if raw:
-            sid = blobstore.get_meta(raw, root).get("source_id")
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        sid = None
-    cache[cleaned_hash] = sid
-    return sid
 
 
 def gather_events(root: Path, *, min_confidence: float = 0.0) -> list[ResolvedEvent]:
@@ -196,23 +182,24 @@ def gather_events(root: Path, *, min_confidence: float = 0.0) -> list[ResolvedEv
         sp = ev[0] if ev and isinstance(ev[0], dict) else None
         if not ch or sp is None:
             continue
-        bs, be = sp.get("byte_start"), sp.get("byte_end")
-        if not (isinstance(bs, int) and isinstance(be, int) and 0 <= bs < be):
-            continue                  # reject None / negative / inverted before slicing clamps it
         try:
             data = blobs.get(ch)
             if data is None:
                 data = blobstore.get(ch, root).encode("utf-8")
                 blobs[ch] = data
-            if be > len(data):        # overshoot would be silently clamped — reject explicitly
-                continue
-            quote = data[bs:be].decode("utf-8")
-        except (FileNotFoundError, OSError, UnicodeDecodeError):
+        except (FileNotFoundError, OSError):
+            continue
+        span = blobstore.validate_span(data, sp.get("byte_start"), sp.get("byte_end"))   # the read-side anchor
+        if span is None:
+            continue
+        try:
+            quote = data[span[0]:span[1]].decode("utf-8")
+        except UnicodeDecodeError:    # a span splitting a multibyte char is not a real quote
             continue
         if not quote.strip():
             continue
-        resolved.append(ResolvedEvent(event=e, quote=quote, span=(bs, be),
-                                      session_id=_session_of(ch, root, sessions)))
+        resolved.append(ResolvedEvent(event=e, quote=quote, span=span,
+                                      session_id=blobstore.session_of(ch, root, sessions)))
     return resolved
 
 
