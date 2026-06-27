@@ -91,8 +91,29 @@ def parse_json_object(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+# Markers that mean "throttled, not broken" — a transient server-side rate limit worth WAITING OUT
+# rather than a real error worth failing fast. Matched case-insensitively across the CLI's error
+# envelope + stderr. The list is deliberately broad: a false positive only costs a longer wait before
+# the same failure, and a false negative is no worse than the old fast-fail — so the check is safe
+# either way (it can only ever ADD patience, never drop a result).
+_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "rate-limit", "ratelimit", "overloaded",
+                       "temporarily limiting", "429", "too many requests", "limiting requests")
+
+
+def _is_rate_limited(env: dict, stderr: str) -> bool:
+    """Did this failure come from a transient throttle? Scan the error envelope's text fields + stderr
+    for a known marker. The CLI surfaces a rate limit either as an `is_error` envelope (subtype/result
+    carry the message) or as a non-zero exit with the message on stderr — this catches both."""
+    hay = " ".join(str(x) for x in (
+        env.get("subtype"), env.get("result"), env.get("error"), stderr)).lower()
+    return any(m in hay for m in _RATE_LIMIT_MARKERS)
+
+
 def make_cli_completer(model: str = DEFAULT_MODEL, *, timeout: int = 240, retries: int = 2,
-                       backoff: float = 2.0, cwd: Path | None = None) -> Completer:
+                       backoff: float = 2.0, rate_limit_retries: int = 6,
+                       rate_limit_max_wait: float = 60.0,
+                       on_throttle: Callable[[float], None] | None = None,
+                       cwd: Path | None = None) -> Completer:
     """Bind the default extractor to the authed `claude` CLI. Print mode, JSON envelope (reports
     `total_cost_usd`), a replaced system prompt (no coding-agent prompt), `--max-turns 1`, and an
     **empty `--allowedTools` allowlist** so the model literally cannot call a tool. That last part is
@@ -103,21 +124,31 @@ def make_cli_completer(model: str = DEFAULT_MODEL, *, timeout: int = 240, retrie
     max-turns trip). cwd defaults to the data root — a CLAUDE.md-free, byte-stable dir keeps the
     cached prefix identical every call, so calls after the first read it at ~0.1x.
 
-    Resilient: the JSON envelope is parsed even on a non-zero exit (it carries the real error), and a
-    failing call is retried with backoff (transient overload/rate-limit). A call that still fails
-    raises CompleterError, which glean isolates per-chunk — one bad call never aborts a run."""
+    Resilient, with TWO retry budgets keyed on the failure mode (the JSON envelope is parsed even on a
+    non-zero exit — it carries the real error):
+      - a **transient throttle** (rate limit / overload — `_is_rate_limited`) gets its own larger budget
+        (`rate_limit_retries`) and an EXPONENTIAL wait capped at `rate_limit_max_wait`, so a backfill
+        rides out a multi-minute 429 window instead of dropping the chunk. `on_throttle(wait)` fires
+        before each such sleep (a hook the Progress layer can later surface as "rate-limited/waiting");
+      - any **other** failure keeps the small fast-fail budget (`retries`, linear backoff) — a real
+        error (e.g. `error_max_turns`) shouldn't make us sit and wait.
+    A call that still fails after its budget raises CompleterError, which the stages isolate per-item —
+    one bad call never aborts a run."""
     base = cwd or config.data_root()
     argv = ["claude", "-p", "--model", model, "--output-format", "json",
             "--max-turns", "1", "--allowedTools", ""]
 
     def complete(system: str, user: str) -> Completion:
         last = "no attempt"
-        for attempt in range(retries + 1):
+        tries = 0           # ordinary-error attempts consumed (fast-fail budget)
+        rl_tries = 0        # throttle waits consumed (ride-out budget)
+        while True:
+            rate_limited = False
             try:
                 proc = subprocess.run([*argv, "--system-prompt", system], input=user,
                                       capture_output=True, text=True, timeout=timeout, cwd=str(base))
             except (OSError, subprocess.TimeoutExpired) as e:
-                last = f"{type(e).__name__}: {e}"
+                last = f"{type(e).__name__}: {e}"          # a hang/spawn failure → fast-fail path
             else:
                 env = {}
                 if proc.stdout.strip():
@@ -135,8 +166,18 @@ def make_cli_completer(model: str = DEFAULT_MODEL, *, timeout: int = 240, retrie
                                       output_tokens=usage.get("output_tokens"))
                 last = (f"error ({env.get('subtype')})" if env
                         else f"exit {proc.returncode}, no JSON: {proc.stderr.strip()[:160]!r}")
-            if attempt < retries:
-                time.sleep(backoff * (attempt + 1))
-        raise CompleterError(f"claude CLI: {last}")
+                rate_limited = _is_rate_limited(env, proc.stderr)
+            if rate_limited and rl_tries < rate_limit_retries:
+                wait = min(rate_limit_max_wait, backoff * (2 ** rl_tries))   # exponential, capped
+                rl_tries += 1
+                if on_throttle is not None:
+                    on_throttle(wait)
+                time.sleep(wait)
+                continue
+            if not rate_limited and tries < retries:
+                tries += 1
+                time.sleep(backoff * tries)               # linear fast-fail backoff
+                continue
+            raise CompleterError(f"claude CLI: {last}")
 
     return complete
