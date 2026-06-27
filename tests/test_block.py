@@ -87,6 +87,7 @@ class FakeBlock:
 
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
+    priority = block.no_priority                       # default 0.0 → stable sort preserves order
 
 
 def fresh_root(prefix):
@@ -270,6 +271,7 @@ class FinalizeBlock:
                                   run_id=run_id, extra={"event_ids": [k]}, root=root)
 
     marker_extra = block.no_marker_extra
+    priority = block.no_priority
 
 r6 = fresh_root("finalize")
 fb = FinalizeBlock(["c1", "c2", "c3"], cost=0.0)
@@ -345,5 +347,48 @@ assert abs(prog.cost - 0.21) < 1e-9, prog.cost
 print("OK §9 — Progress renders from its own start/tick/stop protocol alone (decoupled from the driver)")
 
 
-print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, "
-      "DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol structure")
+# === 10. priority() makes enumeration a PRIORITY QUEUE: highest-value first, --limit takes the top ===
+# ADR-0010 §8's one composable knob. The driver stably sorts items DESCENDING by priority(item) BEFORE
+# the --limit slice, so the highest-priority work runs first and the cap takes the top-`limit`. The
+# default `no_priority` (0.0 everywhere) leaves enumeration order untouched (stable sort) — that is why
+# §1-9 above, all on the default, are byte-for-byte unchanged.
+
+class PriorityBlock(FakeBlock):
+    """A FakeBlock that scores each item by a supplied map — so the test reads the driver's sort, not a
+    stage's. Items enumerate in their given order; priority() re-orders them descending before --limit."""
+    name = "prio"
+
+    def __init__(self, items, scores, **kw):
+        super().__init__(items, **kw)
+        self._scores = scores
+
+    def priority(self, item):
+        return self._scores[item]
+
+r10 = fresh_root("priority")
+# enumeration order [lo, hi, mid]; priorities hi=9 > mid=5 > lo=1 → process order must be [hi, mid, lo].
+pb = PriorityBlock(["lo", "hi", "mid"], {"lo": 1.0, "hi": 9.0, "mid": 5.0})
+probe_p = ProbeProgress()
+rep_p = block.run(pb, root=r10, progress=probe_p)
+assert pb.processed_keys == ["hi", "mid", "lo"], \
+    f"the driver processed highest-priority first (descending sort): {pb.processed_keys}"
+assert [t["key"] for t in probe_p.ticks] == ["hi", "mid", "lo"], "progress streamed in priority order"
+
+# --limit takes the TOP-`limit` by priority (the sort precedes the --limit slice): only hi+mid run.
+r10b = fresh_root("priority-limit")
+pb2 = PriorityBlock(["lo", "hi", "mid"], {"lo": 1.0, "hi": 9.0, "mid": 5.0})
+rep_p2 = block.run(pb2, root=r10b, limit=2, progress=None)
+assert rep_p2.examined == 2 and pb2.processed_keys == ["hi", "mid"], \
+    f"--limit takes the top-2 by priority, not the first two enumerated: {pb2.processed_keys}"
+
+# the DEFAULT no_priority is a stable no-op: equal scores preserve enumeration order exactly.
+r10c = fresh_root("priority-default")
+pd = FakeBlock(["a", "b", "c", "d"])               # all default 0.0 priority
+block.run(pd, root=r10c, progress=None)
+assert pd.processed_keys == ["a", "b", "c", "d"], \
+    f"default priority (0.0) + stable sort preserves enumeration order: {pd.processed_keys}"
+print("OK §10 — priority(): descending priority queue, --limit takes the top slice, default is a stable no-op")
+
+
+print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
+      "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol structure")

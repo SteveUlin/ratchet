@@ -271,6 +271,7 @@ class GleanBlock:
     name = "glean"
     commits_per_item = True
     finalize = block.no_finalize
+    priority = block.no_priority             # arrival order (a future salience prefilter is ADR-0010 §8)
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
                  targets: list[str] | None = None) -> None:

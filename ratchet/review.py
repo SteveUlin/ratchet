@@ -89,9 +89,9 @@ def _now_dt() -> datetime:
 
 def _snooze_due(d: dict) -> bool:
     """A snooze re-surfaces when its `until` time has passed (the trigger is validated at snooze time,
-    so it always parses here). "Re-surface on more evidence" is NOT a snooze trigger: more evidence
-    grows a cluster → a new `cluster_signature` → a fresh takeaway that surfaces on its own, while the
-    snoozed one is superseded — so a corroboration counter on a now-frozen id would be inert."""
+    so it always parses here). "Re-surface on more evidence" is NOT a snooze trigger: under v2 more
+    evidence STRENGTHENS the same stable takeaway id (a new version, latest wins), so a snoozed takeaway
+    grows in place — a time trigger is the only re-surface lever the snooze needs to own."""
     until = d.get("until")
     if not until:
         return False
@@ -116,16 +116,44 @@ def _is_out_of_queue(d: dict) -> bool:
 
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> list[dict]:
-    """The review queue: every current takeaway with no terminal decision and no live snooze, each
-    presented with its verified evidence. Derived from references — stores nothing (ADR-0007)."""
+    """The review queue: every MATURE takeaway with no terminal decision and no live snooze, each
+    presented with its verified evidence. Derived from references — stores nothing (ADR-0007).
+
+    The MATURITY GATE is `dream.current_takeaways`: it returns only takeaways corroborated across
+    `dream.MATURITY_SESSIONS` (default 2) DISTINCT sessions. An incubating takeaway (a single session so
+    far) is deliberately kept OUT of the human gate — a one-off lesson costs review attention and risks
+    promoting a false belief from a single moment — but it stays LIVE in the routing catalog so a later
+    session can strengthen it across the bar (see `incubating`)."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
     out: list[dict] = []
-    for tk in dream.current_takeaways(root):
+    for tk in dream.current_takeaways(root):       # the maturity gate (sessions >= MATURITY_SESSIONS)
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
         out.append(_present(tk, root, context_bytes=context_bytes))
+    return out
+
+
+def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_SESSIONS) -> list[dict]:
+    """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
+    them), but not yet shown to the human gate. The counterpart to `pending`: `catalog` minus the mature
+    set, minus anything already terminally decided. Surfaced so the reviewer can SEE what is accruing
+    toward review (and decide to act early) without it crowding — or pre-biasing — the queue. A light
+    projection (no evidence resolution); `needs` is the count of further distinct sessions to mature."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    mature = {t["id"] for t in dream.current_takeaways(root, min_sessions=min_sessions)}
+    out: list[dict] = []
+    for tk in dream.catalog(root):
+        if tk["id"] in mature:
+            continue
+        d = decisions.get(tk["id"])
+        if d and _is_out_of_queue(d):              # accepted/rejected/etc. directly — no longer accruing
+            continue
+        sup = tk.get("support") or {"events": 0, "sessions": 0}
+        out.append({"takeaway_id": tk["id"], "title": tk.get("title", ""), "support": sup,
+                    "needs": max(0, min_sessions - sup.get("sessions", 0))})
     return out
 
 
@@ -181,8 +209,9 @@ def _record(verb: str, target: str, root: Path, **fields) -> dict:
 
 def _mint_concept_id(takeaway: dict) -> str:
     """A fresh, stable concept id for a `new` takeaway. Derived from the accepted takeaway's identity +
-    title (stable across re-reads), NOT the cluster_signature alone (which shifts as the cluster
-    grows) — a later refinement reuses this id via the takeaway's `relation.concept_id`, never re-mints."""
+    title — and in v2 the takeaway id is itself stable (a minted `t-…`, versioned in place), so this
+    concept id is stable across re-reads. A later refinement reuses it via `relation.concept_id`, never
+    re-mints."""
     return CONCEPT_ID_PREFIX + hashlib.sha256(
         f"{takeaway['id']}:{takeaway.get('title', '')}".encode()).hexdigest()[:12]
 
@@ -241,7 +270,7 @@ def snooze(takeaway_id: str, root: Path | None = None, *, until: str, reason: st
     """Defer a takeaway until a concrete time. `until` is VALIDATED as ISO here, at write time — an
     unparseable trigger would otherwise never fire and the snooze would become a permanent graveyard,
     the exact failure mode the trigger exists to prevent. (Re-surfacing on *more evidence* is not a
-    snooze concern: that grows the cluster into a fresh takeaway via supersession — see `_snooze_due`.)"""
+    snooze concern: more evidence strengthens the same stable takeaway in place — see `_snooze_due`.)"""
     if not until:
         raise ValueError("snooze needs a re-surface time: --until <iso>")
     try:
@@ -274,7 +303,9 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="review",
                                  description="The human review gate: takeaways → reviewed concepts.")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--pending", action="store_true", help="the review queue (takeaways + verified evidence)")
+    g.add_argument("--pending", action="store_true", help="the review queue (mature takeaways + verified evidence)")
+    g.add_argument("--incubating", action="store_true",
+                   help="takeaways still below the maturity bar (accruing toward review, not yet shown)")
     g.add_argument("--context", metavar="TAKEAWAY", help="one takeaway with a WIDE evidence window (deep path)")
     g.add_argument("--accept", metavar="TAKEAWAY", help="promote a takeaway to a concept")
     g.add_argument("--reject", metavar="TAKEAWAY", help="reject a takeaway")
@@ -296,9 +327,15 @@ def main(argv=None) -> None:
     if args.pending:
         q = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES)
         if args.json:
-            print(json.dumps(q, ensure_ascii=False, indent=2))
+            print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
-            _print_queue(q)
+            _print_queue(q, incubating_count=len(incubating()))
+    elif args.incubating:
+        inc = incubating()
+        if args.json:
+            print(json.dumps(inc, ensure_ascii=False, indent=2))
+        else:
+            _print_incubating(inc)
     elif args.context:
         c = context_for(args.context, context_bytes=args.bytes if args.bytes is not None else 1200)
         if c is None:
@@ -329,9 +366,18 @@ def main(argv=None) -> None:
               else "\n".join(f"  {c['id']}  {c.get('title', '')}" for c in cs) or "  (no valid concepts yet)")
 
 
-def _print_queue(q: list[dict]) -> None:
+def _incubating_tail(incubating_count: int) -> str:
+    """A one-line footer noting how many takeaways are still accruing below the maturity bar — so an
+    empty/short queue does not read as 'dream learned nothing' when lessons are in fact incubating."""
+    if not incubating_count:
+        return ""
+    return (f"\n({incubating_count} takeaway(s) incubating below the maturity bar — "
+            f"see `--incubating`)")
+
+
+def _print_queue(q: list[dict], *, incubating_count: int = 0) -> None:
     if not q:
-        print("review queue empty — nothing to review.")
+        print("review queue empty — nothing to review." + _incubating_tail(incubating_count))
         return
     print(f"{len(q)} takeaway(s) to review:\n")
     for i, t in enumerate(q, 1):
@@ -341,6 +387,19 @@ def _print_queue(q: list[dict]) -> None:
         for ev in t["evidence"]:
             print(f"    ✓ {ev['quote'][:100]!r}")
         print()
+    tail = _incubating_tail(incubating_count)
+    if tail:
+        print(tail.lstrip("\n"))
+
+
+def _print_incubating(inc: list[dict]) -> None:
+    if not inc:
+        print("nothing incubating — every live takeaway has reached the maturity bar.")
+        return
+    print(f"{len(inc)} takeaway(s) incubating (below the maturity bar):\n")
+    for t in inc:
+        sup = t["support"]
+        print(f"  {t['title']}  [{sup['events']}ev/{sup['sessions']}sess · needs {t['needs']} more session(s)]")
 
 
 if __name__ == "__main__":

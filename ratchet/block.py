@@ -69,6 +69,15 @@ class Block(Protocol):
         """Stage audit fields for the per-item marker's body (glean: n_rejected/n_calls/…). Default {}."""
         ...
 
+    def priority(self, item: Item) -> float:
+        """The item's processing PRIORITY — the one composable knob that turns enumeration into a
+        priority queue (ADR-0010 §8). The driver stably sorts items DESCENDING by this before the
+        --limit cap, so the highest-value work runs first and a budget/limit ceiling takes the top
+        slice. Default (`no_priority`) returns 0.0, so a stable sort preserves enumeration order — a
+        stage that does not care (tap/weave/chunk/glean) stays byte-for-byte identical. dream orders
+        its working set by event salience."""
+        ...
+
 
 # --- defaults a stage mixes in for the optional knobs (so a stage declares only what it overrides) --
 
@@ -85,6 +94,13 @@ def no_finalize(_self, *, root: Path, run_id: str) -> None:
 def no_marker_extra(_self, item: Item) -> dict:
     """The default `marker_extra` — no audit fields. Stages with per-item forensics (glean) override."""
     return {}
+
+
+def no_priority(_self, item: Item) -> float:
+    """The default `priority` — every item ties at 0.0. Python's sort is stable, so a uniform priority
+    leaves enumeration order untouched: a stage that never opts in (tap/weave/chunk/glean) processes
+    in exactly the order it always did. dream overrides with event salience to make a priority queue."""
+    return 0.0
 
 
 # --- the done-set + the processed marker (0007's per-input decisions, generalized to per-item) ------
@@ -311,6 +327,10 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     pvals = tuple(v for _, v in params)
     done = done_index(block.name, root)            # one scan
     items = list(block.items(root, source_id=source_id))   # eager: the bar + startup summary need the total
+    items.sort(key=block.priority, reverse=True)   # ADR-0010 §8: a PRIORITY QUEUE — highest-value work
+                                                   # first. Stable, so the default 0.0 priority preserves
+                                                   # enumeration order (other stages byte-identical); the
+                                                   # sort precedes --limit so the cap takes the TOP slice.
     if limit is not None:
         items = items[:limit]                      # --limit caps items EXAMINED (the first `limit`)
     report = Report(stage=block.name, run_id=run_id)

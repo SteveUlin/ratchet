@@ -163,6 +163,7 @@ class ChunkBlock:
     commits_per_item = True
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
+    priority = block.no_priority
 
     def __init__(self, budget: int = DEFAULT_BUDGET) -> None:
         self.budget = budget

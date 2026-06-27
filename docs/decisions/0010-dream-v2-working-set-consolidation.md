@@ -1,12 +1,25 @@
 # 0010 — dream v2: incremental working-set consolidation (a proposed redesign)
 
-- Status: **proposed** (a grounded plan; not yet built)
+- Status: **accepted** — implemented 2026-06-27 (all 8 suites green)
 - Date: 2026-06-27
-- Supersedes (when built): 0006's global-re-cluster dream. Builds on 0007 (blobs + decisions), 0009 (Block).
+- Supersedes: 0006's global-re-cluster dream. Builds on 0007 (blobs + decisions), 0009 (Block).
 - Superseded by: —
 
-This is a DESIGN ADR — the v2 model + decisions, grounded in a prior-art pass (see References), to be
-implemented behind green tests after the ADR-0009 progress work lands.
+This is a DESIGN ADR — the v2 model + decisions, grounded in a prior-art pass (see References),
+implemented behind green tests on top of the ADR-0009 progress work.
+
+## As-built (2026-06-27)
+
+Implemented as proposed, with **one material divergence from §1**: `route()` puts the **whole catalog**
+into the Haiku prompt — there is **no top-K retrieval / lexical pre-filter at all**. The §1 worry ("can a
+lexical recall pre-filter surface the right candidates without embeddings?") is *dissolved*, not solved:
+the catalog is kept small enough to render in full by the maturity gate (incubating-but-live takeaways
+stay routable) plus the conservative `forget` pass, so the LLM sees every candidate and no recall step can
+drop one. The escape hatch if the catalog ever outgrows the prompt (periodic `merge` is built; a
+lexical pre-filter is the fallback) stays a *future* concern, not a v1-day one. Everything else shipped as
+written: per-event NEW/STRENGTHEN/NOOP, supersession-not-edit, BIRCH support stats, the distinct-session
+maturity gate, conservative forget, the salience `priority` knob on the Block driver. Built by workflow
+`wf_af99af89-c48` (which ran to completion through API rate-limit backoffs, not the stall it looked like).
 
 ## Context
 

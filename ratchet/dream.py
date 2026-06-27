@@ -1,60 +1,53 @@
-"""dream — the synthesis stage: cluster glean's fleeting events and distill each cluster into one
-durable, evidence-cited **takeaway** (ADR-0006).
+"""dream v2 — incremental WORKING-SET CONSOLIDATION: route each un-consolidated glean event to one of
+NEW / STRENGTHEN / NOOP and maintain a small, live CATALOG of durable, evidence-cited **takeaways**
+(ADR-0010, superseding 0006's global re-cluster).
 
     … chunk → chunkset → glean → events → dream → takeaways → [human review] → concepts → generate
-                                            (synthesis, LLM, rare + bigger model)
+                                            (consolidation: a cheap router + a rare synthesizer)
 
-glean runs cheap and per-chunk (Haiku); dream is its opposite — INFREQUENT, over the whole event
-pile, with a SHARPER model (sleep-time compute: spend here, it's rare and amortized). It does two
-things a per-chunk pass cannot: it sees events *together* (so it can find the recurring "why" behind
-many observations), and it re-reads the TRUSTED verbatim quote rather than leaning on glean's
-untrusted one-line summary. The summary was only ever triage; the quote is the ground truth.
+v1 clustered the WHOLE event pile every run, then one Sonnet call per cluster. It under-merged (lexical
+TF-IDF over short quotes is too sparse), churned (a new event shifted cluster signatures and re-fired
+synthesis), and never "failed in the middle." v2 inverts it into a bounded, iterative, ORDER-aware loop
+— and, with no embeddings available (only the authed claude CLI), uses the LLM ITSELF as the similarity
+oracle over an IN-PROMPT catalog, not a vector index.
 
-Two stages, by the same split that governs the rest of ratchet — deterministic work is cheap and
-reproducible, the LLM call is not:
-  1. CLUSTER (deterministic, stdlib, no LLM): group events by lexical similarity over their trusted
-     quotes. Cheap enough to recompute every run, so it is NOT a stored blob — the blobstore models
-     single-parent lineage and a clustering is a fan-in over many events. The partition is recorded
-     where it is actually useful: each cluster's member ids land in its `processed` decision blob, and
-     each takeaway cites its events. Auditable and re-derivable without a new artifact.
-  2. SYNTHESIZE (LLM, one call per cluster): write the cluster's "why" + a name, judge how it relates
-     to already-known CONCEPTS, and cite the events it relied on. The trust chain extends one level:
-     takeaway → cited event ids → each event's verified byte span → immutable cleaned blob.
+The model (ADR-0010):
 
-Takeaways ARE blobs now (ADR-0007): a logical takeaway is a RAW blob whose `source_id` is the
-deterministic `cluster_signature` (the hash of its sorted member event ids), and each synthesis is an
-immutable VERSION (content = `blob_hash(canonical-json(record))`). Identical membership => the same
-source_id => a re-synthesis is a new version under it, `prev`-linked, latest wins; a membership change
-=> a new source_id => a distinct logical takeaway. The append-only `events/dream-*.jsonl` stream and
-the `state/` processed ledger retire: "already done" is a `processed` decision blob (verb='processed',
-target=cluster_signature, keyed on (stage, prompt_version, model)), and `current_takeaways` derives
-from the blobstore TimeMap, not a log-fold.
+  WORKING SET — a DERIVED query: every glean event (latest version) MINUS those whose latest lifecycle
+  decision is `consolidated` or `stale`. Ordered by SALIENCE (markers × confidence) into a PRIORITY
+  QUEUE, so the strongest evidence seeds/corroborates first and stragglers wait (and are forgotten
+  first). This is `DreamBlock.items()`.
 
-EVOLUTION is first-class (sulin): names, summaries, and groupings change over time — a cluster may
-need to split or merge as more evidence arrives. We never mutate a takeaway in place (that would
-orphan its evidence spans and lose history). Instead a re-run re-clusters globally and a new takeaway
-**supersedes** the current takeaways it replaces: grow, split (one→many), and merge (many→one) are
-all the same mechanism. Supersession is COVERAGE-CONDITIONED — a prior takeaway is folded out only
-when ALL its events are re-covered by takeaways committed in the same run, so a dropped or errored
-split-child can never orphan its parent's events (`run`). `current_takeaways` folds the supersede
-links to "now"; nothing is edited, only appended.
+  CATALOG — the current takeaways: `latest_by_kind('takeaway')` minus any with a merge/retire/reject
+  decision. Small by design (forgetting + the maturity gate bound it), so the WHOLE catalog renders into
+  the route prompt — NO retrieval, NO top-K, NO embeddings; the router reads it all.
 
-Idempotency mirrors glean: a `processed` decision is keyed by (cluster_signature, prompt_version,
-model). An unchanged cluster is skipped; a changed one (new signature) re-synthesizes. Bump
-PROMPT_VERSION or the model to re-synthesize the same groupings with a sharper prompt.
+  ROUTE — one cheap Haiku call per event: given the event's VERIFIED verbatim quote + summary and the
+  catalog as a numbered list, return {decision: new|strengthen|noop, takeaway_id}. A strengthen naming
+  an id not in the catalog is coerced to `new` (defensive, like `_clean_relation`).
 
-dream is a `block.Block` (ADR-0009) — but THE one block that commits per RUN, not per item. Its
-`items()` runs the global deterministic prelude (gather + cluster) and yields one cluster per item;
-`process()` synthesizes a cluster (one LLM call) but RECORDS it instead of committing — because the
-coverage-conditioned supersession needs the whole run's emitted takeaways before any `supersedes` is
-known. So `commits_per_item=False` and `finalize()` does every takeaway-blob + marker commit after
-the run's coverage is settled. The done-set / commit ordering is `block.done_index` /
-`block.write_processed`, generalized from this stage's old per-cluster ledger; the observable run
-contract (cluster → synthesize → coverage-supersede → commit, all per-run) is UNCHANGED. `dream.run`
-survives as a thin shim returning the old `RunReport` shape so callers stay untouched.
+  APPLY —
+    new        → SYNTHESIZE (one Sonnet call): mint a STABLE takeaway id (`t-`+sha256(seed_event)[:12]),
+                 write the takeaway with the cited event's evidence (span + verbatim quote + context),
+                 support {events:1, sessions:1}; then a `consolidated` decision for the event.
+    strengthen → BUMP SUPPORT (cheap, NO LLM by default): a NEW VERSION of that takeaway id (the
+                 blobstore TimeMap versions it, latest wins) — append the new event's evidence (dedup by
+                 event_id), union distinct sessions, recompute support (the BIRCH sufficient-statistic),
+                 max-merge markers, bump last_seen. RE-SYNTHESIZE the `why` only when lexical drift
+                 crosses a threshold; else just bump. Then a `consolidated` decision.
+    noop       → nothing durable; the event stays un-consolidated (later forgotten).
 
-The LLM call is injected as a `Completer`; everything else (clustering, parsing, citation
-verification, supersede linking, the fold) is pure and tested offline with a fake.
+  TAKEAWAY IDENTITY — the key change from v1: `source_id` is a STABLE MINTED id, so an UPDATE is a new
+  VERSION of the same id (no membership churn). The v1 coverage-conditioned supersession is GONE; the
+  current set is `latest_by_kind('takeaway')` latest-per-id minus merged/retired. The stored content is a
+  strict SUPERSET of what review reads, so review.py and the trust chain are UNCHANGED.
+
+dream v2 is a `block.Block` (ADR-0009) that commits PER ITEM (the inversion of v1's per-run finalize):
+`items()` yields the salience-ordered working set; `priority()` orders it; `process()` routes + applies,
+committing each event's takeaway version + `consolidated` decision immediately (resumable, fail-in-the-
+middle), and folds the result into the ON-INSTANCE catalog so the NEXT event routes against the updated
+catalog. `finalize()` runs a conservative `forget` pass. The route and synth calls are SEPARATE injected
+`Completer`s (Haiku + Sonnet), so the whole loop is offline-testable with fakes.
 """
 from __future__ import annotations
 
@@ -71,44 +64,63 @@ from . import blobstore, block, completer, config
 from .completer import Completer
 from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dream carries it upward
 
-PROMPT_VERSION = "dream/1"               # bump to re-synthesize the same clusters with a sharper prompt
-DREAM_MODEL = "sonnet"                    # dream is rare → afford a sharper model than glean's haiku
-OUT_NOUN = "takeaways"                    # the per-cluster output noun the Progress bar/line shows
-SIM_THRESHOLD = 0.34                      # cosine to a cluster centroid to JOIN it; high → under-merge
+PROMPT_VERSION = "dream/2"               # bump to re-route NOT-yet-consolidated events with a sharper prompt
+ROUTE_MODEL = "haiku"                    # the router is cheap + per-event → the small model
+SYNTH_MODEL = "sonnet"                   # synthesis is rare (new + drift) → afford a sharper model
+OUT_NOUN = "takeaways"                   # the per-event output noun the Progress bar/line shows
+
+MATURITY_SESSIONS = 2                    # the review bar: corroborated across this many DISTINCT sessions
+DRIFT_THRESHOLD = 0.5                    # lexical drift above which a strengthen re-synthesizes the why
+FORGET_TAU = 4                           # dream cycles an event may sit un-consolidated before forget-eligible
+FORGET_SALIENCE_FLOOR = 0.05             # AND its salience must be below this (never age alone — ADR-0010 §6)
+CONTEXT_BYTES = 160                      # surrounding-context window stored alongside each evidence quote
+
 TITLE_MAX = 80
 WHY_MAX = 280
 NOTE_MAX = 160
 
+# Salience weights: surprise highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
+W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
+
 _RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
 
-SYSTEM_PROMPT = (
-    "You synthesize a CLUSTER of related raw observations from a developer's Claude Code sessions "
-    "into ONE durable, reusable takeaway: the single underlying 'why' a future session would benefit "
-    "from knowing.\n\n"
-    "Each observation has a VERBATIM quote (the ground truth — trust it over everything else) and a "
-    "one-line machine summary (a hint that may be imprecise or wrong). Read the quotes. State the "
-    "principle they share and WHY it holds — do not just restate one observation.\n\n"
-    "You are also given the developer's already-known CONCEPTS. Judge how this takeaway relates to "
-    "them: new (nothing covers it), strengthens (more evidence for one), refines (narrows/extends "
-    "one), or contradicts (overturns one — the most important to surface).\n\n"
+ROUTE_SYSTEM = (
+    "You are the ROUTER for a developer's long-term memory. A new OBSERVATION arrived from a Claude "
+    "Code session; you are shown the CURRENT CATALOG of takeaways the memory already holds. Decide "
+    "where the observation belongs:\n"
+    "  - strengthen: the catalog ALREADY has a takeaway capturing this same underlying lesson — name "
+    "its id (the observation is more evidence for it).\n"
+    "  - new: nothing in the catalog covers it — it should seed a new takeaway.\n"
+    "  - noop: it is noise, not a durable reusable lesson — drop it.\n"
+    "The observation's verbatim QUOTE is ground truth; its one-line summary is only a hint. Prefer "
+    "strengthen when a catalog entry plausibly covers the SAME lesson; prefer new for a genuinely "
+    "distinct lesson; reserve noop for noise.\n"
+    "Return ONLY a JSON object, no prose, no code fences:\n"
+    '{"decision": "new"|"strengthen"|"noop", "takeaway_id": the catalog id to strengthen or null}'
+)
+
+SYNTH_SYSTEM = (
+    "You distill ONE raw observation from a developer's Claude Code session into a durable, reusable "
+    "TAKEAWAY: the underlying 'why' a future session would benefit from knowing.\n\n"
+    "The observation has a VERBATIM quote (the ground truth — trust it) and a one-line machine summary "
+    "(a hint that may be imprecise or wrong). State the principle it carries and WHY it holds — do not "
+    "just restate the quote.\n\n"
+    "You are also given the developer's already-known CONCEPTS. Judge how this takeaway relates: new "
+    "(nothing covers it), strengthens (more evidence for one), refines (narrows/extends one), or "
+    "contradicts (overturns one — the most important to surface).\n\n"
     "Return ONLY a JSON object, no prose, no code fences:\n"
     '{\n'
     '  "title": a short noun phrase naming the takeaway (<= 80 chars),\n'
     '  "why": one or two sentences — the durable principle and why it holds (<= 280 chars),\n'
     '  "relation": {"kind": "new"|"strengthens"|"refines"|"contradicts", "concept_id": the related '
     'concept id or null, "note": a brief reason (<= 160 chars)},\n'
-    '  "cites": the ids of the observations whose quotes actually support this (a subset of the ids '
-    'given to you),\n'
     '  "confidence": 0-1, how durable and reusable this is,\n'
-    '  "drop": true if these observations are noise, not a durable learning (then everything else is '
-    'ignored)\n'
-    '}\n'
-    "If the cluster mixes unrelated things, cite only the coherent subset. Cite at least one "
-    "observation unless drop is true."
+    '  "drop": true if this observation is noise, not a durable learning (then everything else is ignored)\n'
+    '}'
 )
 
-# Lexical-clustering stopwords: drop the connective words so similarity keys on the technical content
-# (tool names, paths, error strings). Deliberately small — domain terms like "git"/"jj" must survive.
+# Lexical stopwords for the drift/merge similarity — drop connective words so similarity keys on the
+# technical content (tool names, paths, error strings). Deliberately small: domain terms (git/jj) survive.
 _STOPWORDS = frozenset(
     "the a an and or but if then else when of to in on at by for with from into over as is are was "
     "were be been being it its this that these those you your he she they we i me my our their them "
@@ -121,9 +133,9 @@ _STOPWORDS = frozenset(
 def load_concepts(root: Path | None = None) -> list[dict]:
     """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
     against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
-    derived, not stored: the latest version of each concept source, minus any whose latest decision is
-    `retire`. This is the loop closing — review's accepts become the concepts dream reads next run.
-    Empty until review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal."""
+    derived: the latest version of each concept source, minus any whose latest decision is `retire`.
+    This is the loop closing — review's accepts become the concepts dream reads next run. Empty until
+    review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     out: list[dict] = []
@@ -147,74 +159,155 @@ def _render_concepts(concepts: list[dict]) -> str:
                      f"{str(c.get('statement', '')).strip()[:200]}" for c in concepts)
 
 
-# --- gather: load events and resolve each to its TRUSTED quote (the untrusted summary is a hint) --
+# --- the resolved event: a glean event re-anchored to its TRUSTED verbatim quote -----------------
 
 @dataclass
 class ResolvedEvent:
     event: dict
     quote: str               # the verbatim evidence, resolved + re-validated from the cleaned blob
     span: tuple[int, int]    # the VALIDATED [start, end) byte span the quote came from (emitted as evidence)
-    session_id: str | None   # the originating session (for support weighting by DISTINCT sessions)
+    session_id: str | None   # the originating session (support weighting by DISTINCT sessions)
 
     @property
     def id(self) -> str:
         return self.event["id"]
 
 
-def gather_events(root: Path, *, min_confidence: float = 0.0) -> list[ResolvedEvent]:
-    """The current glean event of every source (latest version each), **re-anchored** to its trusted
-    quote. dream must not trust the recorded span: glean's substring anchor runs at the WRITE
-    boundary, but an event is now a blob version whose content is just model output + a span (a buggy
-    producer or an out-of-band write can plant a malformed span), and Python slicing silently accepts
-    `None` (the whole blob) and clamps overshoot. So the span is accepted here only after it validates
-    as in-bounds ints `0 <= start < end <= len(blob)` and the bytes decode — re-establishing "the
-    quote is real bytes of an immutable blob" at dream's READ boundary. An event whose blob is gone
-    (TTL-reclaimed) or whose span fails is dropped. The quote, not the summary, is what dream clusters
-    and reasons over."""
-    by_id: dict[str, dict] = {}
+def _resolve_event(e: dict, blobs: dict, sessions: dict, root: Path) -> ResolvedEvent | None:
+    """Re-anchor one event to its trusted quote at the READ boundary. dream must NOT trust the recorded
+    span: an event is a blob version (model output + a span), and a buggy producer or out-of-band write
+    can plant a malformed span, while Python slicing silently accepts `None` (the whole blob) and clamps
+    overshoot. So the span is accepted only after `validate_span` proves it in-bounds ints and the bytes
+    decode — re-establishing "the quote is real bytes of an immutable blob." A gone blob (TTL) or a
+    failing span drops the event."""
+    ch = e.get("cleaned_hash")
+    ev = e.get("evidence") or []
+    sp = ev[0] if ev and isinstance(ev[0], dict) else None
+    if not ch or sp is None:
+        return None
+    try:
+        data = blobs.get(ch)
+        if data is None:
+            data = blobstore.get(ch, root).encode("utf-8")
+            blobs[ch] = data
+    except (FileNotFoundError, OSError):
+        return None
+    span = blobstore.validate_span(data, sp.get("byte_start"), sp.get("byte_end"))   # the read-side anchor
+    if span is None:
+        return None
+    try:
+        quote = data[span[0]:span[1]].decode("utf-8")
+    except UnicodeDecodeError:    # a span splitting a multibyte char is not a real quote
+        return None
+    if not quote.strip():
+        return None
+    return ResolvedEvent(event=e, quote=quote, span=span,
+                         session_id=blobstore.session_of(ch, root, sessions))
+
+
+# --- working set + catalog: the two DERIVED views the loop runs over ------------------------------
+
+def working_set(root: Path | None = None, *, min_confidence: float = 0.0) -> list[ResolvedEvent]:
+    """The un-consolidated events = `latest_by_kind('event')` (latest version per event_id) MINUS every
+    event whose latest LIFECYCLE decision is `consolidated` or `stale`. Rides `latest_decisions`, which
+    already EXCLUDES the producer `processed` markers — exactly right: a per-item `processed` marker is
+    bookkeeping, not membership state (and reusing the fold avoids the resurrection-bug class review
+    already guards). Each survivor is re-anchored to its trusted quote (`validate_span` at the read
+    boundary). This is `DreamBlock.items()`'s source; the driver sorts it by `priority` (salience)."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    blobs: dict[str, bytes] = {}
+    sessions: dict[str, str | None] = {}
+    out: list[ResolvedEvent] = []
     for sid, h in blobstore.latest_by_kind("event", root).items():
+        d = decisions.get(sid)
+        if d and d.get("verb") in ("consolidated", "stale"):
+            continue
         try:
             e = json.loads(blobstore.get(h, root))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(e, dict):
-            e.setdefault("id", sid)   # source_id (event_id) is authoritative; mirror it in case content dropped it
-            by_id[sid] = e            # latest_by_kind already folds each event_id to its newest VERSION —
-                                      # only the untrusted summary can differ across re-extractions, the
-                                      # span-derived quote is invariant, so clustering is unaffected
-    resolved: list[ResolvedEvent] = []
-    blobs: dict[str, bytes] = {}
-    sessions: dict[str, str | None] = {}
-    for e in by_id.values():
+        if not isinstance(e, dict):
+            continue
+        e.setdefault("id", sid)                       # source_id is authoritative; mirror it
         if _score(e.get("confidence"), 0.0) < min_confidence:
             continue
-        ch = e.get("cleaned_hash")
-        ev = e.get("evidence") or []
-        sp = ev[0] if ev and isinstance(ev[0], dict) else None
-        if not ch or sp is None:
-            continue
-        try:
-            data = blobs.get(ch)
-            if data is None:
-                data = blobstore.get(ch, root).encode("utf-8")
-                blobs[ch] = data
-        except (FileNotFoundError, OSError):
-            continue
-        span = blobstore.validate_span(data, sp.get("byte_start"), sp.get("byte_end"))   # the read-side anchor
-        if span is None:
-            continue
-        try:
-            quote = data[span[0]:span[1]].decode("utf-8")
-        except UnicodeDecodeError:    # a span splitting a multibyte char is not a real quote
-            continue
-        if not quote.strip():
-            continue
-        resolved.append(ResolvedEvent(event=e, quote=quote, span=span,
-                                      session_id=blobstore.session_of(ch, root, sessions)))
-    return resolved
+        rv = _resolve_event(e, blobs, sessions, root)
+        if rv is not None:
+            out.append(rv)
+    return out
 
 
-# --- cluster: deterministic, stdlib TF-IDF + leader clustering (no LLM, recomputed every run) ----
+def catalog(root: Path | None = None) -> list[dict]:
+    """The full LIVE routing catalog: `latest_by_kind('takeaway')` (latest version per stable id) MINUS
+    any takeaway whose latest lifecycle decision is in {merge, retire, reject}. INCLUDES incubating
+    takeaways (sessions < the maturity bar) so the router can strengthen them toward maturity. Small by
+    design (forgetting + the maturity gate bound it) → the whole list renders into the route prompt; no
+    retrieval, no embeddings. This REPLACES v1's supersede-fold for routing."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    out: list[dict] = []
+    for sid, h in blobstore.latest_by_kind("takeaway", root).items():
+        d = decisions.get(sid)
+        if d and d.get("verb") in ("merge", "retire", "reject"):
+            continue
+        try:
+            t = json.loads(blobstore.get(h, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(t, dict) and (t.get("id") or sid):
+            t.setdefault("id", sid)
+            out.append(t)
+    return out
+
+
+def current_takeaways(root: Path | None = None, *, min_sessions: int = MATURITY_SESSIONS) -> list[dict]:
+    """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways
+    (support.sessions >= min_sessions). `review.pending()` calls this with the default bar, so only
+    takeaways corroborated across that many DISTINCT sessions reach the human gate; incubating ones stay
+    live (routable via `catalog()`) but invisible to review. This REPLACES v1's supersede-conditioned
+    current_takeaways — same name/return type, so review.py is untouched."""
+    return [t for t in catalog(root)
+            if (t.get("support") or {}).get("sessions", 0) >= min_sessions]
+
+
+def render_catalog(cat: list[dict]) -> str:
+    """The in-prompt routing list — a numbered list of `[N] id=<id>: <title> — <why>` (truncated). The
+    WHOLE catalog goes in the prompt (no top-K). An empty catalog renders a sentinel so the router is
+    never asked to strengthen against nothing."""
+    if not cat:
+        return "(no takeaways yet — every observation is new)"
+    lines = []
+    for i, t in enumerate(cat, 1):
+        title = str(t.get("title", "")).strip()[:TITLE_MAX]
+        why = str(t.get("why", "")).strip()[:WHY_MAX]
+        lines.append(f"[{i}] id={t.get('id')}: {title} — {why}")
+    return "\n".join(lines)
+
+
+# --- scoring + similarity (pure, stdlib): salience for the queue, drift/merge for maintenance -----
+
+_score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
+
+
+def salience(event: dict) -> float:
+    """A pure score of an un-consolidated event for the priority queue: confidence × weighted marker
+    mass. Surprise weighed highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
+    Each untrusted field is scrubbed through `clean_score`. The recurrence bonus (does the event already
+    match a catalog takeaway) is DEFERRED (it needs a pre-route scan). `DreamBlock.priority` delegates
+    here."""
+    conf = _score(event.get("confidence"), 0.5)
+    m = event.get("markers") or {}
+    mass = (W_SURPRISE * _score(m.get("surprise")) + W_INSIGHT * _score(m.get("insight"))
+            + W_RESEARCH * _score(m.get("research")) + EPS)
+    return conf * mass
+
+
+def _event_markers(event: dict) -> dict:
+    """The event's marker vector, each field scrubbed — the per-takeaway markers aggregate (max) these."""
+    em = event.get("markers") or {}
+    return {k: _score(em.get(k)) for k in MARKER_KINDS}
+
 
 def _tokens(text: str) -> list[str]:
     """Content tokens for similarity: lowercase, split on non-identifier punctuation but KEEP the
@@ -247,65 +340,60 @@ def _cos(a: dict[str, float], b: dict[str, float]) -> float:
     return sum(w * b.get(t, 0.0) for t, w in a.items())
 
 
-def cluster(events: list[ResolvedEvent], *, threshold: float = SIM_THRESHOLD) -> list[list[ResolvedEvent]]:
-    """Leader clustering (Hartigan) over TF-IDF(quote + summary) vectors: walk events in a fixed
-    order, join each to the best existing cluster, else start a new one. A high threshold biases
-    toward UNDER-merging — a false merge destroys a learning, a false split only costs the reviewer a
-    second look. Two prior-art-grounded hardenings (ADR-0006) of the naive single-pass leader:
-
-      ORDER (Hartigan / CRAN leaderCluster): leader is input-order dependent, and seeding from the
-      most DISTINCTIVE points first gives better, more stable partitions. So events are ordered by
-      descending pre-normalized TF-IDF mass (content-rich events seed clusters), id breaking ties so
-      the order — and thus every cluster signature — stays reproducible.
-
-      SEED CAP (IR-book complete-link; Swarm): an event joins only if it is similar to BOTH the
-      drifting centroid (cohesion) AND the cluster's fixed SEED (a diameter cap from the origin). The
-      seed cap is what stops centroid-drift CHAINING — a leader otherwise absorbs a string of
-      pairwise-near but globally-distant events into one over-broad takeaway."""
-    docs = [_tokens(rv.quote + " " + str(rv.event.get("summary", ""))) for rv in events]
+def _drift(rv: ResolvedEvent, tk: dict) -> float:
+    """Lexical distance of a strengthening event from the takeaway it bumps: `1 - cos` over TF-IDF of
+    (event quote + summary) vs (takeaway title + why + its evidence quotes). High-distance evidence means
+    the takeaway's `why` may no longer cover it → re-synthesize; near evidence is a cheap bump. Lexical
+    (no embeddings) is low-precision, so the gate defaults to cheap-bump and re-synths only on a clearly
+    distant event (ADR-0010's write-amplification caution)."""
+    ev_quotes = " ".join(str(e.get("quote", "")) for e in (tk.get("evidence") or []))
+    a = rv.quote + " " + str(rv.event.get("summary", ""))
+    b = f"{tk.get('title', '')} {tk.get('why', '')} {ev_quotes}"
+    docs = [_tokens(a), _tokens(b)]
     idf = _idf(docs)
-    vecs = [_vec(d, idf) for d in docs]
-    mass = [sum(tf * idf.get(t, 0.0) for t, tf in Counter(d).items()) for d in docs]
-    seeds: list[dict[str, float]] = []         # each cluster's first (seeding) vector — fixed, no drift
-    centroids: list[dict[str, float]] = []     # running L2-normalized mean per cluster
-    sums: list[dict[str, float]] = []          # unnormalized sum (so the mean updates incrementally)
-    members: list[list[int]] = []
-    for i in sorted(range(len(events)), key=lambda j: (-mass[j], events[j].id)):
-        best, best_sim = -1, threshold
-        for c in range(len(centroids)):
-            cs = _cos(vecs[i], centroids[c])
-            if cs >= best_sim and _cos(vecs[i], seeds[c]) >= threshold:
-                best, best_sim = c, cs
-        if best < 0:
-            seeds.append(vecs[i])
-            centroids.append(dict(vecs[i]))
-            sums.append(dict(vecs[i]))
-            members.append([i])
-        else:
-            s = sums[best]
-            for t, w in vecs[i].items():
-                s[t] = s.get(t, 0.0) + w
-            norm = math.sqrt(sum(w * w for w in s.values())) or 1.0
-            centroids[best] = {t: w / norm for t, w in s.items()}
-            members[best].append(i)
-    return [[events[i] for i in grp] for grp in members]
+    return 1.0 - _cos(_vec(docs[0], idf), _vec(docs[1], idf))
 
 
-def cluster_signature(cl: list[ResolvedEvent]) -> str:
-    """A stable id for a cluster: the hash of its sorted member event ids. Identical membership →
-    identical signature (idempotency); any membership change → a new signature (re-synthesis)."""
-    return hashlib.sha256("|".join(sorted(rv.id for rv in cl)).encode()).hexdigest()[:16]
+# --- the takeaway: stable minted id, robust-anchored evidence, BIRCH support stats ----------------
+
+def mint_takeaway_id(seed_event_id: str) -> str:
+    """The STABLE id of a new takeaway — DETERMINISTIC on the seeding event id (NOT random, NOT a
+    cluster signature). Determinism is load-bearing for resumability: a crash-retry of the same `new`
+    event re-mints the SAME id, so the duplicate is absorbed as a no-op TimeMap version (latest wins)
+    instead of orphaning a second takeaway. Independent of prompt/model (a prompt bump never re-routes a
+    consolidated event, so the id need not vary by params). Distinct event_ids → distinct ids; 12 hex of
+    sha256 makes collision risk negligible."""
+    return "t-" + hashlib.sha256(seed_event_id.encode("utf-8")).hexdigest()[:12]
 
 
-# --- synthesize: one LLM call per cluster → a verified, evidence-cited takeaway -------------------
-
-_score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
+def evidence_entry(rv: ResolvedEvent, *, context_bytes: int = CONTEXT_BYTES) -> dict:
+    """A ROBUST ANCHOR (W3C Web Annotation) for one cited event: the byte span AND the verbatim quote +
+    a little surrounding context. The span is RE-VALIDATED via `validate_span` at WRITE — the same
+    immutable, content-addressed blob `working_set` resolved, so this re-anchors at the write boundary
+    too. If the blob is gone, the (already-validated) span + quote still ship; only the context window is
+    best-effort."""
+    ch = rv.event.get("cleaned_hash")
+    entry = {"event_id": rv.id, "cleaned_hash": ch,
+             "byte_start": rv.span[0], "byte_end": rv.span[1],
+             "quote": rv.quote, "context": rv.quote}
+    try:
+        data = blobstore.get(ch).encode("utf-8")
+    except (FileNotFoundError, OSError):
+        return entry
+    span = blobstore.validate_span(data, rv.span[0], rv.span[1])   # re-validate at WRITE
+    if span is None:
+        return entry
+    bs, be = span
+    cs, ce = max(0, bs - context_bytes), min(len(data), be + context_bytes)
+    entry["context"] = data[cs:ce].decode("utf-8", errors="replace")   # window edges may split a char
+    return entry
 
 
 def _clean_relation(v, known_ids: set[str]) -> dict:
-    """Coerce the untrusted relation: an unknown kind → `new`, and a `concept_id` that isn't a real
-    known concept → null (which forces `new` — you cannot strengthen/refine/contradict a concept that
-    does not exist, so today, with no concepts, every relation is `new`)."""
+    """Coerce the untrusted relation: an unknown kind → `new`, and a `concept_id` that isn't a real known
+    concept → null (which forces `new` — you cannot strengthen/refine/contradict a concept that does not
+    exist, so today, with no concepts, every relation is `new`). Unchanged from v1; powers review's
+    loop-close."""
     v = v if isinstance(v, dict) else {}
     kind = v.get("kind") if v.get("kind") in _RELATION_KINDS else "new"
     cid = v.get("concept_id")
@@ -315,322 +403,487 @@ def _clean_relation(v, known_ids: set[str]) -> dict:
     return {"kind": kind, "concept_id": cid, "note": str(v.get("note", "")).strip()[:NOTE_MAX]}
 
 
-def build_takeaway(parsed: dict, cl: list[ResolvedEvent], signature: str, *,
-                   known_concept_ids: set[str], model: str, run_id: str) -> dict | None:
-    """Assemble a takeaway from a synthesis response — and VERIFY it. A citation is kept only if it
-    names a real event IN THIS CLUSTER (the model can cite nothing it was not given); a takeaway with
-    no surviving citation has no evidence and is dropped. `member_events` records the full
-    deterministic partition (for supersede linking); `cites` is the model's evidence subset; each
-    `evidence` pointer carries the event's REVALIDATED span (`rv.span`, from gather) — the same bytes
-    that produced the trusted quote, never a re-read of the untrusted JSON. `supersedes` is filled by
-    `run` after the whole run's coverage is known (it is empty until then)."""
-    in_cluster = {rv.id: rv for rv in cl}
-    seen: set[str] = set()
-    cited_ids: list[str] = []
-    for c in parsed.get("cites") or []:
-        if isinstance(c, str) and c in in_cluster and c not in seen:
-            seen.add(c)
-            cited_ids.append(c)
-    if not cited_ids:
-        return None
-    markers = {k: 0.0 for k in MARKER_KINDS}
-    evidence = []
-    for cid in cited_ids:
-        rv = in_cluster[cid]
-        evidence.append({"event_id": cid, "cleaned_hash": rv.event.get("cleaned_hash"),
-                         "byte_start": rv.span[0], "byte_end": rv.span[1]})
-        em = rv.event.get("markers") or {}
-        for k in MARKER_KINDS:
-            markers[k] = max(markers[k], _score(em.get(k)))   # a cluster is surprising if any member is
-    sessions = {in_cluster[c].session_id for c in cited_ids if in_cluster[c].session_id}
-    return {
-        "id": signature,
-        "title": str(parsed.get("title", "")).strip()[:TITLE_MAX],
-        "why": str(parsed.get("why", "")).strip()[:WHY_MAX],
-        "relation": _clean_relation(parsed.get("relation"), known_concept_ids),
-        "member_events": sorted(rv.id for rv in cl),   # the full partition (supersede linking keys on this)
-        "cites": cited_ids,                       # the evidence subset the synthesis actually used
-        "evidence": evidence,
-        "support": {"events": len(cited_ids), "sessions": len(sessions)},
-        "markers": markers,
-        "confidence": _score(parsed.get("confidence"), 0.5),
-        "cluster_signature": signature,
-        "supersedes": [],                         # filled by run() once the run's coverage is known
-        "producer": {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
-                     "run_id": run_id, "cost_usd": None},   # in-memory only; mirrored to origin_ref, not stored in content
-    }
+def takeaway_content(tk: dict) -> dict:
+    """The run-invariant STORED projection of a takeaway version — drops the in-memory `producer`/cost,
+    keeps id, title, why, relation, cites, evidence, support, sessions_seen, markers, confidence,
+    last_seen. This is what makes a no-op re-version re-hash IDENTICALLY: a strengthen that incorporates
+    no new event re-serializes to the same bytes, so the blobstore no-ops it (no churn)."""
+    return {k: tk[k] for k in (
+        "id", "title", "why", "relation", "cites", "evidence",
+        "support", "sessions_seen", "markers", "confidence", "last_seen")}
 
 
-def synthesize_cluster(cl: list[ResolvedEvent], complete: Completer, concepts: list[dict], *,
-                       known_concept_ids: set[str], model: str, run_id: str) -> tuple[dict | None, float]:
-    """One cluster → (takeaway or None, cost). None means the model judged the cluster noise (`drop`)
-    or cited nothing verifiable — a successful adjudication, not an error (the caller marks it done so
-    noise is not re-synthesized every run). Raises only if the injected completer itself fails; the
-    caller isolates that and retries the cluster next run."""
-    comp = complete(SYSTEM_PROMPT, _user_prompt(cl, concepts))
+def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) -> None:
+    """Freeze one takeaway as a RAW blob VERSION keyed on its STABLE minted id (ADR-0007). The content is
+    `takeaway_content(tk)` (run-invariant → an unchanged re-version no-ops); `producer` is mirrored into
+    `origin_ref` so provenance is answerable from meta alone. An UPDATE re-uses the same source_id → a new
+    prev-linked version (the TimeMap, latest wins) — no membership churn."""
+    blobstore.ingest(
+        blobstore.canonical_json(takeaway_content(tk)), source_kind="takeaway",
+        source_id=tk["id"],
+        origin_ref={"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
+                    "run_id": run_id, "cost_usd": (tk.get("producer") or {}).get("cost_usd")},
+        root=root)
+
+
+# --- ROUTE: one cheap Haiku call per event over the in-prompt catalog -----------------------------
+
+def _route_user(rv: ResolvedEvent, cat: list[dict]) -> str:
+    return (f'OBSERVATION\nquote: """{rv.quote}"""\n'
+            f'summary: {str(rv.event.get("summary", "")).strip()!r}\n\n'
+            f'CATALOG\n{render_catalog(cat)}')
+
+
+def _clean_route(parsed: dict, catalog_ids: set[str]) -> dict:
+    """Defensive coercion of the untrusted router JSON, mirroring `_clean_relation`. Rules: a decision
+    not in {new, strengthen, noop} → `noop` (safest: no write, the event stays routable on a prompt
+    bump); a `strengthen` whose takeaway_id is not a real catalog id (incl. null) → coerced to `new`
+    (the spec's explicit rule — you cannot strengthen an id the model was not shown); `new` forces
+    takeaway_id None (a new mints fresh)."""
+    parsed = parsed if isinstance(parsed, dict) else {}
+    decision = parsed.get("decision")
+    if decision not in ("new", "strengthen", "noop"):
+        return {"decision": "noop", "takeaway_id": None}
+    if decision in ("new", "noop"):
+        return {"decision": decision, "takeaway_id": None}
+    tid = parsed.get("takeaway_id")
+    if isinstance(tid, str) and tid in catalog_ids:
+        return {"decision": "strengthen", "takeaway_id": tid}
+    return {"decision": "new", "takeaway_id": None}      # strengthen of an unknown id → new
+
+
+def route(rv: ResolvedEvent, cat: list[dict], complete_route: Completer) -> tuple[dict, float]:
+    """ONE cheap Haiku call (the injected ROUTER) per event: system = the routing instruction; user =
+    the event (verbatim quote + summary) + the WHOLE catalog as a numbered list. Returns (route_result,
+    cost). The router may answer with a catalog list-NUMBER instead of the id (a common mis-naming) — map
+    it back before coercion. A raised completer propagates so the driver isolates the event (retried next
+    run). Pure-injectable: offline-tested with a fake that echoes a chosen decision/id."""
+    comp = complete_route(ROUTE_SYSTEM, _route_user(rv, cat))
+    cost = completer.cost_of(comp)
+    parsed = completer.parse_json_object(comp.text) or {}
+    tid = parsed.get("takeaway_id")
+    if isinstance(tid, (int, str)) and not isinstance(tid, bool):   # accept the list-number, map → id
+        s = str(tid).strip()
+        if s.isdigit() and 1 <= int(s) <= len(cat):
+            parsed = dict(parsed)
+            parsed["takeaway_id"] = cat[int(s) - 1].get("id")
+    rr = _clean_route(parsed, {t.get("id") for t in cat})
+    return rr, cost
+
+
+# --- APPLY: synthesize a new takeaway, or bump an existing one's support ---------------------------
+
+def _synth_user(rv: ResolvedEvent, concepts: list[dict]) -> str:
+    return (f"Known concepts:\n{_render_concepts(concepts)}\n\n"
+            f'OBSERVATION\nquote: """{rv.quote}"""\n'
+            f'summary: {str(rv.event.get("summary", "")).strip()!r}')
+
+
+def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concepts: list[dict], *,
+                   known_concept_ids: set[str], model: str, run_id: str) -> tuple[dict | None, float]:
+    """Mint a takeaway from ONE event (the injected SYNTH Completer, Sonnet). `drop` or no usable `why`
+    → (None, cost): a successful adjudication that this event is noise (apply marks it consolidated so it
+    is not re-synthesized). Else build the v2 takeaway: a STABLE minted id, one robust-anchored evidence
+    entry (span + verbatim quote + context, re-validated on write), support {1, 1}, the cited event's
+    markers, a coerced relation, last_seen = now. Raises only if the completer fails (the driver isolates
+    it)."""
+    comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concepts))
     cost = completer.cost_of(comp)
     parsed = completer.parse_json_object(comp.text) or {}
     if not parsed or parsed.get("drop"):
         return None, cost
-    tk = build_takeaway(parsed, cl, cluster_signature(cl), known_concept_ids=known_concept_ids,
-                        model=model, run_id=run_id)
-    if tk is not None:
-        tk["producer"]["cost_usd"] = round(cost, 8)
+    why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+    if not why:                                    # no usable principle → treat as noise
+        return None, cost
+    tk = {
+        "id": mint_takeaway_id(rv.id),
+        "title": str(parsed.get("title", "")).strip()[:TITLE_MAX],
+        "why": why,
+        "relation": _clean_relation(parsed.get("relation"), known_concept_ids),
+        "cites": [rv.id],
+        "evidence": [evidence_entry(rv)],
+        "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
+        "sessions_seen": [rv.session_id] if rv.session_id else [],
+        "markers": _event_markers(rv.event),
+        "confidence": _score(parsed.get("confidence"), 0.5),
+        "last_seen": config.now(),
+        "producer": {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
+                     "run_id": run_id, "cost_usd": round(cost, 8)},
+    }
     return tk, cost
 
 
-def _user_prompt(cl: list[ResolvedEvent], concepts: list[dict]) -> str:
-    obs = "\n".join(f'- id {rv.id}: summary: {str(rv.event.get("summary", "")).strip()!r}\n'
-                    f'  quote: """{rv.quote}"""' for rv in cl)
-    return f"Known concepts:\n{_render_concepts(concepts)}\n\nObservations to synthesize:\n{obs}"
+def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, concepts: list[dict], *,
+                   known_concept_ids: set[str], drift_threshold: float,
+                   model: str, run_id: str) -> tuple[dict, float]:
+    """BUMP SUPPORT — the cheap path (NO LLM by default). Build a NEW VERSION of `tk` (same id): append
+    the event's evidence IDEMPOTENTLY (dedup by event_id — a re-strengthen of an already-cited event is a
+    byte-identical no-op, so sessions never inflate and a one-off can't falsely mature); union the
+    distinct session; recompute support = {events: distinct cites, sessions: distinct sessions} — the
+    BIRCH sufficient-statistic, correct without the raw events; max-merge markers; bump last_seen. DRIFT
+    GATE: only when the event is lexically distant from the takeaway (`_drift` > threshold) is the `why`
+    re-synthesized (one Sonnet call, cost > 0); else keep it (cost 0.0)."""
+    nv = {
+        "id": tk["id"],
+        "title": str(tk.get("title", "")),
+        "why": str(tk.get("why", "")),
+        "relation": tk.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
+        "cites": list(tk.get("cites") or []),
+        "evidence": [dict(e) for e in (tk.get("evidence") or [])],
+        "sessions_seen": list(tk.get("sessions_seen") or []),
+        "markers": {k: _score((tk.get("markers") or {}).get(k)) for k in MARKER_KINDS},
+        "confidence": _score(tk.get("confidence"), 0.5),
+        "last_seen": str(tk.get("last_seen", "")),
+    }
+    cited = {e.get("event_id") for e in nv["evidence"]}
+    if rv.id in cited:                             # already incorporated → idempotent, byte-stable no-op
+        nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
+        return nv, 0.0
+    nv["evidence"].append(evidence_entry(rv))
+    nv["cites"].append(rv.id)
+    if rv.session_id and rv.session_id not in nv["sessions_seen"]:
+        nv["sessions_seen"].append(rv.session_id)
+    em = _event_markers(rv.event)
+    nv["markers"] = {k: max(nv["markers"][k], em[k]) for k in MARKER_KINDS}
+    nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
+    nv["last_seen"] = config.now()
+    cost = 0.0
+    if _drift(rv, tk) > drift_threshold:           # far evidence → the why may no longer cover it
+        comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concepts))
+        cost = completer.cost_of(comp)
+        parsed = completer.parse_json_object(comp.text) or {}
+        why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+        if why:
+            nv["why"] = why
+            nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
+            nv["relation"] = _clean_relation(parsed.get("relation"), known_concept_ids)
+            nv["confidence"] = _score(parsed.get("confidence"), nv["confidence"])
+    return nv, cost
 
 
-# --- the takeaway store + the derived "current" view (fold the supersede links) ------------------
+def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concepts: list[dict],
+          *, known_concept_ids: set[str], drift_threshold: float, model: str, run_id: str,
+          root: Path) -> tuple[int, float, dict | None]:
+    """Route-result → commits. The COMMIT ORDER is the crash invariant: the takeaway version FIRST
+    (`_ingest_takeaway`), the `consolidated` decision LAST — a retry before the consolidated decision
+    re-does the (deterministic-id, dedup-idempotent) write; once consolidated, the event leaves the
+    working set forever and is never re-enumerated.
 
-def takeaway_content(tk: dict) -> dict:
-    """The STORED content of a takeaway version — model output + intrinsic provenance ONLY (ADR-0007
-    blob_shape). `producer` (model/run_id/cost_usd, all run-varying) is DROPPED here and moves to
-    meta.origin_ref; `status` is gone (state is a decision). This projection is what makes "a re-
-    synthesis with unchanged output is a no-op" hold: the canonical-json of this view re-hashes
-    identically run-to-run, so only changed content (title/why/cites/supersedes/…) forks a new version.
-    `id`/`cluster_signature` stay as convenience mirrors (== source_id, deterministic, hash-stable).
-    `supersedes` is INTRINSIC (computed by run() from this run's coverage — ADR-0007 §1)."""
-    return {k: tk[k] for k in (
-        "id", "title", "why", "relation", "member_events", "cites", "evidence",
-        "support", "markers", "confidence", "cluster_signature", "supersedes")}
+      noop       → (0, 0.0, None): no write; the event stays un-consolidated (forget-eligible).
+      new        → synthesize; a drop marks the event consolidated (no takeaway) so it is not
+                   re-synthesized, returns (0, cost, None); else commit takeaway then consolidated,
+                   return (1, cost, takeaway).
+      strengthen → bump support; commit the new version then consolidated, return (1, cost, version).
 
-
-def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) -> None:
-    """Freeze one takeaway as a RAW blob VERSION keyed on its `cluster_signature` (ADR-0007). The
-    content is `takeaway_content(tk)` (run-invariant => an unchanged re-synthesis no-ops); `producer`
-    is mirrored into `origin_ref` so provenance is answerable from meta alone."""
-    blobstore.ingest(
-        blobstore.canonical_json(takeaway_content(tk)), source_kind="takeaway",
-        source_id=tk["cluster_signature"],
-        origin_ref={"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
-                    "run_id": run_id, "cost_usd": tk["producer"].get("cost_usd")},
-        root=root)
-
-
-def load_takeaways(root: Path | None = None) -> list[dict]:
-    """Every committed takeaway VERSION across all sources (ADR-0007). Raw — every snapshot, not just
-    the latest; `current_takeaways` folds re-synthesis (latest per source) and supersession. Used where
-    a full history is wanted; the "now" view needs only `latest_by_kind`."""
-    out: list[dict] = []
-    for m in blobstore.iter_meta(root):
-        if m.get("kind", "raw") != "raw" or m.get("source_kind") != "takeaway":
-            continue
-        ch = m.get("content_hash")
-        if not ch:
-            continue
-        try:
-            out.append(json.loads(blobstore.get(ch, root)))
-        except (OSError, json.JSONDecodeError):
-            continue
-    return out
+    The returned dict is what `DreamBlock.process` folds into the on-instance catalog."""
+    decision = rr["decision"]
+    if decision == "noop":
+        return 0, 0.0, None
+    if decision == "new":
+        tk, cost = synthesize_new(rv, complete_synth, concepts, known_concept_ids=known_concept_ids,
+                                  model=model, run_id=run_id)
+        if tk is None:
+            _write_consolidated(rv.id, None, "new", run_id=run_id, root=root)   # noise: do not re-synth
+            return 0, cost, None
+        _ingest_takeaway(tk, model=model, run_id=run_id, root=root)             # takeaway FIRST
+        _write_consolidated(rv.id, tk["id"], "new", run_id=run_id, root=root)   # consolidated LAST
+        return 1, cost, tk
+    # strengthen
+    tk = cat_by_id.get(rr["takeaway_id"])
+    if tk is None:                                 # id vanished between route + apply → fall back to new
+        return apply(rv, {"decision": "new", "takeaway_id": None}, cat_by_id, complete_synth, concepts,
+                     known_concept_ids=known_concept_ids, drift_threshold=drift_threshold,
+                     model=model, run_id=run_id, root=root)
+    nv, cost = update_support(tk, rv, complete_synth, concepts, known_concept_ids=known_concept_ids,
+                              drift_threshold=drift_threshold, model=model, run_id=run_id)
+    _ingest_takeaway(nv, model=model, run_id=run_id, root=root)                  # takeaway FIRST
+    _write_consolidated(rv.id, nv["id"], "strengthen", run_id=run_id, root=root)  # consolidated LAST
+    return 1, cost, nv
 
 
-def processed_index(root: Path | None = None) -> set[tuple]:
-    """The done-set keyed by (cluster_signature, prompt_version, model) — now `block.done_index`
-    (ADR-0009). dream's params are `((prompt_version, PV), (model, model))`, so the generic
-    `(target, *param-values)` key IS `(cluster_signature, prompt_version, model)` — the tuple shape is
-    preserved verbatim, so callers that read `dream.processed_index()` are unchanged. A re-run skips a
-    cluster whose membership is unchanged; a changed cluster (new signature) re-synthesizes; bumping
-    PROMPT_VERSION or model flips the key."""
-    return block.done_index("dream", config.ensure_layout(root))
+# --- the three v2 lifecycle decision blobs (folded by latest_decisions, no blobstore change) ------
+
+def _write_decision(body: dict, *, run_id: str, root: Path | None) -> None:
+    """Append one lifecycle decision blob, written exactly like `review._record`: source_id ==
+    blob_hash(body), prev=None, fetched_at == body['at'] (so the audited and folded timelines agree). A
+    `producer.stage == 'dream'` rides along so `forget` can count dream cycles off the stored markers."""
+    s = blobstore.canonical_json(body)
+    blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
+                     origin_ref={"stage": "dream", "run_id": run_id}, fetched_at=body["at"], root=root)
 
 
-def current_takeaways(root: Path | None = None) -> list[dict]:
-    """The live takeaway set, derived from the blobstore TimeMap: take the LATEST version of every
-    takeaway source (`latest_by_kind('takeaway')` — the prev-chain IS the per-source recency fold, so a
-    re-synthesis or a prompt/model bump replaces its prior self by construction), then drop every
-    takeaway that some surviving takeaway supersedes. This is how groupings/names/summaries evolve
-    without editing anything in place. Recency is the TimeMap's (fetched_at, content_hash) — true
-    lineage, not glob order — so the fold can't surface a stale record."""
-    by_id: dict[str, dict] = {}
-    for sid, h in blobstore.latest_by_kind("takeaway", root).items():
-        try:
-            t = json.loads(blobstore.get(h, root))
-        except (OSError, json.JSONDecodeError):
-            continue
-        tid = t.get("id") or sid      # id mirrors cluster_signature == source_id; fall back to meta
-        by_id[tid] = t
-    superseded: set[str] = set()
-    for t in by_id.values():
-        for s in t.get("supersedes") or []:
-            superseded.add(s)
-    return [t for tid, t in by_id.items() if tid not in superseded]
+def _write_consolidated(event_id: str, takeaway_id: str | None, decision: str, *,
+                        run_id: str, root: Path | None) -> None:
+    """The commit point that removes an incorporated event from the working set forever (across all
+    params). `decision` is `new` | `strengthen`; `takeaway` is the minted id (None when synth dropped it
+    as noise)."""
+    at = config.now()
+    _write_decision({"verb": "consolidated", "target": event_id, "takeaway": takeaway_id,
+                     "decision": decision, "at": at, "run_id": run_id,
+                     "producer": {"stage": "dream", "run_id": run_id, "at": at}}, run_id=run_id, root=root)
 
 
-# --- the Block: dream as the per-RUN-commit stage (ADR-0009's one finalize exception) ------------
+def _write_stale(event_id: str, reason: str, *, run_id: str, root: Path | None) -> None:
+    """Forget's verdict on an aged, low-salience, never-consolidated event — also removes it from the
+    working set; reversible (a fact, not a deletion)."""
+    at = config.now()
+    _write_decision({"verb": "stale", "target": event_id, "reason": reason, "at": at, "run_id": run_id,
+                     "producer": {"stage": "dream", "run_id": run_id, "at": at}}, run_id=run_id, root=root)
 
-@dataclass
-class _Pending:
-    """One synthesized-but-not-yet-committed cluster, recorded by `process` for `finalize`. dream is
-    the lone `commits_per_item=False` block: synthesis streams (per cluster) but commit waits for the
-    whole run's coverage. `cl` is kept so the marker's `event_ids` audit can list the cluster's full
-    membership; `tk` is None when the model dropped/cited-nothing (the cluster is still marked done)."""
-    cl: list[ResolvedEvent]
-    sig: str
-    tk: dict | None
-    cost: float
 
+def _write_merge(loser_id: str, winner_id: str, *, run_id: str, root: Path | None) -> None:
+    """Sibling of review.retire: removes the loser takeaway from catalog/current_takeaways (its blob +
+    history are retained; the union evidence lives on the winner)."""
+    at = config.now()
+    _write_decision({"verb": "merge", "target": loser_id, "into": winner_id, "at": at, "run_id": run_id,
+                     "producer": {"stage": "dream", "run_id": run_id, "at": at}}, run_id=run_id, root=root)
+
+
+# --- forget: conservative straggler eviction (never age alone — ADR-0010 §6) ----------------------
+
+def forget(root: Path | None = None, *, tau: int = FORGET_TAU,
+           salience_floor: float = FORGET_SALIENCE_FLOOR, run_id: str) -> list[str]:
+    """Stale the stragglers: for each un-consolidated event, `cycles_resident` = the count of DISTINCT
+    dream run_ids in the stored dream-stage decisions whose `at` postdates the event blob (no mutable
+    per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (salience < floor)
+    — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Reversible. Cheap, no LLM
+    — runs in `DreamBlock.finalize`. Returns the staled event ids."""
+    root = root or config.data_root()
+    ws = working_set(root)
+    latest = blobstore.latest_by_kind("event", root)
+    dream_decs = list(blobstore.decisions_for(None, root, stage="dream"))
+    staled: list[str] = []
+    for rv in ws:
+        born = ""
+        h = latest.get(rv.id)
+        if h:
+            try:
+                born = blobstore.get_meta(h, root).get("fetched_at", "")
+            except (OSError, json.JSONDecodeError):
+                born = ""
+        runs = {d.get("run_id") for d in dream_decs
+                if d.get("run_id") and str(d.get("at", "")) > born}
+        if len(runs) >= tau and salience(rv.event) < salience_floor:
+            _write_stale(rv.id, "aged + low salience", run_id=run_id, root=root)
+            staled.append(rv.id)
+    return staled
+
+
+# --- merge: maintenance de-dup (NOT in the hot per-event loop) -------------------------------------
+
+def merge_candidates(cat: list[dict], *, threshold: float) -> list[tuple[str, str]]:
+    """A recall-first hint: lexically score catalog pairs (TF-IDF over title + why) above `threshold` and
+    return (loser_id, winner_id) — the higher-support takeaway wins. The LLM/human confirms (mis-coercion,
+    not recall, is the dominant failure mode while the catalog stays small)."""
+    docs = [_tokens(f"{t.get('title', '')} {t.get('why', '')}") for t in cat]
+    idf = _idf(docs)
+    vecs = [_vec(d, idf) for d in docs]
+    pairs: list[tuple[str, str]] = []
+    for i in range(len(cat)):
+        for j in range(i + 1, len(cat)):
+            if _cos(vecs[i], vecs[j]) >= threshold:
+                a, b = cat[i], cat[j]
+                sa = (a.get("support") or {}).get("events", 0)
+                sb = (b.get("support") or {}).get("events", 0)
+                w, l = (a, b) if sa >= sb else (b, a)
+                pairs.append((l["id"], w["id"]))
+    return pairs
+
+
+def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, model: str, run_id: str,
+          root: Path | None = None, resynth: bool = True) -> dict:
+    """The v2 replacement for v1's split/merge-by-resignature. Build a WINNER version that UNIONs the
+    loser's evidence (dedup by event_id), sessions_seen, markers (max), last_seen (max) and recomputes
+    support; optionally re-synthesize the `why` (one Sonnet call); commit the winner version, then a
+    `merge` decision dropping the loser. The loser's blob + history are retained — its already-consolidated
+    events keep a now-stale takeaway pointer (harmless; the union evidence lives on the winner)."""
+    root = root or config.data_root()
+    by_id = {t["id"]: t for t in catalog(root)}
+    winner = by_id.get(winner_id)
+    loser = by_id.get(loser_id)
+    if winner is None:
+        raise ValueError(f"no winner takeaway {winner_id!r}")
+    nv = {
+        "id": winner_id,
+        "title": str(winner.get("title", "")),
+        "why": str(winner.get("why", "")),
+        "relation": winner.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
+        "evidence": [dict(e) for e in (winner.get("evidence") or [])],
+        "sessions_seen": list(winner.get("sessions_seen") or []),
+        "markers": {k: _score((winner.get("markers") or {}).get(k)) for k in MARKER_KINDS},
+        "confidence": _score(winner.get("confidence"), 0.5),
+        "last_seen": str(winner.get("last_seen", "")),
+    }
+    seen = {e.get("event_id") for e in nv["evidence"]}
+    for e in (loser.get("evidence") or []) if loser else []:
+        if e.get("event_id") not in seen:
+            nv["evidence"].append(dict(e))
+            seen.add(e.get("event_id"))
+    nv["cites"] = sorted({e.get("event_id") for e in nv["evidence"] if e.get("event_id")})
+    ss = set(nv["sessions_seen"]) | set((loser.get("sessions_seen") or []) if loser else [])
+    nv["sessions_seen"] = sorted(s for s in ss if s)
+    lm = (loser.get("markers") or {}) if loser else {}
+    nv["markers"] = {k: max(nv["markers"][k], _score(lm.get(k))) for k in MARKER_KINDS}
+    nv["last_seen"] = max(nv["last_seen"], str((loser or {}).get("last_seen", "")))
+    nv["support"] = {"events": len(nv["cites"]), "sessions": len(nv["sessions_seen"])}
+    cost = 0.0
+    if resynth and complete_synth is not None and loser is not None:
+        user = ("Two takeaways describe the SAME lesson; merge them into ONE.\n"
+                f"A: {winner.get('title', '')} — {winner.get('why', '')}\n"
+                f"B: {loser.get('title', '')} — {loser.get('why', '')}\n"
+                'Return ONLY JSON {"title": ..., "why": ...}.')
+        comp = complete_synth(SYNTH_SYSTEM, user)
+        cost = completer.cost_of(comp)
+        parsed = completer.parse_json_object(comp.text) or {}
+        why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+        if why:
+            nv["why"] = why
+            nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
+    nv["producer"] = {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
+                      "run_id": run_id, "cost_usd": round(cost, 8)}
+    _ingest_takeaway(nv, model=model, run_id=run_id, root=root)     # winner version FIRST
+    _write_merge(loser_id, winner_id, run_id=run_id, root=root)     # the merge decision LAST
+    return nv
+
+
+# --- the Block: dream v2 as the sequential, stateful, per-EVENT-commit consolidator ----------------
 
 class DreamBlock:
-    """dream as a `block.Block` — the synthesis stage, and the ONE block that commits per RUN, not per
-    item (ADR-0009). The coverage-conditioned supersession needs the whole run's emitted takeaways
-    before any `supersedes` is known, so `commits_per_item=False`: `process` synthesizes a cluster
-    (one LLM call) but only RECORDS it; `finalize` does the supersession pass + every takeaway-blob and
-    marker commit. The flag is all-or-nothing (block.py docstring): nothing durable is written in
-    `process`, everything in `finalize`.
+    """dream v2 as a `block.Block` (ADR-0009): the SEQUENTIAL, STATEFUL consolidator that commits PER
+    ITEM (the inversion of v1's per-run finalize). `items()` loads the concepts + the ON-INSTANCE catalog
+    once, then yields the working set; the driver sorts it by `priority` (salience) and caps by --limit.
+    `process(rv)` routes + applies — committing the takeaway version + `consolidated` decision INSIDE
+    process — then FOLDS the result into `self._cat`/`self._cat_by_id` IN MEMORY so the VERY NEXT event
+    routes against the just-updated catalog. The driver writes the per-item `processed` marker LAST.
+    `finalize()` runs the conservative `forget` pass.
 
-    `items()` runs the global deterministic prelude once — gather (re-anchoring every event to its
-    trusted quote) + cluster (the whole pile, recomputed each run) — and yields one cluster per item;
-    `source_id` is ignored (dream is a global pass). The `min_events` floor and the cluster/event tallies
-    land on the INSTANCE so the shim can surface the old `RunReport` fields; the uniform `block.Report`
-    stays stage-agnostic."""
+    Resumability: each event's takeaway + `consolidated` decision land immediately, so a kill keeps every
+    completed event; on resume `items()` recomputes the working set from the store (consolidated events
+    already excluded) and reloads the catalog fresh — the in-memory catalog is only an intra-run
+    optimization, always reconciled-from-store at run start, never a source of truth."""
 
     name = "dream"
-    commits_per_item = False                       # THE exception: commit per run, in finalize
-    marker_extra = block.no_marker_extra           # never called (the driver writes no per-item marker
-                                                   # when commits_per_item=False) — declared for Block
-                                                   # conformance; dream's audit rides finalize's marker
+    commits_per_item = True                        # the v2 inversion of v1's per-run finalize commit
+    marker_extra = block.no_marker_extra           # no per-item audit fields beyond the uniform marker
 
-    def __init__(self, complete: Completer, *, model: str = DREAM_MODEL,
-                 threshold: float = SIM_THRESHOLD, min_confidence: float = 0.0,
-                 min_events: int = 0) -> None:
-        self.complete = complete
-        self.model = model
-        self.threshold = threshold
+    def __init__(self, complete_route: Completer, complete_synth: Completer, *,
+                 route_model: str = ROUTE_MODEL, synth_model: str = SYNTH_MODEL,
+                 min_confidence: float = 0.0, drift_threshold: float = DRIFT_THRESHOLD,
+                 maturity: int = MATURITY_SESSIONS, forget: bool = True,
+                 forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR) -> None:
+        self.complete_route = complete_route
+        self.complete_synth = complete_synth
+        self.route_model = route_model
+        self.synth_model = synth_model
         self.min_confidence = min_confidence
-        self.min_events = min_events
+        self.drift_threshold = drift_threshold
+        self.maturity = maturity
+        self.forget_on = forget
+        self.forget_tau = forget_tau
+        self.forget_floor = forget_floor
+        # params is the done-key suffix: the per-item `processed` marker keys on (event_id, PV, synth_model).
         self.params: tuple[tuple[str, str], ...] = (
-            ("prompt_version", PROMPT_VERSION), ("model", model))
-        # the rich RunReport-shaped state the shim/CLI read; populated across items/process/finalize.
-        self.takeaways: list[dict] = []
-        self.n_events = 0
-        self.n_clusters = 0
-        self.dropped = 0                           # clusters the model judged noise (no takeaway)
-        self.below_threshold = False               # fewer than min_events → did nothing
-        # the global prelude's products, computed once in items() and reused by finalize.
+            ("prompt_version", PROMPT_VERSION), ("model", synth_model))
+        # the on-instance catalog (loaded once in items(), folded as events consolidate within the run).
         self._concepts: list[dict] = []
         self._known_ids: set[str] = set()
-        self._pending: list[_Pending] = []         # synthesized clusters awaiting the coverage commit
-
-    # -- enumeration: the global gather + cluster (recomputed each run) -----------------------
+        self._cat: list[dict] = []
+        self._cat_by_id: dict[str, dict] = {}
+        # RunReport-shaped tallies (read by the shim/CLI).
+        self.takeaways: list[dict] = []
+        self.n_events = 0
+        self.n_new = 0
+        self.n_strengthened = 0
+        self.n_noop = 0
+        self.staled: list[str] = []
 
     def items(self, root: Path, *, source_id: str | None = None):
-        """The global, deterministic prelude — yield one cluster per item. dream is a whole-pile pass,
-        so `source_id` is ignored. Below the `min_events` floor it yields NOTHING (and flags
-        `below_threshold`); else it clusters the whole event pile and yields each cluster. `concepts`
-        is loaded here (once) for `process` to reason against, and the event/cluster tallies land on the
-        instance for the Report."""
+        """Load the concepts + the ON-INSTANCE catalog ONCE, then yield the salience-ordered working set.
+        `source_id` is ignored (dream is a global pass). The driver eager-lists this, sorts by `priority`,
+        and caps by --limit."""
         self._concepts = load_concepts(root)
-        self._known_ids = {c["id"] for c in self._concepts}   # all str (load_concepts guarantees it)
-        events = gather_events(root, min_confidence=self.min_confidence)
-        self.n_events = len(events)
-        if len(events) < self.min_events:          # a floor below which dreaming is pointless (not a
-            self.below_threshold = True            # change-detector — the done-skip handles unchanged work)
-            return
-        clusters = cluster(events, threshold=self.threshold)
-        self.n_clusters = len(clusters)
-        yield from clusters
+        self._known_ids = {c["id"] for c in self._concepts}      # all str (load_concepts guarantees it)
+        self._cat = catalog(root)
+        self._cat_by_id = {t["id"]: t for t in self._cat}
+        ws = working_set(root, min_confidence=self.min_confidence)
+        self.n_events = len(ws)
+        return ws
 
-    def key(self, cl: list[ResolvedEvent]) -> str:
-        return cluster_signature(cl)
+    def key(self, rv: ResolvedEvent) -> str:
+        return rv.id
 
-    # -- synthesize ONE cluster — record, do NOT commit --------------------------------------
+    def priority(self, rv: ResolvedEvent) -> float:
+        return salience(rv.event)
 
-    def process(self, cl: list[ResolvedEvent], *, root: Path, run_id: str) -> tuple[int, float]:
-        """Synthesize one cluster (one LLM call) and RECORD it — nothing durable is committed here
-        (commits_per_item=False). Returns (0, cost): 0 outputs because no blob lands yet; `cost` feeds
-        the driver's `--max-usd` gate (a budget stop simply means finalize commits the clusters
-        synthesized before the stop). A raised completer propagates — the driver isolates it as
-        `errored`, the cluster is absent from `_pending`, retried next run."""
-        tk, cost = synthesize_cluster(cl, self.complete, self._concepts,
-                                      known_concept_ids=self._known_ids,
-                                      model=self.model, run_id=run_id)
-        self._pending.append(_Pending(cl=cl, sig=cluster_signature(cl), tk=tk, cost=cost))
-        return (0, cost)
-
-    # -- finalize: coverage-conditioned supersession, then commit per cluster -----------------
+    def process(self, rv: ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
+        """Route the event against the on-instance catalog, apply the verdict (committing the takeaway +
+        `consolidated` decision), then FOLD the result back into the catalog so the next event sees it.
+        Returns (n_outputs, cost) for the driver's budget gate. A raised route/synth propagates — the
+        driver isolates the event as errored (no consolidated decision → retried next run)."""
+        rr, route_cost = route(rv, self._cat, self.complete_route)
+        n_out, apply_cost, tk = apply(
+            rv, rr, self._cat_by_id, self.complete_synth, self._concepts,
+            known_concept_ids=self._known_ids, drift_threshold=self.drift_threshold,
+            model=self.synth_model, run_id=run_id, root=root)
+        if tk is not None:
+            if rr["decision"] == "new":
+                self.n_new += 1
+            else:
+                self.n_strengthened += 1
+            self.takeaways.append(tk)
+            folded = takeaway_content(tk)            # the stored projection (== what a re-load would give)
+            self._cat_by_id[folded["id"]] = folded
+            self._cat = list(self._cat_by_id.values())
+        else:
+            self.n_noop += 1                         # noop OR a synth-dropped new (no takeaway either way)
+        return n_out, route_cost + apply_cost
 
     def finalize(self, *, root: Path, run_id: str) -> None:
-        """The per-run commit — today's run() steps 2+3, lifted out of the loop (ADR-0009). The driver
-        hands `finalize` NO item list (#6): dream tracks its own `_pending` on the instance (it commits
-        nothing per item, so a driver-kept record would be empty anyway). Two steps:
-
-          2. COVERAGE-CONDITIONED SUPERSESSION (the orphan fix, preserved EXACTLY): a prior current
-             takeaway is eligible to fold out ONLY if ALL its events are re-covered by takeaways
-             emitted this run — so a dropped/errored split-child can never orphan its parent's events;
-             each emitted takeaway then supersedes every eligible prior it shares an event with
-             (`- {tk id}` guards a same-id re-synthesis from superseding itself).
-          3. COMMIT (crash-ordering preserved): each takeaway blob durable FIRST (content then meta),
-             then its cluster's `processed` marker LAST — a crash before a marker re-processes that
-             cluster; the re-synthesis re-appears as a new VERSION of the same cluster_signature (a
-             no-op if bytes unchanged, else latest wins). model-bump-replaces is free: a bumped model
-             is a new done-key, `_ingest_takeaway` writes a new version under the same source, and
-             `current_takeaways` folds to the newest."""
-        emitted = [p.tk for p in self._pending if p.tk is not None]
-        coverage = set().union(*(set(tk["member_events"]) for tk in emitted)) if emitted else set()
-        eligible = {p["id"]: set(p.get("member_events") or [])
-                    for p in current_takeaways(root)}
-        eligible = {pid: pev for pid, pev in eligible.items() if pev and pev <= coverage}
-        for tk in emitted:
-            ev = set(tk["member_events"])
-            tk["supersedes"] = sorted({pid for pid, pev in eligible.items() if pev & ev} - {tk["id"]})
-
-        for p in self._pending:
-            if p.tk is not None:
-                _ingest_takeaway(p.tk, model=self.model, run_id=run_id, root=root)   # durable first ...
-                self.takeaways.append(p.tk)
-            else:
-                self.dropped += 1
-            # ... then the cluster's commit marker LAST. event_ids/dropped/cost are the per-cluster
-            # audit (the old _write_processed body); block.write_processed appends the uniform fields.
-            block.write_processed(
-                "dream", p.sig, self.params, n_outputs=1 if p.tk is not None else 0,
-                cost_usd=p.cost, run_id=run_id, root=root,
-                extra={"event_ids": sorted(rv.id for rv in p.cl), "dropped": p.tk is None})
+        """The conservative straggler eviction (cheap, no LLM). Runs even though commits_per_item=True —
+        the driver always calls finalize. Disabled via `forget=False`."""
+        if self.forget_on:
+            self.staled = forget(root, tau=self.forget_tau, salience_floor=self.forget_floor,
+                                 run_id=run_id)
 
 
-# --- run: a thin compat shim over the block driver (keeps callers' RunReport reads untouched) -----
+# --- run: a thin compat shim over the block driver ------------------------------------------------
 
 class RunReport:
-    """The shape the old `dream.run` returned — a thin WRAPPER, not a copy (the spec's #4). It holds the
-    uniform `block.Report` the driver populated plus the DreamBlock instance, and exposes every field by
-    reading THROUGH them via @property: the uniform fields proxy the Report (run_id/skipped/errored/
-    cost_usd/stopped_on_budget), the genuinely-extra instance tallies proxy the block (n_events/
-    n_clusters/takeaways/dropped/below_threshold). Nothing is copied at construction, so the hand-
-    maintained desync surface (a field set here that the block later changed) is gone. `min_events` is
-    the run's own arg, carried so the CLI can print the threshold it gated on. Callers (the CLI,
-    test_dream/test_review setup) read `.takeaways`/`.n_clusters`/`.skipped`/`.dropped`/etc."""
-    def __init__(self, report: block.Report, blk: DreamBlock, *, min_events: int) -> None:
+    """The shape `dream.run` returns — a thin WRAPPER over the uniform `block.Report` the driver
+    populated plus the DreamBlock instance, exposing every field by reading THROUGH them. Nothing is
+    copied at construction, so there is no hand-maintained desync surface."""
+    def __init__(self, report: block.Report, blk: DreamBlock) -> None:
         self._report = report
         self._blk = blk
-        self.min_events = min_events
 
-    # the genuinely-extra instance tallies — read off the block (the Report stays stage-agnostic)
     @property
     def n_events(self) -> int:
         return self._blk.n_events
     @property
-    def n_clusters(self) -> int:
-        return self._blk.n_clusters
+    def n_new(self) -> int:
+        return self._blk.n_new
+    @property
+    def n_strengthened(self) -> int:
+        return self._blk.n_strengthened
+    @property
+    def n_noop(self) -> int:
+        return self._blk.n_noop
     @property
     def takeaways(self) -> list[dict]:
         return self._blk.takeaways
     @property
-    def dropped(self) -> int:
-        return self._blk.dropped
-    @property
-    def below_threshold(self) -> bool:
-        return self._blk.below_threshold
+    def staled(self) -> list[str]:
+        return self._blk.staled
 
-    # the uniform fields — proxied straight off the wrapped Report (never copied → never stale)
     @property
     def run_id(self) -> str:
         return self._report.run_id
+    @property
+    def examined(self) -> int:
+        return self._report.examined
+    @property
+    def processed(self) -> int:
+        return self._report.processed
     @property
     def skipped(self) -> int:
         return self._report.skipped
@@ -645,82 +898,92 @@ class RunReport:
         return self._report.stopped_on_budget
 
 
-def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM_THRESHOLD,
-        min_confidence: float = 0.0, min_events: int = 0, max_usd: float | None = None,
-        limit: int | None = None, progress: block.Progress | None = None,
-        root: Path | None = None) -> RunReport:
-    """Synthesize takeaways over the whole event pile, idempotently (ADR-0006) — now a thin shim over
-    the per-run-commit `DreamBlock` + `block.run` (ADR-0009). The observable contract is UNCHANGED:
-    cluster globally (cheap, deterministic), one LLM call per not-yet-done cluster, coverage-conditioned
-    supersession over the whole run's emitted takeaways, then commit (takeaway blob first, processed
-    marker last). The driver streams synthesis progress per cluster and isolates a failing call
-    (counts `errored`, the cluster retries next run); the supersession + commit live in `finalize`.
-
-    Returns a `RunReport` WRAPPING the SAME `block.Report` + `DreamBlock` instance the driver populated,
-    so existing callers' field reads are untouched. `progress` defaults to None (silent) so a setup
-    helper doesn't spew per-cluster lines — the CLI injects a Progress to see them."""
-    blk = DreamBlock(complete, model=model, threshold=threshold,
-                     min_confidence=min_confidence, min_events=min_events)
+def run(complete_route: Completer, complete_synth: Completer, *, route_model: str = ROUTE_MODEL,
+        synth_model: str = SYNTH_MODEL, min_confidence: float = 0.0,
+        drift_threshold: float = DRIFT_THRESHOLD, maturity: int = MATURITY_SESSIONS,
+        forget: bool = True, max_usd: float | None = None, limit: int | None = None,
+        progress: block.Progress | None = None, root: Path | None = None) -> RunReport:
+    """Consolidate the working set incrementally — a thin shim over `block.run(DreamBlock(...))` (mirrors
+    v1's run/RunReport-wrapper pattern), so callers/CLI keep a stable surface. TWO separate injected
+    Completers (route = Haiku, synth = Sonnet), offline-testable with fakes. `progress` defaults to None
+    (silent) so a setup helper doesn't spew per-event lines."""
+    blk = DreamBlock(complete_route, complete_synth, route_model=route_model, synth_model=synth_model,
+                     min_confidence=min_confidence, drift_threshold=drift_threshold, maturity=maturity,
+                     forget=forget)
     report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
-    return RunReport(report, blk, min_events=min_events)
+    return RunReport(report, blk)
 
 
 # --- CLI ------------------------------------------------------------------------------------------
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(
-        prog="dream", description="Cluster glean events and synthesize evidence-cited takeaways (LLM).")
-    ap.add_argument("--model", default=DREAM_MODEL, help=f"claude model (default: {DREAM_MODEL})")
-    ap.add_argument("--threshold", type=float, default=SIM_THRESHOLD,
-                    help=f"cluster join similarity 0-1, higher = smaller clusters (default {SIM_THRESHOLD})")
-    ap.add_argument("--min-confidence", type=float, default=0.0,
-                    help="ignore events below this glean confidence")
-    ap.add_argument("--min-events", type=int, default=0,
-                    help="do nothing unless at least this many events exist (trigger on accumulation)")
+        prog="dream",
+        description="Incremental working-set consolidation: route each un-consolidated event to "
+                    "NEW/STRENGTHEN/NOOP and maintain evidence-cited takeaways (LLM).")
+    ap.add_argument("--route-model", default=ROUTE_MODEL, help=f"router model (default: {ROUTE_MODEL})")
+    ap.add_argument("--synth-model", default=SYNTH_MODEL, help=f"synthesis model (default: {SYNTH_MODEL})")
+    ap.add_argument("--min-confidence", type=float, default=0.0, help="ignore events below this glean confidence")
+    ap.add_argument("--drift-threshold", type=float, default=DRIFT_THRESHOLD,
+                    help="lexical drift above which a strengthen re-synthesizes the why")
+    ap.add_argument("--maturity", type=int, default=MATURITY_SESSIONS,
+                    help="distinct-session bar a takeaway must cross to reach review")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
-    ap.add_argument("--limit", type=int, help="cap clusters examined this run (dream is global: no --all/--source-id)")
+    ap.add_argument("--limit", type=int, help="cap events examined this run (the salience-ordered top)")
+    ap.add_argument("--no-forget", action="store_true", help="skip the straggler-eviction (forget) pass")
+    ap.add_argument("--merge", action="store_true", help="run the maintenance de-dup pass (list near-dup pairs)")
+    ap.add_argument("--merge-threshold", type=float, default=0.5, help="lexical similarity for merge candidates")
     ap.add_argument("--dry-run", action="store_true",
-                    help="cluster only — print the groupings and a sample quote each; no LLM calls")
-    ap.add_argument("--show", action="store_true", help="print each synthesized takeaway")
-    ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-cluster progress line")
+                    help="list the salience-ordered working set + catalog sizes; no LLM calls")
+    ap.add_argument("--show", action="store_true", help="print each new/strengthened takeaway")
+    ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-event progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     args = ap.parse_args(argv)
 
-    if args.dry_run:                               # eyeball the deterministic grouping before spending
+    if args.merge:                                  # maintenance de-dup: list the candidate pairs
         root = config.ensure_layout()
-        events = gather_events(root, min_confidence=args.min_confidence)
-        clusters = cluster(events, threshold=args.threshold)
-        print(f"{len(events)} events → {len(clusters)} clusters (threshold {args.threshold}):")
-        for cl in sorted(clusters, key=len, reverse=True):
-            sample = cl[0].quote.strip().replace("\n", " ")
-            print(f"  [{len(cl):>2}] {cluster_signature(cl)[:10]}  e.g. {sample[:72]!r}")
+        cat = catalog(root)
+        pairs = merge_candidates(cat, threshold=args.merge_threshold)
+        by_id = {t["id"]: t for t in cat}
+        print(f"{len(pairs)} merge candidate(s) over {len(cat)} takeaways (threshold {args.merge_threshold}):")
+        for loser, winner in pairs:
+            print(f"  {loser[:12]} → {winner[:12]}  "
+                  f"({by_id.get(loser, {}).get('title', '')!r} into {by_id.get(winner, {}).get('title', '')!r})")
         return
 
-    complete = completer.make_cli_completer(args.model)
-    # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
-    # to watch (--quiet; --dry-run already returned above); else built from this stage's args + OUT_NOUN.
-    progress = None if args.quiet else block.Progress(
-        "dream", cap=args.max_usd, params={"prompt_version": PROMPT_VERSION, "model": args.model},
-        out_noun=OUT_NOUN, verbose=args.verbose)
-    report = run(complete, model=args.model, threshold=args.threshold,
-                 min_confidence=args.min_confidence, min_events=args.min_events,
-                 max_usd=args.max_usd, limit=args.limit, progress=progress)
-    if report.below_threshold:
-        print(f"dream-{report.run_id}: {report.n_events} events < min-events {report.min_events}, skipped")
+    if args.dry_run:                                # eyeball the queue + catalog before spending
+        root = config.ensure_layout()
+        ws = working_set(root, min_confidence=args.min_confidence)
+        ws.sort(key=lambda rv: salience(rv.event), reverse=True)
+        cat = catalog(root)
+        mature = current_takeaways(root, min_sessions=args.maturity)
+        print(f"{len(ws)} un-consolidated events (salience-ordered) · catalog {len(cat)} takeaways "
+              f"({len(mature)} mature):")
+        for rv in ws[:40]:
+            sample = rv.quote.strip().replace("\n", " ")
+            print(f"  [{salience(rv.event):.3f}] {rv.id[:12]}  {sample[:72]!r}")
         return
+
+    complete_route = completer.make_cli_completer(args.route_model)
+    complete_synth = completer.make_cli_completer(args.synth_model)
+    progress = None if args.quiet else block.Progress(
+        "dream", cap=args.max_usd, params={"prompt_version": PROMPT_VERSION, "model": args.synth_model},
+        out_noun=OUT_NOUN, verbose=args.verbose)
+    report = run(complete_route, complete_synth, route_model=args.route_model, synth_model=args.synth_model,
+                 min_confidence=args.min_confidence, drift_threshold=args.drift_threshold,
+                 maturity=args.maturity, forget=not args.no_forget, max_usd=args.max_usd,
+                 limit=args.limit, progress=progress)
     if args.show:
         for t in report.takeaways:
-            rel = t["relation"]["kind"]
-            print(f"\n  • {t['title']}  [{rel}, {t['support']['events']}ev/"
-                  f"{t['support']['sessions']}sess, conf {t['confidence']:.2f}]")
+            sup, rel = t["support"], t["relation"]["kind"]
+            print(f"\n  • {t['title']}  [{rel}, {sup['events']}ev/{sup['sessions']}sess, "
+                  f"conf {t['confidence']:.2f}]")
             print(f"    {t['why']}")
-            if t["supersedes"]:
-                print(f"    supersedes {', '.join(s[:10] for s in t['supersedes'])}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
     errs = f", {report.errored} errored" if report.errored else ""
-    print(f"\ndream-{report.run_id}: {report.n_events} events → {report.n_clusters} clusters, "
-          f"{len(report.takeaways)} takeaways, {report.dropped} dropped, {report.skipped} skipped"
-          f"{errs}, ${report.cost_usd:.4f}{tail}")
+    print(f"\ndream-{report.run_id}: {report.n_events} events → {report.n_new} new, "
+          f"{report.n_strengthened} strengthened, {report.n_noop} noop, {report.skipped} skipped, "
+          f"{len(report.staled)} staled{errs}, ${report.cost_usd:.4f}{tail}")
 
 
 if __name__ == "__main__":

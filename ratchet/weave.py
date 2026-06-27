@@ -343,6 +343,7 @@ class WeaveBlock:
     commits_per_item = True
     finalize = block.no_finalize             # no cross-item dependency
     marker_extra = block.no_marker_extra     # no per-item audit fields
+    priority = block.no_priority             # arrival order
 
     def __init__(self) -> None:
         # render_version is read at construction so a single instance pins one logic version per run.
