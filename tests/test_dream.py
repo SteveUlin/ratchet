@@ -168,12 +168,21 @@ def _run_block_substrate_checks():
         assert not list(blobstore.decisions_for(None, iroot, verb="processed", stage="dream")), \
             "no processed marker is written in process (the all-or-nothing commits_per_item=False rule)"
 
-        # the streaming printer is exercised once per cluster (capture the per-item lines)
+        # the streaming printer is exercised once per cluster (capture the per-item lines). The probe is
+        # a Progress-like object (start/tick/stop) — the decoupled driver speaks only that protocol — and
+        # tracks its OWN examined/processed counters since the new tick takes key+outcome, not the Report.
         lines = []
-        def _probe(report, item, key, n, c, **kw):
-            lines.append((report.examined, report.processed, key))
+        class _Probe:
+            def __init__(self): self.examined = self.processed = 0
+            def start(self, *, total, todo, already): pass
+            def tick(self, key, outcome, *, outputs=0, cost=0.0):
+                self.examined += 1
+                if outcome == "done":
+                    self.processed += 1
+                lines.append((self.examined, self.processed, key))
+            def stop(self): pass
         blk2 = dream.DreamBlock(_DreamFake(), model="fake-b")
-        rep = block.run(blk2, progress=_probe, root=iroot)
+        rep = block.run(blk2, progress=_Probe(), root=iroot)
         assert rep.stage == "dream" and rep.examined == 2 and rep.processed == 2, \
             "uniform block.Report: 2 clusters examined + processed"
         assert rep.outputs == 0, "Report.outputs is 0 for dream — outputs land in finalize, not per item"

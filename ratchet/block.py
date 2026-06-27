@@ -24,25 +24,15 @@ every output+marker is in finalize, never split — or the crash-safety ordering
 """
 from __future__ import annotations
 
+import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Iterable, Protocol, runtime_checkable
 
 from . import blobstore, config
 
 Item = Any   # opaque to the driver — only the block's key()/process() interpret it
-
-
-@dataclass
-class Done:
-    """A driver record for an item it decided to commit — handed to `finalize` for the optional
-    cross-item pass. `item` is the opaque enumeration value; `key` is its stable id; n_outputs/
-    cost_usd are the in-flight accounting `process` returned. dream reads `item` to recover the
-    cluster; per-item stages ignore the list entirely (their default `finalize` is a no-op)."""
-    item: Item
-    key: str
-    n_outputs: int = 0
-    cost_usd: float = 0.0
 
 
 @runtime_checkable
@@ -69,8 +59,10 @@ class Block(Protocol):
         Raising is caught + isolated by run()."""
         ...
 
-    def finalize(self, processed: list[Done], *, root: Path, run_id: str) -> None:
-        """OPTIONAL cross-item pass. Default (`no_finalize`) is a no-op; dream is the only override."""
+    def finalize(self, *, root: Path, run_id: str) -> None:
+        """OPTIONAL cross-item pass over state the block accumulated on ITSELF during the run (dream's
+        `_pending`, tap's dirty cursor). The driver hands it NO item list — a finalize block tracks its
+        own per-item state on the instance. Default (`no_finalize`) is a no-op; dream/tap override."""
         ...
 
     def marker_extra(self, item: Item) -> dict:
@@ -84,7 +76,7 @@ class Block(Protocol):
 # `self`/`_self` the descriptor protocol passes — a module-level function set as a class attribute is
 # an instance method. A stage that needs neither just inherits these and declares nothing.
 
-def no_finalize(_self, processed: list[Done], *, root: Path, run_id: str) -> None:
+def no_finalize(_self, *, root: Path, run_id: str) -> None:
     """The default `finalize` — a no-op. A per-item stage (tap is the exception, flushing its cursor)
     has no cross-item dependency, so it inherits this rather than writing an empty method each."""
     return None
@@ -166,35 +158,135 @@ class Report:
     would_process: int = 0     # --dry-run only
 
 
-# --- the streaming progress printer (reads ONLY Report counters + the per-item tuple) ---------------
+# --- live progress: spinner + ▰▱ bar + spend on a TTY; idempotent per-item lines when piped --------
 
-def _default_progress(report: Report, item: Item, key: str, n_out: int, cost: float, *,
-                      dry_run: bool = False, errored: bool = False) -> None:
-    """One line per item as it LANDS (not batched) — the fix for "no visible progress" on a backfill.
-    It reads ONLY the stage-agnostic `Report` counters + the per-item `(key, n_out, cost)`, so the
-    SAME printer serves every stage verbatim. `--quiet` passes `progress=None`; `--json` passes the
-    block's structured `json_progress`."""
-    k12 = key[:12]
-    if dry_run:
-        print(f"would {report.stage} {k12}")
-        return
-    if errored:
-        print(f"  ! {report.stage} {k12} errored")
-        return
-    print(f"{report.stage}  {report.examined} examined · {report.processed} done · "
-          f"{report.skipped} skip · {report.outputs} out · ${report.cost_usd:.2f}   {k12}")
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_RESET, _BOLD, _DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
+_RED, _GRN, _YEL, _CYN = "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[36m"
+
+
+class Progress:
+    """A block run's live progress, stdlib-only. On a TTY: ONE in-place line — an animated spinner, a
+    `▰▱` bar with a percentage, a `done` count and a running spend, in color — redrawn by a daemon
+    thread every 100 ms so it MOVES even during a slow LLM call (the "still alive" signal). Piped (not
+    a TTY): one IDEMPOTENT, self-contained line per processed item — its own key · outputs · cost,
+    never a running total — so a log survives reordering and a future PARALLEL run needs no format
+    change. The aggregate counters live behind a lock, so worker threads may `tick()` concurrently:
+    multithreading-ready (ADR-0009). `skip`/`err` show only when nonzero (a clean first run is
+    uncluttered). `--quiet` → no Progress; `--verbose` → the per-item lines also print above the bar."""
+
+    def __init__(self, stage: str, *, cap: float | None = None, params: dict | None = None,
+                 out_noun: str = "out", verbose: bool = False, stream=None):
+        # `total` is NOT here: the driver owns enumeration, so it knows the count only at start() time
+        # (after items() + --limit). The stage builds this Progress from its args BEFORE the driver
+        # enumerates, so total cannot be a constructor arg — it arrives in start().
+        self.stage, self.cap, self.out_noun = stage, cap, out_noun
+        self.params, self.verbose = params or {}, verbose
+        self.stream = stream if stream is not None else sys.stderr
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.total = 0
+        self.done = self.skipped = self.errored = self.outputs = 0
+        self.cost = 0.0
+        self._frame = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _c(self, code: str, s) -> str:
+        return f"{code}{s}{_RESET}" if self.tty else str(s)    # color ONLY on a TTY
+
+    def start(self, *, total: int, todo: int, already: int) -> None:
+        """Open the run: the driver passes the enumerated `total` (it owns enumeration) plus the
+        done-skip split (`todo`/`already`). A TTY spawns the animator thread here, once the count is known."""
+        self.total = total
+        ps = " · ".join(f"{k}={v}" for k, v in self.params.items())
+        cap = f" · cap {self._c(_YEL, f'${self.cap:.2f}')}" if self.cap is not None else ""
+        self._println(f"{self._c(_BOLD, self.stage)}: {self.total} items · {todo} to do · "
+                      f"{already} done{cap}" + (f" · {self._c(_DIM, ps)}" if ps else ""))
+        if self.tty and self.total:
+            self._thread = threading.Thread(target=self._animate, daemon=True)
+            self._thread.start()
+
+    def tick(self, key: str, outcome: str, *, outputs: int = 0, cost: float = 0.0) -> None:
+        """Record ONE item's landing. `outcome` is the single discriminator the driver passes per call
+        site — one of "done" | "skipped" | "errored" | "dry_run" — replacing the old bool soup: tick
+        branches on it once. A "done" item adds its outputs+cost to the aggregate; a skip/dry-run is a
+        bare counter (no per-item line); an errored item logs its line but no outputs/cost."""
+        with self._lock:                              # lock-guarded → concurrent ticks are safe
+            if outcome == "skipped":
+                self.skipped += 1
+            elif outcome == "errored":
+                self.errored += 1
+            elif outcome == "done":
+                self.done += 1
+                self.outputs += outputs
+                self.cost += cost
+            # "dry_run" touches no aggregate counter (it is a list-only pass)
+        if outcome in ("skipped", "dry_run"):
+            return                                    # a skip/dry-run is a counter, not a per-item line
+        line = self._item_line(key, outputs, cost, outcome == "errored")
+        if not self.tty:
+            self._println(line)                       # piped: the idempotent log
+        elif self.verbose:
+            self._println(line)                       # TTY --verbose: above the bar; it redraws next frame
+
+    def _item_line(self, key: str, outputs: int, cost: float, errored: bool) -> str:
+        if errored:
+            return f"  {self.stage} {key[:12]} · {self._c(_RED, 'errored')}"
+        return f"  {self.stage} {key[:12]} · {outputs} {self.out_noun} · ${cost:.4f}"   # THIS item only
+
+    def _animate(self) -> None:
+        while not self._stop.wait(0.1):
+            with self._lock:
+                self._frame = (self._frame + 1) % len(_SPIN)
+                self._draw_bar()
+
+    def _draw_bar(self) -> None:
+        seen = self.done + self.skipped + self.errored
+        frac = seen / self.total if self.total else 1.0
+        width = 24
+        filled = int(round(width * frac))
+        bar = _GRN + "▰" * filled + _DIM + "▱" * (width - filled) + _RESET
+        skip = f" · {self.skipped} skip" if self.skipped else ""
+        err = f" · {self._c(_RED, f'{self.errored} err')}" if self.errored else ""
+        spend = self._c(_YEL, f"${self.cost:.2f}") + (f"/${self.cap:.2f}" if self.cap is not None else "")
+        self.stream.write(f"\r\x1b[2K{self._c(_CYN, _SPIN[self._frame])} {self.stage} {bar} "
+                          f"{int(frac * 100)}% · {self.done}/{self.total} · "
+                          f"{self.outputs} {self.out_noun}{skip}{err} · {spend}")
+        self.stream.flush()
+
+    def _erase(self) -> None:
+        if self.tty:
+            self.stream.write("\r\x1b[2K")
+            self.stream.flush()
+
+    def _println(self, s: str) -> None:
+        with self._lock:                              # serialize against the animator's bar draw
+            if self.tty:
+                self._erase()
+            self.stream.write(s + "\n")
+            self.stream.flush()
+
+    def stop(self) -> None:
+        """Stop the animator and clear the live bar. The STAGE prints the final summary (its own richer
+        one, on stdout) — Progress owns only the startup line, the live bar, and the per-item log."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.3)
+        if self.tty:
+            self._erase()
 
 
 # --- the driver: one loop, identical for every stage ------------------------------------------------
 
 def run(block: Block, *, source_id: str | None = None, max_usd: float | None = None,
         limit: int | None = None, dry_run: bool = False,
-        progress: Callable | None = _default_progress, root: Path | None = None) -> Report:
+        progress: Progress | None = None, root: Path | None = None) -> Report:
     """Drive a block over its items, IDENTICALLY for every stage. The per-item contract:
 
-      1. enumerate → 2. examine (cap by --limit) → 3. done-skip (a marker for (key, *params)) →
-      4. budget gate (--max-usd, clean exit) → 5. dry-run list-only → 6. process (commit blobs) →
-      7. write the marker LAST (per-item commit) → 8. progress as it lands → 9. optional finalize.
+      1. enumerate (eager, so the bar knows the total) → 2. --limit cap → 3. done-skip (a marker for
+      (key, *params)) → 4. budget gate (--max-usd, clean exit) → 5. dry-run list-only → 6. process
+      (commit blobs) → 7. the marker LAST (per-item commit) → 8. progress.tick → 9. optional finalize.
 
     The four invariants the driver guarantees so no stage re-implements them:
       PER-ITEM COMMIT — output blobs (in process) then the marker (here, LAST), so a kill/crash keeps
@@ -203,27 +295,37 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
         the item retries next run (its key never entered the done-set).
       IDEMPOTENCY — `done_index` skips items with a marker for (key, *params); a bumped param flips the
         key, so the item re-processes.
-      BUDGET/LIMIT — `--limit` caps items EXAMINED (before the done-skip, so re-running a done corpus
-        still examines `limit` and stops); `--max-usd` stops cleanly, committed-so-far persists.
+      BUDGET/LIMIT — `--limit` caps items EXAMINED (the first `limit`); `--max-usd` stops cleanly,
+        committed-so-far persists.
 
-    dream opts out of per-item commit (`commits_per_item=False`): process() ingests nothing durable
-    and returns (0, cost) for the budget gate; the driver writes NO per-item marker; `finalize` does
-    every blob+marker commit. The flag is all-or-nothing (see module docstring)."""
+    PROGRESS is fully DECOUPLED: the driver knows only the `Progress` PROTOCOL (start/tick/stop), never
+    constructs one, and never reads stage knobs (out_noun, verbosity) off the block. Each stage's main()
+    builds its own `Progress` (or None for --quiet/--dry-run) from its args and injects it here. The
+    driver owns enumeration, so IT computes `total`/`todo`/`already` and hands them to `start`; per item
+    it passes the ONE outcome to `tick`. dream opts out of per-item commit (`commits_per_item=False`):
+    process() ingests nothing durable and returns (0, cost) for the budget gate; the driver writes NO
+    per-item marker; `finalize` does every blob+marker commit off the block's own `_pending`. All-or-nothing."""
     root = config.ensure_layout(root)
     run_id = config.run_id()
     params = block.params                          # snapshot once (a stage must not mutate mid-run)
     pvals = tuple(v for _, v in params)
     done = done_index(block.name, root)            # one scan
+    items = list(block.items(root, source_id=source_id))   # eager: the bar + startup summary need the total
+    if limit is not None:
+        items = items[:limit]                      # --limit caps items EXAMINED (the first `limit`)
     report = Report(stage=block.name, run_id=run_id)
-    committed: list[Done] = []
 
-    for item in block.items(root, source_id=source_id):
-        if limit is not None and report.examined >= limit:
-            break                                  # --limit caps items EXAMINED, before the done-skip
+    if progress:                                   # the driver owns enumeration → it computes the counts
+        todo = sum(1 for it in items if (block.key(it), *pvals) not in done)
+        progress.start(total=len(items), todo=todo, already=len(items) - todo)
+
+    for item in items:
         report.examined += 1
         k = block.key(item)
         if (k, *pvals) in done:
             report.skipped += 1
+            if progress:
+                progress.tick(k, "skipped")
             continue
         if max_usd is not None and report.cost_usd >= max_usd:
             report.stopped_on_budget = True
@@ -231,14 +333,14 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
         if dry_run:
             report.would_process += 1              # list-only; NO process, NO LLM, NO marker
             if progress:
-                progress(report, item, k, 0, 0.0, dry_run=True)
+                progress.tick(k, "dry_run")
             continue
         try:
             n_out, cost = block.process(item, root=root, run_id=run_id)   # blobs committed inside
         except Exception:
             report.errored += 1                    # per-item isolation; run continues, item retried
             if progress:
-                progress(report, item, k, 0, 0.0, errored=True)
+                progress.tick(k, "errored")
             continue
         report.processed += 1
         report.outputs += n_out
@@ -247,10 +349,11 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
             write_processed(block.name, k, params, n_outputs=n_out, cost_usd=cost,
                             run_id=run_id, extra=block.marker_extra(item), root=root)  # marker LAST
             done.add((k, *pvals))                  # so a duplicate key later this run also skips
-        committed.append(Done(item=item, key=k, n_outputs=n_out, cost_usd=cost))
         if progress:
-            progress(report, item, k, n_out, cost)
+            progress.tick(k, "done", outputs=n_out, cost=cost)
 
+    if progress:
+        progress.stop()
     if not dry_run:
-        block.finalize(committed, root=root, run_id=run_id)   # no-op default; dream commits here
+        block.finalize(root=root, run_id=run_id)   # no-op default; dream/tap act on their own state
     return report

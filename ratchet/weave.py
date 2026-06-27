@@ -32,6 +32,7 @@ from . import blobstore, block, config
 
 RENDER_VERSION = "weave/1"             # bump when render logic changes — pins which logic made a span
 RENDER_FORMAT = "transcript.render/1"  # the cleaned-blob artifact's shape (source-kind . shape . ver)
+OUT_NOUN = "cleaned"                    # the per-item output noun the Progress bar/line shows
 
 
 # --- 1. parse + active-path reconstruction ------------------------------------------------
@@ -396,6 +397,7 @@ def main(argv=None) -> None:
     ap.add_argument("--limit", type=int, help="cap items EXAMINED")
     ap.add_argument("--dry-run", action="store_true", help="list what would materialize; do nothing")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
+    ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — weave never calls an LLM)")
     args = ap.parse_args(argv)
 
@@ -417,16 +419,24 @@ def main(argv=None) -> None:
     if not (args.all or args.source_id or args.hash):
         ap.error("give a blob hash, --source-id, or --all")
 
+    # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
+    # else built from this stage's args + OUT_NOUN. weave has no LLM cost, so cap is omitted.
+    def make_progress(blk):
+        if args.quiet or args.dry_run:
+            return None
+        return block.Progress(blk.name, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
+
     # The batch/idempotent path: drive the block. A bare hash scopes to that one raw blob (a one-item
     # block so the driver's done-skip + marker still apply — no bespoke materialize that bypasses them).
-    progress = None if args.quiet else block._default_progress
     if args.hash and not args.all:
         if not blobstore.has(args.hash):
             ap.error(f"no such blob: {args.hash}")
-        block.run(_OneRaw(args.hash), dry_run=args.dry_run, progress=progress)
+        one = _OneRaw(args.hash)
+        block.run(one, dry_run=args.dry_run, progress=make_progress(one))
         return
-    block.run(WeaveBlock(), source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
-              dry_run=args.dry_run, progress=progress)
+    wb = WeaveBlock()
+    block.run(wb, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
+              dry_run=args.dry_run, progress=make_progress(wb))
 
 
 class _OneRaw(WeaveBlock):

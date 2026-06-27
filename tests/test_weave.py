@@ -133,9 +133,22 @@ assert "\n\n".join(cleaned_text[turn.start:turn.end] for turn in doc.turns) == c
 
 # A streaming-progress probe so we assert the driver streams per item (not batched to the end).
 class _Probe:
-    def __init__(self): self.lines = []
-    def __call__(self, report, item, key, n_out, cost, *, dry_run=False, errored=False):
-        self.lines.append((key, n_out, cost, report.processed, report.skipped, dry_run, errored))
+    """Progress-like (start/tick/stop) so the driver drives it as the real bar. The new decoupled tick
+    takes only key+outcome, so the probe tracks its own running processed/skipped counters to keep the
+    tuple shape. A skipped item lands no line (it is a bare counter)."""
+    def __init__(self):
+        self.lines = []
+        self.processed = self.skipped = 0
+    def start(self, *, total, todo, already): pass
+    def tick(self, key, outcome, *, outputs=0, cost=0.0):
+        if outcome == "done":
+            self.processed += 1
+        elif outcome == "skipped":
+            self.skipped += 1
+            return
+        self.lines.append((key, outputs, cost, self.processed, self.skipped,
+                           outcome == "dry_run", outcome == "errored"))
+    def stop(self): pass
 
 wb = weave.WeaveBlock()
 assert wb.name == "weave" and wb.commits_per_item is True

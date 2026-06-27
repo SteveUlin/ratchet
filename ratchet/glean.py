@@ -44,6 +44,7 @@ from .completer import Completer  # the LLM seam (Completion + the default bindi
 PROMPT_VERSION = "glean/2"     # bump to re-extract over the same frozen chunks (idempotency key)
 MIN_QUOTE_BYTES = 12           # a shorter "quote" is ambiguous (matches anywhere) → low-value evidence
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
+OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
 
 # Markers are the FILTER classification (ADR-0005): each learning is scored 0-1 on several salience
 # axes (multi-label, not one bucket) so a downstream synthesis ("dream") layer can route and cluster.
@@ -366,22 +367,49 @@ class GleanBlock:
 # --- run: a thin compat shim over the block driver (keeps dream/review setup untouched) -----
 
 class _ShimReport:
-    """The shape the old `glean.run` returned, projected from a `block.Report` + the GleanBlock
-    instance's tallies. dream/review call `glean.run([cs], fake, model='fake')` purely to populate the
-    event store; they read `.events`/`.skipped`. The richer fields (`rejected`/`errored`/`cost_usd`/
-    `stopped_on_budget`) mirror the block so test_glean reads them off the same object the driver
-    populated (no parallel construction — the spec's anti-desync discipline)."""
+    """The shape the old `glean.run` returned — a thin WRAPPER, not a copy. It holds the uniform
+    `block.Report` the driver populated plus the GleanBlock instance, and exposes every field by reading
+    THROUGH them via @property (`@anti-desync`, the spec's #4): the uniform fields proxy the Report, the
+    genuinely-extra instance tallies (events/rejected) proxy the block. No field is copied at construction,
+    so there is no hand-maintained surface that can silently drift from what the driver wrote. dream/review
+    call `glean.run([cs], fake, model='fake')` purely to populate the event store; they read `.events`/`.skipped`."""
     def __init__(self, report: block.Report, blk: GleanBlock) -> None:
-        self.run_id = report.run_id
-        self.events = blk.events           # == report.outputs
-        self.skipped = report.skipped
-        self.rejected = blk.rejected
-        self.errored = report.errored
-        self.cost_usd = report.cost_usd
-        self.stopped_on_budget = report.stopped_on_budget
-        self.examined = report.examined
-        self.processed = report.processed
-        self.outputs = report.outputs
+        self._report = report
+        self._blk = blk
+
+    # the genuinely-extra instance tallies (the Report has no place for these) — read off the block
+    @property
+    def events(self) -> int:      # == self._report.outputs, but the block is the audit source of truth
+        return self._blk.events
+    @property
+    def rejected(self) -> int:
+        return self._blk.rejected
+
+    # the uniform fields — proxied straight off the wrapped Report (never copied → never stale)
+    @property
+    def run_id(self) -> str:
+        return self._report.run_id
+    @property
+    def skipped(self) -> int:
+        return self._report.skipped
+    @property
+    def errored(self) -> int:
+        return self._report.errored
+    @property
+    def cost_usd(self) -> float:
+        return self._report.cost_usd
+    @property
+    def stopped_on_budget(self) -> bool:
+        return self._report.stopped_on_budget
+    @property
+    def examined(self) -> int:
+        return self._report.examined
+    @property
+    def processed(self) -> int:
+        return self._report.processed
+    @property
+    def outputs(self) -> int:
+        return self._report.outputs
 
 
 def run(chunkset_hashes: list[str], complete: Completer, *, model: str = completer.DEFAULT_MODEL,
@@ -389,11 +417,11 @@ def run(chunkset_hashes: list[str], complete: Completer, *, model: str = complet
         progress=None) -> _ShimReport:
     """Compat shim: extract over the chunks of the given chunksets via the per-chunk `block.run`
     driver (ADR-0009). Builds a `GleanBlock` over an explicit chunkset list and returns a
-    `_ShimReport` projecting the uniform `block.Report` + the block's tallies — so existing callers
+    `_ShimReport` WRAPPING the uniform `block.Report` + the block's tallies — so existing callers
     (dream/review test setup, the old `glean.run([cs], fake, model=...)` shape) keep working with
     minimal change. Idempotency, per-chunk commit, error isolation, and the budget stop are the
     driver's (now at CHUNK granularity, not chunkset). `progress` defaults to None (silent) so a
-    setup helper doesn't spew per-chunk lines."""
+    setup helper doesn't spew per-chunk lines — the caller injects a Progress to see them."""
     blk = GleanBlock(complete, model=model, targets=list(chunkset_hashes))
     report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
     return _ShimReport(report, blk)
@@ -435,6 +463,7 @@ def main(argv=None) -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="list chunks that would be processed (skips done); no LLM calls")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
+    ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     args = ap.parse_args(argv)
 
     # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
@@ -454,7 +483,10 @@ def main(argv=None) -> None:
 
     complete = completer.make_cli_completer(args.model)
     blk = GleanBlock(complete, model=args.model, targets=targets)
-    progress = None if args.quiet else block._default_progress
+    # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
+    # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
+    progress = None if (args.quiet or args.dry_run) else block.Progress(
+        blk.name, cap=args.max_usd, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
     report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
                        progress=progress)
 

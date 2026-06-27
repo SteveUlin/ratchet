@@ -37,14 +37,32 @@ _orig_read = tap.read_origin
 
 
 class Probe:
-    """A progress sink that records one entry per item as it LANDS — exactly what the driver hands
-    the streaming printer — so a test can assert the run is watchable per item (not batched)."""
+    """A Progress-like progress sink — it satisfies the driver's Progress PROTOCOL (start/tick/stop),
+    so the driver drives it exactly as the real bar. Records one entry per item as it LANDS, so a test
+    can assert the run is watchable per item (not batched). It tracks its own running tallies (the new
+    decoupled tick takes only key+outcome, not the Report), so the tuple still carries live counters.
+    A skipped item lands no per-item line (a skip is a bare counter)."""
     def __init__(self):
         self.lines = []
+        self.examined = self.processed = self.skipped = self.errored = 0
 
-    def __call__(self, report, item, key, n_out, cost, *, dry_run=False, errored=False):
-        self.lines.append((key, n_out, cost, dry_run, errored, report.examined,
-                           report.processed, report.skipped, report.errored))
+    def start(self, *, total, todo, already):
+        pass
+
+    def tick(self, key, outcome, *, outputs=0, cost=0.0):
+        self.examined += 1
+        if outcome == "done":
+            self.processed += 1
+        elif outcome == "skipped":
+            self.skipped += 1
+            return                                    # a skip is a counter, not a landed per-item line
+        elif outcome == "errored":
+            self.errored += 1
+        self.lines.append((key, outputs, cost, outcome == "dry_run", outcome == "errored",
+                           self.examined, self.processed, self.skipped, self.errored))
+
+    def stop(self):
+        pass
 
 
 def run(*, progress=None, **kw):

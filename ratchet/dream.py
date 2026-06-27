@@ -64,7 +64,7 @@ import json
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import blobstore, block, completer, config
@@ -73,6 +73,7 @@ from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dre
 
 PROMPT_VERSION = "dream/1"               # bump to re-synthesize the same clusters with a sharper prompt
 DREAM_MODEL = "sonnet"                    # dream is rare → afford a sharper model than glean's haiku
+OUT_NOUN = "takeaways"                    # the per-cluster output noun the Progress bar/line shows
 SIM_THRESHOLD = 0.34                      # cosine to a cluster centroid to JOIN it; high → under-merge
 TITLE_MAX = 80
 WHY_MAX = 280
@@ -554,10 +555,10 @@ class DreamBlock:
 
     # -- finalize: coverage-conditioned supersession, then commit per cluster -----------------
 
-    def finalize(self, committed: list[block.Done], *, root: Path, run_id: str) -> None:
-        """The per-run commit — today's run() steps 2+3, lifted out of the loop (ADR-0009). The
-        `committed` list the driver hands us is unused: dream tracks its own `_pending` (it commits
-        nothing per item, so the driver's record is empty). Two steps:
+    def finalize(self, *, root: Path, run_id: str) -> None:
+        """The per-run commit — today's run() steps 2+3, lifted out of the loop (ADR-0009). The driver
+        hands `finalize` NO item list (#6): dream tracks its own `_pending` on the instance (it commits
+        nothing per item, so a driver-kept record would be empty anyway). Two steps:
 
           2. COVERAGE-CONDITIONED SUPERSESSION (the orphan fix, preserved EXACTLY): a prior current
              takeaway is eligible to fold out ONLY if ALL its events are re-covered by takeaways
@@ -595,29 +596,59 @@ class DreamBlock:
 
 # --- run: a thin compat shim over the block driver (keeps callers' RunReport reads untouched) -----
 
-@dataclass
 class RunReport:
-    """The shape the old `dream.run` returned, projected from a `block.Report` + the DreamBlock
-    instance's tallies. Callers (the CLI, test_dream/test_review setup) read `.takeaways`/`.n_clusters`/
-    `.skipped`/`.dropped`/`.errored`/`.cost_usd`/`.below_threshold`/`.stopped_on_budget`/`.min_events`.
-    Built from the SAME objects the driver populated (no parallel construction — the anti-desync
-    discipline): the uniform fields come from the block.Report, the rich ones off the instance."""
-    run_id: str
-    n_events: int = 0
-    n_clusters: int = 0
-    takeaways: list[dict] = field(default_factory=list)
-    skipped: int = 0           # clusters already synthesized for (prompt_version, model)
-    dropped: int = 0           # clusters the model judged noise (no takeaway, but marked done)
-    errored: int = 0           # clusters whose LLM call failed (isolated, retried next run)
-    cost_usd: float = 0.0
-    stopped_on_budget: bool = False
-    below_threshold: bool = False   # fewer than min_events to dream over → did nothing
-    min_events: int = 0
+    """The shape the old `dream.run` returned — a thin WRAPPER, not a copy (the spec's #4). It holds the
+    uniform `block.Report` the driver populated plus the DreamBlock instance, and exposes every field by
+    reading THROUGH them via @property: the uniform fields proxy the Report (run_id/skipped/errored/
+    cost_usd/stopped_on_budget), the genuinely-extra instance tallies proxy the block (n_events/
+    n_clusters/takeaways/dropped/below_threshold). Nothing is copied at construction, so the hand-
+    maintained desync surface (a field set here that the block later changed) is gone. `min_events` is
+    the run's own arg, carried so the CLI can print the threshold it gated on. Callers (the CLI,
+    test_dream/test_review setup) read `.takeaways`/`.n_clusters`/`.skipped`/`.dropped`/etc."""
+    def __init__(self, report: block.Report, blk: DreamBlock, *, min_events: int) -> None:
+        self._report = report
+        self._blk = blk
+        self.min_events = min_events
+
+    # the genuinely-extra instance tallies — read off the block (the Report stays stage-agnostic)
+    @property
+    def n_events(self) -> int:
+        return self._blk.n_events
+    @property
+    def n_clusters(self) -> int:
+        return self._blk.n_clusters
+    @property
+    def takeaways(self) -> list[dict]:
+        return self._blk.takeaways
+    @property
+    def dropped(self) -> int:
+        return self._blk.dropped
+    @property
+    def below_threshold(self) -> bool:
+        return self._blk.below_threshold
+
+    # the uniform fields — proxied straight off the wrapped Report (never copied → never stale)
+    @property
+    def run_id(self) -> str:
+        return self._report.run_id
+    @property
+    def skipped(self) -> int:
+        return self._report.skipped
+    @property
+    def errored(self) -> int:
+        return self._report.errored
+    @property
+    def cost_usd(self) -> float:
+        return self._report.cost_usd
+    @property
+    def stopped_on_budget(self) -> bool:
+        return self._report.stopped_on_budget
 
 
 def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM_THRESHOLD,
         min_confidence: float = 0.0, min_events: int = 0, max_usd: float | None = None,
-        limit: int | None = None, root: Path | None = None, progress=None) -> RunReport:
+        limit: int | None = None, progress: block.Progress | None = None,
+        root: Path | None = None) -> RunReport:
     """Synthesize takeaways over the whole event pile, idempotently (ADR-0006) — now a thin shim over
     the per-run-commit `DreamBlock` + `block.run` (ADR-0009). The observable contract is UNCHANGED:
     cluster globally (cheap, deterministic), one LLM call per not-yet-done cluster, coverage-conditioned
@@ -625,18 +656,13 @@ def run(complete: Completer, *, model: str = DREAM_MODEL, threshold: float = SIM
     marker last). The driver streams synthesis progress per cluster and isolates a failing call
     (counts `errored`, the cluster retries next run); the supersession + commit live in `finalize`.
 
-    Returns a `RunReport` built from the SAME `block.Report` + `DreamBlock` instance the driver
-    populated, so existing callers' field reads are untouched. `progress` defaults to None (silent) so
-    a setup helper doesn't spew per-cluster lines."""
+    Returns a `RunReport` WRAPPING the SAME `block.Report` + `DreamBlock` instance the driver populated,
+    so existing callers' field reads are untouched. `progress` defaults to None (silent) so a setup
+    helper doesn't spew per-cluster lines — the CLI injects a Progress to see them."""
     blk = DreamBlock(complete, model=model, threshold=threshold,
                      min_confidence=min_confidence, min_events=min_events)
     report = block.run(blk, max_usd=max_usd, limit=limit, root=root, progress=progress)
-    return RunReport(
-        run_id=report.run_id, n_events=blk.n_events, n_clusters=blk.n_clusters,
-        takeaways=blk.takeaways, skipped=report.skipped, dropped=blk.dropped,
-        errored=report.errored, cost_usd=report.cost_usd,
-        stopped_on_budget=report.stopped_on_budget, below_threshold=blk.below_threshold,
-        min_events=min_events)
+    return RunReport(report, blk, min_events=min_events)
 
 
 # --- CLI ------------------------------------------------------------------------------------------
@@ -657,6 +683,7 @@ def main(argv=None) -> None:
                     help="cluster only — print the groupings and a sample quote each; no LLM calls")
     ap.add_argument("--show", action="store_true", help="print each synthesized takeaway")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-cluster progress line")
+    ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     args = ap.parse_args(argv)
 
     if args.dry_run:                               # eyeball the deterministic grouping before spending
@@ -670,7 +697,11 @@ def main(argv=None) -> None:
         return
 
     complete = completer.make_cli_completer(args.model)
-    progress = None if args.quiet else block._default_progress
+    # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
+    # to watch (--quiet; --dry-run already returned above); else built from this stage's args + OUT_NOUN.
+    progress = None if args.quiet else block.Progress(
+        "dream", cap=args.max_usd, params={"prompt_version": PROMPT_VERSION, "model": args.model},
+        out_noun=OUT_NOUN, verbose=args.verbose)
     report = run(complete, model=args.model, threshold=args.threshold,
                  min_confidence=args.min_confidence, min_events=args.min_events,
                  max_usd=args.max_usd, limit=args.limit, progress=progress)

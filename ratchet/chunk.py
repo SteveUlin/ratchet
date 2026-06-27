@@ -23,6 +23,7 @@ from . import blobstore, block, config, weave
 
 CHUNKSET_FORMAT = "transcript.chunkset/1"  # source-kind . shape . PACKING version (bump if `_group` changes)
 DEFAULT_BUDGET = 12000   # chars per chunk (~3k tokens); a single larger turn stands alone
+OUT_NOUN = "chunksets"   # the per-item output noun the Progress bar/line shows
 
 
 @dataclass
@@ -224,10 +225,10 @@ def main(argv=None) -> None:
     ap.add_argument("--limit", type=int, help="cap items EXAMINED")
     ap.add_argument("--dry-run", action="store_true", help="list what would chunk; do nothing")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
+    ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — chunk never calls an LLM)")
     args = ap.parse_args(argv)
 
-    progress = None if args.quiet else block._default_progress
 
     # --show is the single-blob inspector path (like weave --render): materialize this ONE blob and
     # print its chunks. A bare hash here is a RAW hash (as today), so materialize takes it directly.
@@ -244,6 +245,13 @@ def main(argv=None) -> None:
     if not (args.all or args.source_id or args.hash):
         ap.error("give a blob hash, --source-id, or --all")
 
+    # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
+    # else built from this stage's args + OUT_NOUN. chunk has no LLM cost, so cap is omitted.
+    def make_progress(blk):
+        if args.quiet or args.dry_run:
+            return None
+        return block.Progress(blk.name, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
+
     # The batch/idempotent path: drive the block over cleaned blobs. A bare hash is a RAW hash today;
     # map it to its cleaned blob (materialize the raw first) so the single-item key is the cleaned
     # hash, matching the block's item identity — then run a one-item block over that cleaned hash.
@@ -252,11 +260,11 @@ def main(argv=None) -> None:
         if not blobstore.has(args.hash):
             ap.error(f"no such blob: {args.hash}")
         cleaned_hash, _, _ = weave.materialize(args.hash)   # raw → cleaned (idempotent)
-        block.run(_OneCleaned(cleaned_hash, budget=args.budget), dry_run=args.dry_run,
-                  progress=progress)
+        one = _OneCleaned(cleaned_hash, budget=args.budget)
+        block.run(one, dry_run=args.dry_run, progress=make_progress(one))
         return
     block.run(blk, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
-              dry_run=args.dry_run, progress=progress)
+              dry_run=args.dry_run, progress=make_progress(blk))
 
 
 class _OneCleaned(ChunkBlock):

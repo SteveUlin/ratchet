@@ -77,17 +77,25 @@ class FakeCompleter:
 
 
 class Probe:
-    """A streaming-progress sink: one record per item AS IT LANDS, so a test reads the live per-chunk
-    feed (the ADR-0009 fix for 'no visible progress'). A SKIPPED item lands no line (a skip is not a
-    landed item) — so `len(probe.lines)` counts only processed/errored/dry-run items."""
+    """A Progress-like streaming sink — it satisfies the driver's Progress PROTOCOL (start/tick/stop),
+    so the driver drives it exactly as the real bar. One record per item AS IT LANDS, so a test reads
+    the live per-chunk feed (the ADR-0009 fix for 'no visible progress'). A SKIPPED item lands no line
+    (a skip is a bare counter, not a landed item) — so `len(probe.lines)` counts only the
+    processed/errored/dry-run items, matching how piped Progress emits one line per such item."""
     def __init__(self):
         self.lines = []
 
-    def __call__(self, report, item, key, n_out, cost, *, dry_run=False, errored=False):
-        self.lines.append({"key": key, "n_out": n_out, "cost": cost,
-                           "dry_run": dry_run, "errored": errored,
-                           "processed": report.processed, "skipped": report.skipped,
-                           "errored_n": report.errored})
+    def start(self, *, total, todo, already):
+        pass
+
+    def tick(self, key, outcome, *, outputs=0, cost=0.0):
+        if outcome == "skipped":
+            return                                    # a skip is a counter, not a landed per-item line
+        self.lines.append({"key": key, "n_out": outputs, "cost": cost,
+                           "dry_run": outcome == "dry_run", "errored": outcome == "errored"})
+
+    def stop(self):
+        pass
 
 
 def glean_markers(target=None):

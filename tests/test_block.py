@@ -7,15 +7,16 @@ substrate's cross-cutting guarantees are pinned independent of any stage. The lo
     the marker is a real `processed` decision blob (0007), folded back by done_index.
   BUDGET/LIMIT — --max-usd stops cleanly (committed-so-far persists); --limit caps items EXAMINED
     before the done-skip; --dry-run lists without processing.
-  PROGRESS — the callback fires once per item as it LANDS, with live Report counters.
-  DREAM'S finalize EXCEPTION — commits_per_item=False writes NO per-item marker; finalize sees every
-    committed item and does the commit itself.
+  PROGRESS DECOUPLING — the driver speaks only the Progress PROTOCOL (start(total,todo,already) /
+    tick(key, outcome, …) / stop), never constructs one, never reads stage knobs off the block. A
+    probe satisfying that protocol records the stream; the driver computes total/todo/already itself.
+  DREAM'S finalize EXCEPTION — commits_per_item=False writes NO per-item marker; finalize sees the
+    block's own pending state (no driver-passed list) and does the commit itself.
 
 Run: `python tests/test_block.py`."""
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,14 +28,35 @@ config.ensure_layout()
 ROOT = config.data_root()
 
 
+# --- a Progress-like probe: the driver speaks the PROTOCOL (start/tick/stop), so a plain object that ---
+# implements it captures the exact stream the driver emits. tick's SINGLE `outcome` (one of
+# done/skipped/errored/dry_run) is recorded verbatim — proving the driver passes the one discriminator
+# per call site, not a soup of bool flags. start() records the driver-computed (total, todo, already).
+
+class ProbeProgress:
+    def __init__(self):
+        self.started = None                         # (total, todo, already)
+        self.ticks: list[dict] = []                 # one per landed/skipped/dry/errored item, in order
+        self.stopped = False
+
+    def start(self, *, total, todo, already):
+        self.started = (total, todo, already)
+
+    def tick(self, key, outcome, *, outputs=0, cost=0.0):
+        self.ticks.append({"key": key, "outcome": outcome, "outputs": outputs, "cost": cost})
+
+    def stop(self):
+        self.stopped = True
+
+
 # --- a minimal fake block: items are plain strings, "process" ingests one raw blob per item ----------
 # Each item commits a real blob (so we can assert it persists across a crash) and returns (1, cost).
 # `key(item) == item` makes the done-set trivially inspectable; `params` lets us flip the done-key.
 
 class FakeBlock:
     """A driver harness. `boom_on` names items whose process() RAISES (uncaught-seam isolation);
-    `cost` is charged per processed item (drives the budget gate). Records every key it processed and
-    every progress call, so the test reads the driver's behavior, not a stage's."""
+    `cost` is charged per processed item (drives the budget gate). Records every key it processed,
+    so the test reads the driver's behavior, not a stage's."""
     name = "fake"
     commits_per_item = True
 
@@ -44,7 +66,6 @@ class FakeBlock:
         self.boom_on = set(boom_on)
         self.cost = cost
         self.processed_keys: list[str] = []
-        self.finalized: list[block.Done] | None = None
 
     def items(self, root, *, source_id=None):
         # source_id filters the enumeration (the --source-id contract); None → all.
@@ -81,12 +102,9 @@ def fresh_root(prefix):
 # counted errored), and STILL processes c. Re-running re-does ONLY BOOM (now made to succeed).
 
 r1 = fresh_root("crash")
-calls: list[tuple] = []
-def rec_progress(report, item, key, n_out, cost, *, dry_run=False, errored=False):
-    calls.append((key, n_out, errored, report.processed, report.errored))
-
 blk = FakeBlock(["a", "BOOM", "c"], boom_on=["BOOM"], cost=0.0)
-rep = block.run(blk, root=r1, progress=rec_progress)
+probe = ProbeProgress()
+rep = block.run(blk, root=r1, progress=probe)
 
 assert rep.stage == "fake"
 assert rep.examined == 3, f"all three examined: {rep}"
@@ -104,10 +122,13 @@ assert ("BOOM", "v1") not in done, "the failing item got NO marker (so it retrie
 markers = list(blobstore.decisions_for("a", r1, verb="processed", stage="fake"))
 assert len(markers) == 1 and markers[0]["n_outputs"] == 1, f"a's marker is a decision blob: {markers}"
 
-# progress fired per item as it landed: a (ok), BOOM (errored), c (ok) — and saw LIVE counters.
-assert [(k, err) for k, _, err, _, _ in calls] == [("a", False), ("BOOM", True), ("c", False)]
-assert calls[0][3] == 1 and calls[2][3] == 2, "report.processed ticked up across the run (live)"
-assert calls[1][4] == 1, "report.errored was already 1 when BOOM's progress fired"
+# the driver drove the Progress PROTOCOL: start() got the driver-computed counts, tick() fired once per
+# item with the SINGLE outcome (a→done, BOOM→errored, c→done), stop() ran. The driver constructed nothing.
+assert probe.started == (3, 3, 0), f"driver computed total/todo/already and passed them to start: {probe.started}"
+assert [(t["key"], t["outcome"]) for t in probe.ticks] == [("a", "done"), ("BOOM", "errored"), ("c", "done")]
+assert probe.ticks[0]["outputs"] == 1, "a done tick carries its outputs"
+assert probe.ticks[1]["outputs"] == 0, "an errored tick carries no outputs"
+assert probe.stopped, "the driver stopped the progress after the loop"
 
 # RECOVERY: re-run with BOOM no longer booming — only BOOM re-does (a,c skip via their markers).
 blk2 = FakeBlock(["a", "BOOM", "c"], boom_on=[], cost=0.0)
@@ -125,9 +146,13 @@ rep_a = block.run(b_v1, root=r2, progress=None)
 assert rep_a.processed == 3 and rep_a.skipped == 0, f"first run does all: {rep_a}"
 
 b_v1_again = FakeBlock(["x", "y", "z"], version="v1")
-rep_b = block.run(b_v1_again, root=r2, progress=None)
+probe_idem = ProbeProgress()
+rep_b = block.run(b_v1_again, root=r2, progress=probe_idem)
 assert rep_b.processed == 0 and rep_b.skipped == 3, f"re-run skips all (same param): {rep_b}"
 assert b_v1_again.processed_keys == [], "no item re-processed on an unchanged re-run"
+# a fully-done re-run: start sees 0 todo, every tick is the single "skipped" outcome.
+assert probe_idem.started == (3, 0, 3), f"all already-done: 0 todo, 3 already: {probe_idem.started}"
+assert [t["outcome"] for t in probe_idem.ticks] == ["skipped", "skipped", "skipped"], "every item ticked skipped"
 
 # bump the idempotency param → a new done-key → every item re-processes (the "re-do on logic change").
 b_v2 = FakeBlock(["x", "y", "z"], version="v2")
@@ -162,9 +187,12 @@ print("OK §3 — --max-usd: clean stop, committed-so-far persists, resumable")
 # === 4. --limit caps items EXAMINED (before the done-skip), --dry-run lists without processing ========
 r4 = fresh_root("limit")
 b_lim = FakeBlock(["p", "q", "r", "s", "t"], cost=0.0)
-rep_lim = block.run(b_lim, root=r4, limit=2, progress=None)
+probe_lim = ProbeProgress()
+rep_lim = block.run(b_lim, root=r4, limit=2, progress=probe_lim)
 assert rep_lim.examined == 2 and rep_lim.processed == 2, f"--limit caps examination: {rep_lim}"
 assert b_lim.processed_keys == ["p", "q"], "exactly the first two were processed"
+# --limit feeds the bar's TOTAL: the driver enumerated, capped to 2, and that 2 is what start sees.
+assert probe_lim.started == (2, 2, 0), f"--limit caps the progress total too: {probe_lim.started}"
 
 # --limit caps EXAMINED, not processed: re-running a done corpus with --limit still examines `limit`
 # items and stops (it does not scan past them hunting for undone work). p,q are done → both skip.
@@ -175,17 +203,17 @@ assert rep_lim2.examined == 2 and rep_lim2.skipped == 2 and rep_lim2.processed =
 
 # --dry-run: list-only, no process, no marker, no blob.
 r4b = fresh_root("dryrun")
-dry_calls: list[str] = []
-def dry_progress(report, item, key, n_out, cost, *, dry_run=False, errored=False):
-    dry_calls.append(("dry" if dry_run else "real", key))
 b_dry = FakeBlock(["m", "n"], cost=0.5)
-rep_dry = block.run(b_dry, root=r4b, dry_run=True, progress=dry_progress)
+probe_dry = ProbeProgress()
+rep_dry = block.run(b_dry, root=r4b, dry_run=True, progress=probe_dry)
 assert rep_dry.would_process == 2 and rep_dry.processed == 0, f"dry-run lists only: {rep_dry}"
 assert rep_dry.cost_usd == 0.0, "dry-run spends nothing"
 assert b_dry.processed_keys == [], "dry-run never called process"
 assert not blobstore.has(blobstore.blob_hash("payload::m"), r4b), "dry-run ingested no blob"
 assert block.done_index("fake", r4b) == set(), "dry-run wrote no marker"
-assert dry_calls == [("dry", "m"), ("dry", "n")], "progress flagged each as dry"
+# each item ticked with the single "dry_run" outcome (not a done/skip).
+assert [(t["key"], t["outcome"]) for t in probe_dry.ticks] == [("m", "dry_run"), ("n", "dry_run")], \
+    "progress ticked each as the dry_run outcome"
 print("OK §4 — --limit caps examination; --dry-run lists without processing/committing")
 
 
@@ -196,17 +224,23 @@ rep_one = block.run(b_one, root=r5, source_id="beta", progress=None)
 assert rep_one.examined == 1 and rep_one.processed == 1, f"--source-id processes just that one: {rep_one}"
 assert b_one.processed_keys == ["beta"], "only the named source was enumerated"
 assert block.done_index("fake", r5) == {("beta", "v1")}, "only beta marked"
-print("OK §5 — --source-id scopes items(); --quiet passes progress=None (no output)")
+# progress=None is the --quiet path: the driver runs the whole loop without ever touching a Progress.
+b_quiet = FakeBlock(["solo"], cost=0.0)
+rep_quiet = block.run(b_quiet, root=fresh_root("quiet"), progress=None)
+assert rep_quiet.processed == 1, "the run completes with no Progress injected (quiet path)"
+print("OK §5 — --source-id scopes items(); --quiet passes progress=None (the driver never builds Progress)")
 
 
 # === 6. dream's finalize exception: commits_per_item=False → NO per-item marker; finalize commits ======
-# Mirrors dream: process() records (no durable write, returns (0, cost)); the driver writes no marker
-# and skips none of the budget accounting; finalize sees EVERY committed item and does the real work.
+# Mirrors dream: process() records on the INSTANCE (no durable write, returns (0, cost)); the driver
+# writes no marker and skips none of the budget accounting; finalize reads the block's OWN recorded
+# state (the driver passes finalize NO list now, #6) and does the real work.
 
 class FinalizeBlock:
-    """A commits_per_item=False harness (dream's shape). process records the item + cost (no blob, no
-    marker — returns 0 outputs); finalize gets the whole committed list and is where commits would
-    happen. Proves the driver skips the per-item marker yet still gates budget on process()'s cost."""
+    """A commits_per_item=False harness (dream's shape). process records the item + cost on the instance
+    (no blob, no marker — returns 0 outputs); finalize reads that instance state (NOT a driver-passed
+    list) and is where commits happen. Proves the driver skips the per-item marker yet still gates budget
+    on process()'s cost, and that finalize takes only (root, run_id)."""
     name = "dreamlike"
     commits_per_item = False
 
@@ -214,7 +248,7 @@ class FinalizeBlock:
         self._items = list(items)
         self.params = (("prompt_version", "d1"), ("model", "fake"))
         self.cost = cost
-        self.recorded: list[str] = []
+        self.recorded: list[tuple[str, float]] = []   # the block's OWN per-item state (dream's _pending)
         self.finalized_keys: list[str] | None = None
 
     def items(self, root, *, source_id=None):
@@ -224,35 +258,37 @@ class FinalizeBlock:
         return item
 
     def process(self, item, *, root, run_id):
-        self.recorded.append(item)
-        return 0, self.cost                      # nothing durable yet; cost feeds the budget gate
+        self.recorded.append((item, self.cost))      # nothing durable yet; cost feeds the budget gate
+        return 0, self.cost
 
-    def finalize(self, processed, *, root, run_id):
-        # the driver handed us every committed Done; THIS is where dream ingests + writes markers.
-        self.finalized_keys = [d.key for d in processed]
-        for d in processed:
-            block.write_processed(self.name, d.key, self.params, n_outputs=1, cost_usd=d.cost_usd,
-                                  run_id=run_id, extra={"event_ids": [d.key]}, root=root)
+    def finalize(self, *, root, run_id):
+        # the driver hands finalize NO item list — the block reads its OWN recorded state. THIS is where
+        # dream ingests + writes markers.
+        self.finalized_keys = [k for k, _ in self.recorded]
+        for k, cost in self.recorded:
+            block.write_processed(self.name, k, self.params, n_outputs=1, cost_usd=cost,
+                                  run_id=run_id, extra={"event_ids": [k]}, root=root)
 
     marker_extra = block.no_marker_extra
 
 r6 = fresh_root("finalize")
 fb = FinalizeBlock(["c1", "c2", "c3"], cost=0.0)
-fin_calls: list[str] = []
-def fin_progress(report, item, key, n_out, cost, *, dry_run=False, errored=False):
-    fin_calls.append(key)
-rep_fin = block.run(fb, root=r6, progress=fin_progress)
+probe_fin = ProbeProgress()
+rep_fin = block.run(fb, root=r6, progress=probe_fin)
 
-assert fb.recorded == ["c1", "c2", "c3"], "process ran per item (synthesis happened)"
+assert [k for k, _ in fb.recorded] == ["c1", "c2", "c3"], "process ran per item (synthesis happened)"
 assert rep_fin.processed == 3 and rep_fin.outputs == 0, \
     f"process committed nothing durable per item (0 outputs): {rep_fin}"
 # CRUCIAL: the driver wrote NO per-item marker mid-loop (commits_per_item=False) ...
-# ... yet finalize, running after the loop, sees every committed item and writes the markers itself.
-assert fb.finalized_keys == ["c1", "c2", "c3"], "finalize received the full committed list"
+# ... yet finalize, running after the loop, reads the block's recorded items and writes the markers itself.
+assert fb.finalized_keys == ["c1", "c2", "c3"], "finalize acted on the block's own recorded state"
 done6 = block.done_index("dreamlike", r6)
 assert done6 == {("c1", "d1", "fake"), ("c2", "d1", "fake"), ("c3", "d1", "fake")}, \
     f"finalize wrote the markers (with the ordered two-param key): {done6}"
-assert fin_calls == ["c1", "c2", "c3"], "progress still streamed per item even though commit is deferred"
+# progress still streamed per item even though commit is deferred (each a "done" outcome, 0 outputs).
+assert [(t["key"], t["outcome"], t["outputs"]) for t in probe_fin.ticks] == \
+    [("c1", "done", 0), ("c2", "done", 0), ("c3", "done", 0)], \
+    "progress streamed per item even though commit is deferred to finalize"
 
 # a finalize block also honors --dry-run: process AND finalize are both skipped (no commit at all).
 r6b = fresh_root("finalize-dry")
@@ -261,7 +297,7 @@ rep_fin_dry = block.run(fb_dry, root=r6b, dry_run=True, progress=None)
 assert rep_fin_dry.would_process == 2 and fb_dry.recorded == [], "dry-run skips process()"
 assert fb_dry.finalized_keys is None, "dry-run skips finalize too (no commit on a dry run)"
 assert block.done_index("dreamlike", r6b) == set(), "dry-run on a finalize block wrote nothing"
-print("OK §6 — commits_per_item=False: driver writes no per-item marker; finalize commits the run")
+print("OK §6 — commits_per_item=False: driver writes no per-item marker; finalize commits off the block's own state")
 
 
 # === 7. error isolation when EVERY item booms: run completes, nothing marked, all retryable ===========
@@ -279,22 +315,35 @@ assert isinstance(FinalizeBlock(["a"]), block.Block), "the finalize variant sati
 print("OK §8 — Block is a structural Protocol (stages are plain objects, no inheritance)")
 
 
-# === 9. the default progress printer is stage-agnostic: it reads only Report + the per-item tuple =====
-# (smoke: it must not raise on any of the three line shapes — normal, dry, errored.)
+# === 9. Progress is a self-contained subsystem: it renders from start/tick/stop ALONE (smoke) =========
+# The decoupling means Progress carries NO knowledge of the driver or any stage — a test drives it
+# directly through its own protocol with a piped (non-TTY) stream and reads the idempotent per-item log
+# + the startup line. It must render all three line shapes (done, errored) without raising. The bar
+# itself is TTY-only; piped, each landed item is one self-contained line (its own key·outputs·cost).
 import io
-import contextlib
-buf = io.StringIO()
-demo = block.Report(stage="glean", run_id="r", examined=812, processed=47, skipped=0, outputs=3, cost_usd=0.21)
-with contextlib.redirect_stdout(buf):
-    block._default_progress(demo, "item", "a1b2c3d4e5f6", 3, 0.21)
-    block._default_progress(demo, "item", "deadbeefcafe", 0, 0.0, dry_run=True)
-    block._default_progress(demo, "item", "0badf00d1234", 0, 0.0, errored=True)
-lines = buf.getvalue().splitlines()
-assert lines[0].startswith("glean  812 examined · 47 done · 0 skip · 3 out · $0.21"), lines[0]
-assert lines[1] == "would glean deadbeefcafe", lines[1]
-assert lines[2] == "  ! glean 0badf00d1234 errored", lines[2]
-print("OK §9 — default progress printer renders all three line shapes from Report alone")
+buf = io.StringIO()                                 # not a TTY → the piped, idempotent-line path
+prog = block.Progress("glean", cap=0.50, params={"prompt_version": "glean/2", "model": "haiku"},
+                      out_noun="events", stream=buf)
+prog.start(total=812, todo=47, already=765)         # the driver-computed counts arrive in start(), not __init__
+prog.tick("a1b2c3d4e5f6", "done", outputs=3, cost=0.21)
+prog.tick("skipthis0000", "skipped")                # a skip is a bare counter — NO per-item line
+prog.tick("would00dry00", "dry_run")                # a dry-run is a bare counter — NO per-item line
+prog.tick("0badf00d1234", "errored")
+prog.stop()
+lines = [ln for ln in buf.getvalue().splitlines() if ln]
+# the startup line carries the stage, total, the todo/already split, the cap, and the params
+assert lines[0].startswith("glean: 812 items · 47 to do · 765 done"), lines[0]
+assert "cap" in lines[0] and "$0.50" in lines[0] and "prompt_version=glean/2" in lines[0], lines[0]
+# the done item logged its own self-contained line with the out_noun and its OWN outputs+cost
+assert lines[1] == "  glean a1b2c3d4e5f6 · 3 events · $0.2100", lines[1]
+# the errored item logged an errored line; the skipped/dry-run items logged NOTHING (they are counters)
+assert lines[2] == "  glean 0badf00d1234 · errored", lines[2]
+assert len(lines) == 3, f"skip + dry_run logged no per-item line (counters only): {lines}"
+# the aggregate counters tracked the outcomes (the bar would read these on a TTY)
+assert prog.done == 1 and prog.skipped == 1 and prog.errored == 1 and prog.outputs == 3
+assert abs(prog.cost - 0.21) < 1e-9, prog.cost
+print("OK §9 — Progress renders from its own start/tick/stop protocol alone (decoupled from the driver)")
 
 
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, "
-      "progress streaming, dream's finalize exception, protocol structure")
+      "DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol structure")

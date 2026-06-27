@@ -28,6 +28,7 @@ from typing import Iterator
 from . import blobstore, block, config
 
 DEFAULT_DATASTORE = Path.home() / ".claude" / "projects"
+OUT_NOUN = "raw"   # the per-item output noun the Progress bar/line shows (tap copies raw transcript blobs)
 
 
 def discover(datastore: Path, project: str | None = None) -> Iterator[Path]:
@@ -220,10 +221,11 @@ class TapBlock:
         self._latest[sid] = (fetched_at, h)
         return (1, 0.0)
 
-    def finalize(self, processed: list, *, root: Path, run_id: str) -> None:
+    def finalize(self, *, root: Path, run_id: str) -> None:
         """Flush the fingerprint cursor ONCE after the loop — its single end-of-run save (the cursor
-        is a per-run rebuildable optimization, no fsync). tap uses finalize purely for the cursor
-        flush; blob commits stay per-item (the blobstore's content-then-meta)."""
+        is a per-run rebuildable optimization, no fsync). The driver hands `finalize` NO item list (#6);
+        tap tracks its own dirty cursor state on the instance (`self._dirty`/`self._state`). tap uses
+        finalize purely for the cursor flush; blob commits stay per-item (the blobstore's content-then-meta)."""
         if self._dirty:
             save_fetch_state(root, self._state)
 
@@ -242,12 +244,16 @@ def main(argv=None) -> None:
     ap.add_argument("--limit", type=int, help="cap items EXAMINED this run")
     ap.add_argument("--dry-run", action="store_true", help="list what would be copied; no writes")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming progress line")
+    ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--max-usd", type=float, help="(no cost; inert — tap never calls an LLM)")
     args = ap.parse_args(argv)
 
-    progress = None if args.quiet else block._default_progress
-    block.run(TapBlock(datastore=args.datastore, project=args.project),
-              source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
+    blk = TapBlock(datastore=args.datastore, project=args.project)
+    # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
+    # else built from this stage's args + OUT_NOUN. tap has params=() and no LLM cost (cap omitted).
+    progress = None if (args.quiet or args.dry_run) else block.Progress(
+        blk.name, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
+    block.run(blk, source_id=args.source_id, max_usd=args.max_usd, limit=args.limit,
               dry_run=args.dry_run, progress=progress)
 
 
