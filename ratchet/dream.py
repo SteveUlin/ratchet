@@ -23,8 +23,9 @@ The model (ADR-0010):
   the route prompt — NO retrieval, NO top-K, NO embeddings; the router reads it all.
 
   ROUTE — one cheap Haiku call per event: given the event's VERIFIED verbatim quote + summary and the
-  catalog as a numbered list, return {decision: new|strengthen|noop, takeaway_id}. A strengthen naming
-  an id not in the catalog is coerced to `new` (defensive, like `_clean_relation`).
+  catalog as a numbered list, return {decision: new|strengthen|weaken|noop, takeaway_id}. A strengthen
+  naming an id not in the catalog is coerced to `new`; a weaken naming an unknown id is coerced to `noop`
+  (never mint a 'negative' takeaway — defensive, like `_clean_relation`).
 
   APPLY —
     new        → SYNTHESIZE (one Sonnet call): mint a STABLE takeaway id (`t-`+sha256(seed_event)[:12]),
@@ -35,6 +36,12 @@ The model (ADR-0010):
                  event_id), union distinct sessions, recompute support (the BIRCH sufficient-statistic),
                  max-merge markers, bump last_seen. RE-SYNTHESIZE the `why` only when lexical drift
                  crosses a threshold; else just bump. Then a `consolidated` decision.
+    weaken     → BUMP CONTRADICTIONS (ALWAYS NO LLM — ADR-0012): the SYMMETRIC half — append the
+                 contradicting event to contradicted_by/contradiction_evidence (dedup by event_id),
+                 recompute the contradictions stat; support/why/title ride untouched. A takeaway demotes
+                 by NET entrenchment (support.sessions − contradictions.sessions < the maturity bar), never
+                 by deletion — contested, quarantined, retained, re-graduatable. Then a `consolidated`
+                 decision (the event is incorporated AS a contradiction).
     noop       → nothing durable; the event stays un-consolidated (later forgotten).
 
   TAKEAWAY IDENTITY — the key change from v1: `source_id` is a STABLE MINTED id, so an UPDATE is a new
@@ -64,7 +71,8 @@ from . import blobstore, block, completer, config
 from .completer import Completer
 from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dream carries it upward
 
-PROMPT_VERSION = "dream/2"               # bump to re-route NOT-yet-consolidated events with a sharper prompt
+PROMPT_VERSION = "dream/3"               # bump to re-route NOT-yet-consolidated events with a sharper prompt
+                                         # (dream/3 adds the WEAKEN verdict — ADR-0012)
 ROUTE_MODEL = "haiku"                    # the router is cheap + per-event → the small model
 SYNTH_MODEL = "sonnet"                   # synthesis is rare (new + drift) → afford a sharper model
 OUT_NOUN = "takeaways"                   # the per-event output noun the Progress bar/line shows
@@ -89,14 +97,18 @@ ROUTE_SYSTEM = (
     "Code session; you are shown the CURRENT CATALOG of takeaways the memory already holds. Decide "
     "where the observation belongs:\n"
     "  - strengthen: the catalog ALREADY has a takeaway capturing this same underlying lesson — name "
-    "its id (the observation is more evidence for it).\n"
+    "its id (the observation is more evidence FOR it).\n"
+    "  - weaken: the observation is evidence that a catalog takeaway is WRONG or NO LONGER HOLDS (a "
+    "contradiction or correction) — name its id (the observation is evidence AGAINST it). This is "
+    "DISTINCT from new: weaken contests an EXISTING lesson; new is a genuinely DIFFERENT one.\n"
     "  - new: nothing in the catalog covers it — it should seed a new takeaway.\n"
     "  - noop: it is noise, not a durable reusable lesson — drop it.\n"
     "The observation's verbatim QUOTE is ground truth; its one-line summary is only a hint. Prefer "
-    "strengthen when a catalog entry plausibly covers the SAME lesson; prefer new for a genuinely "
-    "distinct lesson; reserve noop for noise.\n"
+    "strengthen when a catalog entry plausibly covers the SAME lesson; prefer weaken when it plausibly "
+    "CONTRADICTS one; prefer new for a genuinely distinct lesson; reserve noop for noise.\n"
     "Return ONLY a JSON object, no prose, no code fences:\n"
-    '{"decision": "new"|"strengthen"|"noop", "takeaway_id": the catalog id to strengthen or null}'
+    '{"decision": "new"|"strengthen"|"weaken"|"noop", "takeaway_id": the catalog id to strengthen or '
+    'weaken, or null}'
 )
 
 SYNTH_SYSTEM = (
@@ -261,14 +273,38 @@ def catalog(root: Path | None = None) -> list[dict]:
     return out
 
 
+def net_sessions(tk: dict) -> int:
+    """NET distinct-session entrenchment (ADR-0012): supporting distinct sessions MINUS contradicting
+    distinct sessions. The SINGLE SOURCE of the demotion rule — `current_takeaways` (and so review's
+    `pending`/`incubating`, which ride it) gate on this, never on a duplicated formula. Read defensively:
+    a dream/2 blob with no `contradictions` field reads as 0, so net == support and behaviour is
+    identical to before any contradiction arrives. NO clamp: net may go NEGATIVE (a strongly-contested
+    takeaway) — it only ever feeds a `>=` gate, so negative is just deep quarantine (and `incubating`'s
+    `needs` shortfall may then be large — intended)."""
+    sup = (tk.get("support") or {}).get("sessions", 0)
+    con = (tk.get("contradictions") or {}).get("sessions", 0)
+    return sup - con
+
+
 def current_takeaways(root: Path | None = None, *, min_sessions: int = MATURITY_SESSIONS) -> list[dict]:
-    """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways
-    (support.sessions >= min_sessions). `review.pending()` calls this with the default bar, so only
-    takeaways corroborated across that many DISTINCT sessions reach the human gate; incubating ones stay
-    live (routable via `catalog()`) but invisible to review. This REPLACES v1's supersede-conditioned
-    current_takeaways — same name/return type, so review.py is untouched."""
+    """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways by
+    NET distinct-session entrenchment (`net_sessions >= min_sessions` — support sessions minus contradicting
+    sessions, ADR-0012). `review.pending()` calls this with the default bar, so only takeaways corroborated
+    across that many DISTINCT sessions NET of contradictions reach the human gate; incubating (and CONTESTED)
+    ones stay live (routable via `catalog()`) but invisible to review. A strongly-corroborated takeaway
+    survives a lone contradiction; a contested one un-graduates yet is never retired — it re-graduates if
+    corroboration returns. This REPLACES v1's supersede-conditioned current_takeaways — same name/return
+    type, so review.py is untouched."""
+    return [t for t in catalog(root) if net_sessions(t) >= min_sessions]
+
+
+def contradicted_takeaways(root: Path | None = None) -> list[dict]:
+    """The live takeaways carrying a recorded contradiction: `catalog()` filtered to
+    `contradictions.events > 0` (ADR-0012). A contested/demoted takeaway is NEVER silently lost — it stays
+    in `catalog()` (routable, re-graduatable) but is surfaced here for spot-checking and a future review
+    surface (quarantine, not delete). Read defensively: a dream/2 blob with no field reads as zero."""
     return [t for t in catalog(root)
-            if (t.get("support") or {}).get("sessions", 0) >= min_sessions]
+            if ((t.get("contradictions") or {}).get("events", 0)) > 0]
 
 
 def render_catalog(cat: list[dict]) -> str:
@@ -406,11 +442,29 @@ def _clean_relation(v, known_ids: set[str]) -> dict:
 def takeaway_content(tk: dict) -> dict:
     """The run-invariant STORED projection of a takeaway version — drops the in-memory `producer`/cost,
     keeps id, title, why, relation, cites, evidence, support, sessions_seen, markers, confidence,
-    last_seen. This is what makes a no-op re-version re-hash IDENTICALLY: a strengthen that incorporates
-    no new event re-serializes to the same bytes, so the blobstore no-ops it (no churn)."""
-    return {k: tk[k] for k in (
+    last_seen, and the SYMMETRIC contradiction side (contradictions, contradicted_by, contradiction_evidence
+    — ADR-0012). This is what makes a no-op re-version re-hash IDENTICALLY: a strengthen/weaken that
+    incorporates no new event re-serializes to the same bytes, so the blobstore no-ops it (no churn). The
+    contradiction fields read DEFENSIVELY (dream/2 blobs lack them → they project as the empty stat). A
+    dream/2 blob's FIRST strengthen/weaken gains the three empty fields — a one-time migration re-version,
+    not a no-op; byte-identical on every touch after."""
+    base = {k: tk[k] for k in (
         "id", "title", "why", "relation", "cites", "evidence",
         "support", "sessions_seen", "markers", "confidence", "last_seen")}
+    base["contradictions"] = tk.get("contradictions") or {"events": 0, "sessions": 0}
+    base["contradicted_by"] = list(tk.get("contradicted_by") or [])
+    base["contradiction_evidence"] = [dict(e) for e in (tk.get("contradiction_evidence") or [])]
+    return base
+
+
+def _contradiction_stats(tk: dict) -> dict:
+    """The BIRCH sufficient-statistic for the CONTRADICTION side, mirroring `support`: distinct
+    contradicting events (by event_id) and distinct contradicting sessions (each contradiction_evidence
+    entry carries the `session_id` it came from — so the count needs no parallel session list). Closed
+    over the summary, correct without the raw events."""
+    by = tk.get("contradicted_by") or []
+    sess = {e.get("session_id") for e in (tk.get("contradiction_evidence") or []) if e.get("session_id")}
+    return {"events": len(set(by)), "sessions": len(sess)}
 
 
 def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) -> None:
@@ -436,20 +490,22 @@ def _route_user(rv: ResolvedEvent, cat: list[dict]) -> str:
 
 def _clean_route(parsed: dict, catalog_ids: set[str]) -> dict:
     """Defensive coercion of the untrusted router JSON, mirroring `_clean_relation`. Rules: a decision
-    not in {new, strengthen, noop} → `noop` (safest: no write, the event stays routable on a prompt
-    bump); a `strengthen` whose takeaway_id is not a real catalog id (incl. null) → coerced to `new`
-    (the spec's explicit rule — you cannot strengthen an id the model was not shown); `new` forces
-    takeaway_id None (a new mints fresh)."""
+    not in {new, strengthen, weaken, noop} → `noop` (safest: no write, the event stays routable on a
+    prompt bump); a `strengthen`/`weaken` needs a REAL catalog id, and an unknown/null id resolves
+    ASYMMETRICALLY: a `strengthen` of an unknown id → `new` (it is still a lesson, re-routed as a fresh
+    one), but a `weaken` of an unknown id → `noop` — NEVER mint a 'negative' takeaway out of a
+    contradiction whose target the model was not shown; the event stays routable on a prompt bump. `new`
+    forces takeaway_id None (a new mints fresh)."""
     parsed = parsed if isinstance(parsed, dict) else {}
     decision = parsed.get("decision")
-    if decision not in ("new", "strengthen", "noop"):
+    if decision not in ("new", "strengthen", "weaken", "noop"):
         return {"decision": "noop", "takeaway_id": None}
     if decision in ("new", "noop"):
         return {"decision": decision, "takeaway_id": None}
     tid = parsed.get("takeaway_id")
     if isinstance(tid, str) and tid in catalog_ids:
-        return {"decision": "strengthen", "takeaway_id": tid}
-    return {"decision": "new", "takeaway_id": None}      # strengthen of an unknown id → new
+        return {"decision": decision, "takeaway_id": tid}      # strengthen | weaken of a KNOWN id
+    return {"decision": "new" if decision == "strengthen" else "noop", "takeaway_id": None}
 
 
 def route(rv: ResolvedEvent, cat: list[dict], complete_route: Completer) -> tuple[dict, float]:
@@ -504,6 +560,9 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concepts: list[
         "evidence": [evidence_entry(rv)],
         "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
         "sessions_seen": [rv.session_id] if rv.session_id else [],
+        "contradictions": {"events": 0, "sessions": 0},    # the symmetric side, born empty (ADR-0012)
+        "contradicted_by": [],
+        "contradiction_evidence": [],
         "markers": _event_markers(rv.event),
         "confidence": _score(parsed.get("confidence"), 0.5),
         "last_seen": config.now(),
@@ -534,7 +593,11 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
         "markers": {k: _score((tk.get("markers") or {}).get(k)) for k in MARKER_KINDS},
         "confidence": _score(tk.get("confidence"), 0.5),
         "last_seen": str(tk.get("last_seen", "")),
+        # the CONTRADICTION side rides UNTOUCHED through a strengthen (carried forward, ADR-0012).
+        "contradicted_by": list(tk.get("contradicted_by") or []),
+        "contradiction_evidence": [dict(e) for e in (tk.get("contradiction_evidence") or [])],
     }
+    nv["contradictions"] = _contradiction_stats(nv)
     cited = {e.get("event_id") for e in nv["evidence"]}
     if rv.id in cited:                             # already incorporated → idempotent, byte-stable no-op
         nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
@@ -561,6 +624,47 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
     return nv, cost
 
 
+def update_contradictions(tk: dict, rv: ResolvedEvent) -> tuple[dict, float]:
+    """WEAKEN — the demotion half `update_support` lacked: dream could accrue support but never be DEMOTED
+    by contradicting evidence (ExpeL's downvote, in dream's additive-sufficient-statistic style; ADR-0012).
+    ALWAYS NO LLM (cost 0.0): a contradiction RECORDS the conflict, it does NOT rewrite the `why` — support,
+    why, title ride UNTOUCHED. Build a NEW VERSION of `tk` (same id): append the contradicting event to
+    `contradicted_by`/`contradiction_evidence` IDEMPOTENTLY (dedup by event_id — a re-weaken of an
+    already-recorded event is a byte-identical no-op, so sessions can't inflate); recompute
+    `contradictions = {events: distinct contradicted_by, sessions: distinct contradicting sessions}` (the
+    BIRCH stat); bump last_seen. The span+quote TRUST CHAIN extends to the contradiction: each entry is a
+    `evidence_entry` (re-validated on write) carrying the session it came from — unlike support's parallel `sessions_seen`, the session rides INSIDE each
+    entry, so the contradiction side needs NO parallel session list (the simpler shape support should migrate
+    TO, not a list to grow here). NEVER auto-deletes — a
+    contested takeaway is quarantined (drops below the net gate), retained, and re-graduatable."""
+    nv = {
+        "id": tk["id"],
+        "title": str(tk.get("title", "")),
+        "why": str(tk.get("why", "")),
+        "relation": tk.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
+        "cites": list(tk.get("cites") or []),
+        "evidence": [dict(e) for e in (tk.get("evidence") or [])],
+        "support": dict(tk.get("support") or {"events": 0, "sessions": 0}),   # untouched by a contradiction
+        "sessions_seen": list(tk.get("sessions_seen") or []),
+        "markers": {k: _score((tk.get("markers") or {}).get(k)) for k in MARKER_KINDS},
+        "confidence": _score(tk.get("confidence"), 0.5),
+        "last_seen": str(tk.get("last_seen", "")),
+        "contradicted_by": list(tk.get("contradicted_by") or []),
+        "contradiction_evidence": [dict(e) for e in (tk.get("contradiction_evidence") or [])],
+    }
+    against = {e.get("event_id") for e in nv["contradiction_evidence"]}
+    if rv.id in against:                           # already recorded → idempotent, byte-stable no-op
+        nv["contradictions"] = _contradiction_stats(nv)
+        return nv, 0.0
+    entry = evidence_entry(rv)
+    entry["session_id"] = rv.session_id            # the session rides WITH the evidence (powers the count)
+    nv["contradiction_evidence"].append(entry)
+    nv["contradicted_by"].append(rv.id)
+    nv["contradictions"] = _contradiction_stats(nv)
+    nv["last_seen"] = config.now()
+    return nv, 0.0
+
+
 def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concepts: list[dict],
           *, known_concept_ids: set[str], drift_threshold: float, model: str, run_id: str,
           root: Path) -> tuple[int, float, dict | None]:
@@ -574,11 +678,23 @@ def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Complete
                    re-synthesized, returns (0, cost, None); else commit takeaway then consolidated,
                    return (1, cost, takeaway).
       strengthen → bump support; commit the new version then consolidated, return (1, cost, version).
+      weaken     → record a contradiction (NO LLM); a vanished target falls back to NOOP (a contradiction
+                   of a gone takeaway is not a new lesson); else commit the new version then consolidated
+                   (decision='weaken'), return (1, 0.0, version) — the event leaves the working set,
+                   incorporated AS a contradiction.
 
     The returned dict is what `DreamBlock.process` folds into the on-instance catalog."""
     decision = rr["decision"]
     if decision == "noop":
         return 0, 0.0, None
+    if decision == "weaken":
+        tk = cat_by_id.get(rr["takeaway_id"])
+        if tk is None:                             # the contested takeaway vanished → NOOP, not new
+            return 0, 0.0, None
+        nv, cost = update_contradictions(tk, rv)                                        # NO LLM, cost 0.0
+        _ingest_takeaway(nv, model=model, run_id=run_id, root=root)             # takeaway FIRST
+        _write_consolidated(rv.id, nv["id"], "weaken", run_id=run_id, root=root)  # consolidated LAST
+        return 1, cost, nv
     if decision == "new":
         tk, cost = synthesize_new(rv, complete_synth, concepts, known_concept_ids=known_concept_ids,
                                   model=model, run_id=run_id)
@@ -615,8 +731,9 @@ def _write_decision(body: dict, *, run_id: str, root: Path | None) -> None:
 def _write_consolidated(event_id: str, takeaway_id: str | None, decision: str, *,
                         run_id: str, root: Path | None) -> None:
     """The commit point that removes an incorporated event from the working set forever (across all
-    params). `decision` is `new` | `strengthen`; `takeaway` is the minted id (None when synth dropped it
-    as noise)."""
+    params). `decision` is `new` | `strengthen` | `weaken` (a weaken incorporates the event AS a
+    contradiction against the named takeaway); `takeaway` is the minted id (None when synth dropped it as
+    noise)."""
     at = config.now()
     _write_decision({"verb": "consolidated", "target": event_id, "takeaway": takeaway_id,
                      "decision": decision, "at": at, "run_id": run_id,
@@ -693,10 +810,12 @@ def merge_candidates(cat: list[dict], *, threshold: float) -> list[tuple[str, st
 def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, model: str, run_id: str,
           root: Path | None = None, resynth: bool = True) -> dict:
     """The v2 replacement for v1's split/merge-by-resignature. Build a WINNER version that UNIONs the
-    loser's evidence (dedup by event_id), sessions_seen, markers (max), last_seen (max) and recomputes
-    support; optionally re-synthesize the `why` (one Sonnet call); commit the winner version, then a
-    `merge` decision dropping the loser. The loser's blob + history are retained — its already-consolidated
-    events keep a now-stale takeaway pointer (harmless; the union evidence lives on the winner)."""
+    loser's evidence (dedup by event_id), sessions_seen, markers (max), last_seen (max), AND the
+    contradiction side (contradicted_by/contradiction_evidence, dedup by event_id — a contradiction is
+    never silently lost in a merge, ADR-0012) and recomputes both support and contradictions; optionally
+    re-synthesize the `why` (one Sonnet call); commit the winner version, then a `merge` decision dropping
+    the loser. The loser's blob + history are retained — its already-consolidated events keep a now-stale
+    takeaway pointer (harmless; the union evidence lives on the winner)."""
     root = root or config.data_root()
     by_id = {t["id"]: t for t in catalog(root)}
     winner = by_id.get(winner_id)
@@ -713,6 +832,7 @@ def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, mo
         "markers": {k: _score((winner.get("markers") or {}).get(k)) for k in MARKER_KINDS},
         "confidence": _score(winner.get("confidence"), 0.5),
         "last_seen": str(winner.get("last_seen", "")),
+        "contradiction_evidence": [dict(e) for e in (winner.get("contradiction_evidence") or [])],
     }
     seen = {e.get("event_id") for e in nv["evidence"]}
     for e in (loser.get("evidence") or []) if loser else []:
@@ -726,6 +846,13 @@ def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, mo
     nv["markers"] = {k: max(nv["markers"][k], _score(lm.get(k))) for k in MARKER_KINDS}
     nv["last_seen"] = max(nv["last_seen"], str((loser or {}).get("last_seen", "")))
     nv["support"] = {"events": len(nv["cites"]), "sessions": len(nv["sessions_seen"])}
+    cseen = {e.get("event_id") for e in nv["contradiction_evidence"]}     # union the contradiction side
+    for e in (loser.get("contradiction_evidence") or []) if loser else []:
+        if e.get("event_id") not in cseen:
+            nv["contradiction_evidence"].append(dict(e))
+            cseen.add(e.get("event_id"))
+    nv["contradicted_by"] = sorted({e.get("event_id") for e in nv["contradiction_evidence"] if e.get("event_id")})
+    nv["contradictions"] = _contradiction_stats(nv)
     cost = 0.0
     if resynth and complete_synth is not None and loser is not None:
         user = ("Two takeaways describe the SAME lesson; merge them into ONE.\n"
@@ -794,6 +921,7 @@ class DreamBlock:
         self.n_events = 0
         self.n_new = 0
         self.n_strengthened = 0
+        self.n_weakened = 0
         self.n_noop = 0
         self.staled: list[str] = []
 
@@ -828,12 +956,14 @@ class DreamBlock:
         if tk is not None:
             if rr["decision"] == "new":
                 self.n_new += 1
+            elif rr["decision"] == "weaken":
+                self.n_weakened += 1
             else:
                 self.n_strengthened += 1
             self.takeaways.append(tk)
             folded = takeaway_content(tk)            # the stored projection (== what a re-load would give)
-            self._cat_by_id[folded["id"]] = folded
-            self._cat = list(self._cat_by_id.values())
+            self._cat_by_id[folded["id"]] = folded   # a weakened version folds too → the next event routes
+            self._cat = list(self._cat_by_id.values())  # against its UPDATED contradiction stats
         else:
             self.n_noop += 1                         # noop OR a synth-dropped new (no takeaway either way)
         return n_out, route_cost + apply_cost
@@ -865,6 +995,9 @@ class RunReport:
     @property
     def n_strengthened(self) -> int:
         return self._blk.n_strengthened
+    @property
+    def n_weakened(self) -> int:
+        return self._blk.n_weakened
     @property
     def n_noop(self) -> int:
         return self._blk.n_noop
@@ -986,8 +1119,8 @@ def main(argv=None) -> None:
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\ndream-{report.run_id}: {report.n_events} events → {report.n_new} new, "
-          f"{report.n_strengthened} strengthened, {report.n_noop} noop, {report.skipped} skipped, "
-          f"{len(report.staled)} staled{errs}, ${report.cost_usd:.4f}{tail}")
+          f"{report.n_strengthened} strengthened, {report.n_weakened} weakened, {report.n_noop} noop, "
+          f"{report.skipped} skipped, {len(report.staled)} staled{errs}, ${report.cost_usd:.4f}{tail}")
 
 
 if __name__ == "__main__":

@@ -119,11 +119,13 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> 
     """The review queue: every MATURE takeaway with no terminal decision and no live snooze, each
     presented with its verified evidence. Derived from references — stores nothing (ADR-0007).
 
-    The MATURITY GATE is `dream.current_takeaways`: it returns only takeaways corroborated across
-    `dream.MATURITY_SESSIONS` (default 2) DISTINCT sessions. An incubating takeaway (a single session so
-    far) is deliberately kept OUT of the human gate — a one-off lesson costs review attention and risks
-    promoting a false belief from a single moment — but it stays LIVE in the routing catalog so a later
-    session can strengthen it across the bar (see `incubating`)."""
+    The MATURITY GATE is `dream.current_takeaways`: it returns only takeaways whose NET distinct-session
+    entrenchment (support sessions MINUS contradicting sessions, ADR-0012) crosses `dream.MATURITY_SESSIONS`
+    (default 2). An incubating takeaway (a single net session so far) is deliberately kept OUT of the human
+    gate — a one-off lesson costs review attention and risks promoting a false belief from a single moment
+    — but it stays LIVE in the routing catalog so a later session can strengthen it across the bar; a once-
+    mature takeaway that gets CONTESTED un-graduates back out of the queue (never deleted) and re-graduates
+    if corroboration returns (see `incubating`)."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
     out: list[dict] = []
@@ -138,9 +140,13 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> 
 def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_SESSIONS) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
     them), but not yet shown to the human gate. The counterpart to `pending`: `catalog` minus the mature
-    set, minus anything already terminally decided. Surfaced so the reviewer can SEE what is accruing
-    toward review (and decide to act early) without it crowding — or pre-biasing — the queue. A light
-    projection (no evidence resolution); `needs` is the count of further distinct sessions to mature."""
+    set, minus anything already terminally decided. The bar is NET distinct-session entrenchment (support
+    sessions minus contradicting sessions, ADR-0012), single-sourced in `dream.net_sessions`/
+    `current_takeaways` — so "below the bar" here means below the SAME net gate `pending` graduates on,
+    and a CONTESTED takeaway that un-graduated re-appears here (not silently lost). Surfaced so the
+    reviewer can SEE what is accruing toward review (and decide to act early) without it crowding — or
+    pre-biasing — the queue. A light projection (no evidence resolution); `needs` is the count of further
+    distinct sessions to cross the net bar."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     mature = {t["id"] for t in dream.current_takeaways(root, min_sessions=min_sessions)}
@@ -153,7 +159,7 @@ def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_S
             continue
         sup = tk.get("support") or {"events": 0, "sessions": 0}
         out.append({"takeaway_id": tk["id"], "title": tk.get("title", ""), "support": sup,
-                    "needs": max(0, min_sessions - sup.get("sessions", 0))})
+                    "needs": max(0, min_sessions - dream.net_sessions(tk))})   # net bar, single-sourced
     return out
 
 

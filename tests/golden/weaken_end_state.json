@@ -1,0 +1,14 @@
+{
+  "_comment": "Golden expected end-state of the WEAKEN scenario (ADR-0012). Three scripted events drive one takeaway T: A (session s1) routes `new` -> mints T {support 1/1, contradictions 0/0}; B (session s2, same lesson) routes `strengthen` -> support 2/2, T matures (net 2 >= MATURITY_SESSIONS=2); C (session s3, contradicting) routes `weaken` -> contradictions 1/1, net = 2-1 = 1 < 2, so T LEAVES current_takeaways, APPEARS in contradicted_takeaways, STILL in catalog (never deleted), and its contradiction evidence is span-verified. The test builds the actual end-state from the run and asserts actual == this, key-by-key with a legible diff. The takeaway id is dynamic (minted off A's event id), so it is asserted separately, not pinned here. Regenerate only when the weaken semantics change.",
+  "support": {"events": 2, "sessions": 2},
+  "contradictions": {"events": 1, "sessions": 1},
+  "net_sessions": 1,
+  "support_evidence_count": 2,
+  "contradiction_evidence_count": 1,
+  "title_unchanged_by_weaken": true,
+  "why_unchanged_by_weaken": true,
+  "contradiction_evidence_span_verified": true,
+  "in_catalog": true,
+  "in_current_takeaways": false,
+  "in_contradicted_takeaways": true
+}
