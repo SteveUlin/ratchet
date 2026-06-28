@@ -301,14 +301,49 @@ def _facet_index(root: Path) -> tuple[list[dict], list[str], dict[str, dict]]:
     return concepts, [c["id"] for c in concepts], facets
 
 
+def _asserted_graph_edges(root: Path, valid_ids: set[str]) -> list[dict]:
+    """The gardener's ASSERTED edges (3c/ADR-0015), folded in alongside the derived ones — but ONLY between
+    two VALID concepts (both endpoints are graph nodes), so a `supersedes` loser→winner edge naturally drops
+    out of the live graph once the loser is invalidated (the lineage still lives in the asserted-edge blob
+    store, readable via `garden.asserted_edges`). Marked `asserted: True` to distinguish them from the
+    recomputed DERIVED edges (ADR-0013 §B); EMPTY when nothing has been asserted, so an un-edited graph (and
+    the 3a golden) is byte-IDENTICAL. The `garden` import is LAZY (the garden <-> concepts cycle, as in
+    `_facet_index`)."""
+    from . import garden
+    out: list[dict] = []
+    for e in garden.asserted_edges(root):
+        if e["src"] in valid_ids and e["dst"] in valid_ids:
+            out.append({"source": e["src"], "target": e["dst"], "kind": e["kind"],
+                        "note": e["note"], "asserted": True})
+    out.sort(key=lambda x: (x["source"], x["kind"], x["target"]))
+    return out
+
+
+def concept_hierarchy(root: Path | None = None) -> dict:
+    """The generalization SPINE — `{parent_id: sorted[child_ids]}` over the active `generalizes` asserted
+    edges between valid concepts (3c/ADR-0015). The tree the gardener's `abstract`/`reparent` maintain ON
+    TOP of the flat facet graph; kept a SEPARATE view (not a `concept_graph` key) so the 3a graph bytes —
+    and its golden — stay unchanged. Empty until an `abstract`/`reparent` asserts a `generalizes` edge."""
+    root = root or config.data_root()
+    from . import garden
+    valid = dream.valid_concept_ids(root)
+    children: dict[str, list[str]] = {}
+    for e in garden.asserted_edges(root):
+        if e["kind"] == "generalizes" and e["src"] in valid and e["dst"] in valid:
+            children.setdefault(e["src"], []).append(e["dst"])
+    return {p: sorted(cs) for p, cs in children.items()}
+
+
 def concept_graph(root: Path | None = None) -> dict:
     """The rebuildable concept graph — `{nodes, edges, clusters}` — computed from provenance facets,
-    no LLM, never stored. Order-stable (concepts sorted by id throughout)."""
+    no LLM, never stored. Order-stable (concepts sorted by id throughout). `edges` = the DERIVED facet
+    overlaps (3a/ADR-0013) PLUS the gardener's ASSERTED edges (3c/ADR-0015, marked `asserted: True`); the
+    asserted set is empty until an op runs, so an un-edited graph is byte-identical to 3a."""
     root = root or config.data_root()
     concepts, ids, facets = _facet_index(root)
     nodes = [{"id": c["id"], "title": c.get("title", ""), "facets": facets[c["id"]]} for c in concepts]
     return {"nodes": nodes,
-            "edges": derived_edges(ids, facets),
+            "edges": derived_edges(ids, facets) + _asserted_graph_edges(root, set(ids)),
             "clusters": leader_clusters(ids, facets)}
 
 
@@ -325,11 +360,16 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="concepts",
                                  description="Dump the rebuildable concept-facet graph (no LLM).")
     ap.add_argument("--clusters", action="store_true", help="print only the facet-overlap clusters")
+    ap.add_argument("--hierarchy", action="store_true",
+                    help="print only the generalization spine (the gardener's `generalizes` edges)")
     ap.add_argument("--json", action="store_true", help="emit the full graph as JSON (default: a summary)")
     args = ap.parse_args(argv)
 
     if args.clusters:
         print(json.dumps(concept_clusters(), ensure_ascii=False, indent=2))
+        return
+    if args.hierarchy:
+        print(json.dumps(concept_hierarchy(), ensure_ascii=False, indent=2))
         return
     graph = concept_graph()
     if args.json:
@@ -346,7 +386,8 @@ def main(argv=None) -> None:
     if graph["edges"]:
         print("\n  edges:")
         for e in graph["edges"]:
-            tail = f" {e['shared']}" if e["shared"] else ""
+            # an asserted edge (3c) carries a `note`, not the derived edges' `shared` member list.
+            tail = f" {e['shared']}" if e.get("shared") else (" *asserted*" if e.get("asserted") else "")
             print(f"    {e['source']} —{e['kind']}→ {e['target']}{tail}")
     print("\n  clusters:")
     for cl in graph["clusters"]:

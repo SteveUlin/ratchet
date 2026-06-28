@@ -92,6 +92,21 @@ W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
 
 _RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
 
+# The verbs whose latest decision drops a concept from the valid set — the concept-side mirror of
+# `catalog`'s merge/retire/reject filter. `retire` is review's human gate (ADR-0008); `supersede`/`split`
+# are the gardener's structural ops (3c/ADR-0015) — a merge-loser is superseded INTO its winner, a split
+# original is dissolved INTO its parts. All three are invalidate-don't-delete: the blob + history stay,
+# only the latest-decision FOLD takes the concept out of `load_concepts`/`valid_concepts`.
+#
+# SINGLE-SOURCED CONTRACT: the gardener WRITES these decision verbs (`garden.merge`/`split` reference
+# `VERB_SUPERSEDE`/`VERB_SPLIT`) and this fold READS them — one spelling, so a typo can't silently leave a
+# merge-loser in the valid set (a trust-corruption). The constants live here (garden→dream already holds,
+# no cycle); garden imports them.
+VERB_RETIRE = "retire"
+VERB_SUPERSEDE = "supersede"
+VERB_SPLIT = "split"
+CONCEPT_INVALID_VERBS = (VERB_RETIRE, VERB_SUPERSEDE, VERB_SPLIT)
+
 ROUTE_SYSTEM = (
     "You are the ROUTER for a developer's long-term memory. A new OBSERVATION arrived from a Claude "
     "Code session; you are shown the CURRENT CATALOG of takeaways the memory already holds. Decide "
@@ -153,8 +168,8 @@ def load_concepts(root: Path | None = None) -> list[dict]:
     out: list[dict] = []
     for sid, h in blobstore.latest_by_kind("concept", root).items():
         d = decisions.get(sid)
-        if d and d.get("verb") == "retire":      # retired out of the valid set (ADR-0007 §4)
-            continue
+        if d and d.get("verb") in CONCEPT_INVALID_VERBS:   # retired/superseded/split out of the valid set
+            continue                                        # (ADR-0007 §4; the gardener's ops, ADR-0015)
         try:
             obj = json.loads(blobstore.get(h, root))
         except (OSError, json.JSONDecodeError):
@@ -162,6 +177,14 @@ def load_concepts(root: Path | None = None) -> list[dict]:
         if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
             out.append(obj)
     return out
+
+
+def valid_concept_ids(root: Path | None = None) -> set[str]:
+    """The IDS of the current valid concept set — `{c["id"] for c in load_concepts(root)}`. The membership
+    test the gardener's structural ops (an op never targets a dead concept) and the concept-graph folds
+    gate on; single-sourced HERE, next to `load_concepts` (its source — kept in dream to avoid a
+    dream↔concepts cycle, per `review.valid_concepts`), so the call sites never re-spell the comprehension."""
+    return {c["id"] for c in load_concepts(root)}
 
 
 def _render_concepts(concepts: list[dict]) -> str:

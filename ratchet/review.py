@@ -245,7 +245,7 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     title = edited.get("title", tk.get("title", ""))
     statement = edited.get("why", tk.get("why", ""))
     rel = tk.get("relation") or {}
-    known = {c["id"] for c in dream.load_concepts(root)}
+    known = dream.valid_concept_ids(root)
     concept_id = (rel["concept_id"] if rel.get("kind") in ("strengthens", "refines")
                   and isinstance(rel.get("concept_id"), str) and rel["concept_id"] in known
                   else _mint_concept_id(tk))        # reuse only an EXISTING concept; else mint fresh

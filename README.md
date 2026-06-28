@@ -38,10 +38,14 @@ tap → raw → weave → cleaned → chunk → chunkset → glean → events �
   FACETS (shared repo/file/tool, temporal proximity — recomputed on read from each cited session's raw
   transcript, never stored), NO LLM and NO text similarity (ADR-0013). A rebuildable read-side view; the substrate
   the gardener (managed tags, structural ops) is built on.
-- `garden` — the **gardener, phase 1**: a cheap model tags each concept from a gardener-managed,
+- `garden` — the **gardener**. *Phase 1 (tags)*: a cheap model tags each concept from a gardener-managed,
   controlled **vocabulary** (both a derived fold over append-only blobs — concepts stay immutable), and a
-  shared **tag** becomes a `shares-tag` edge that sharpens the `concepts` graph. LOW-STAKES, auto-applied
-  (no review); a `block.Block` reusing the whole driver (ADR-0014). Structural ops + vocab curation = 3c.
+  shared **tag** becomes a `shares-tag` edge that sharpens the `concepts` graph. LOW-STAKES, auto-applied;
+  a `block.Block` reusing the whole driver (ADR-0014). *Phase 2 (structural ops, 3c-i)*: the deterministic,
+  append-only machinery that ACTS on the graph — `merge`/`split`/`abstract`/`reparent`/`retire` of concepts
+  + `merge_tags`/`retire_tag` of the vocab, plus **asserted edges** (the gardener's stored claims, vs the
+  derived ones), all invalidate-don't-delete with the trust chain re-proven on every write, no LLM
+  (ADR-0015). The LLM that drives them + the human gate for the high-stakes ones are 3c-ii / 3d.
 
 ## Layout
 
