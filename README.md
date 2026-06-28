@@ -38,13 +38,18 @@ tap → raw → weave → cleaned → chunk → chunkset → glean → events �
   FACETS (shared repo/file/tool, temporal proximity — recomputed on read from each cited session's raw
   transcript, never stored), NO LLM and NO text similarity (ADR-0013). A rebuildable read-side view; the substrate
   the gardener (managed tags, structural ops) is built on.
+- `garden` — the **gardener, phase 1**: a cheap model tags each concept from a gardener-managed,
+  controlled **vocabulary** (both a derived fold over append-only blobs — concepts stay immutable), and a
+  shared **tag** becomes a `shares-tag` edge that sharpens the `concepts` graph. LOW-STAKES, auto-applied
+  (no review); a `block.Block` reusing the whole driver (ADR-0014). Structural ops + vocab curation = 3c.
 
 ## Layout
 
 - `ratchet/` — the Python package: `config`, `blobstore` (every artifact is a content-addressed,
   versioned blob — ADR-0007), `block` (the one driver every stage runs on — ADR-0009), `tap`, `weave`,
-  `chunk`, `glean`, `dream`, `review`, `concepts` (the rebuildable concept-graph view — ADR-0013), and
-  `completer` (the injected LLM seam).
+  `chunk`, `glean`, `dream`, `review`, `concepts` (the rebuildable concept-graph view — ADR-0013),
+  `garden` (the gardener's managed-tags pass over concepts — ADR-0014), and `completer` (the injected
+  LLM seam).
 - `.claude/skills/ratchet-review/` — the `/ratchet-review` skill (the human gate's interaction).
 - Every batch stage (tap/weave/chunk/glean/dream) is a **Block**: same `--all`/`--source-id`/`--max-usd`/
   `--limit`/`--dry-run`/`--quiet` CLI, same streaming per-item progress, same per-item commit + resume.

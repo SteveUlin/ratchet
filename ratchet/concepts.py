@@ -17,13 +17,17 @@ OVERLAP, not a cosine over short quotes (the metric that sank dream v1 — ADR-0
 Everything here is a REBUILDABLE VIEW — computed on read from the blobs, never stored, exactly like
 `dream.current_takeaways` / `load_concepts`. `concept_graph` returns `{nodes, edges, clusters}`:
   - nodes  — each valid concept with its facets.
-  - edges  — DERIVED edges (`shares-repo` / `shares-file` / `shares-tool` / `temporal-proximity`),
-             one per non-empty facet overlap between a pair. A pure view (recomputed each call).
+  - edges  — DERIVED edges (`shares-repo` / `shares-file` / `shares-tool` / `shares-tag` /
+             `temporal-proximity`), one per non-empty facet overlap between a pair. A pure view
+             (recomputed each call).
   - clusters — leader clustering over the facet-overlap SCORE: a single deterministic pass, the most
              distinctive concept seeds a cluster, later ones join the first leader within threshold.
 
-This is the additive READ-side substrate only. The gardener's ASSERTED edges, managed tags, and the
-structural ops (split/merge/supersede) are deferred to 3b/3c (ADR-0013) — nothing here mutates a blob.
+The provenance facets are 3a (ADR-0013); the gardener's MANAGED TAGS (3b/ADR-0014) thread in as the
+second grouping axis — a cheap-AI semantic signal `garden.py` produces, folded once in `_facet_index`
+and overlapped as `shares-tag`. Purely additive: an untagged concept carries no `tags` facet, so the 3a
+graph stays byte-identical. The gardener's structural ops (split/merge/supersede of concepts AND of tags)
+are deferred to 3c — nothing here mutates a blob.
 """
 from __future__ import annotations
 
@@ -45,11 +49,20 @@ W_FILE = 3.0
 W_REPO = 1.0
 W_TOOL = 0.5
 W_TEMPORAL_BONUS = 0.25
-
 CLUSTER_THRESHOLD = 3.0          # leader-join bar — CLUSTER_THRESHOLD == W_FILE couples it to "one shared file clears it" (a shared repo alone does not)
+# A shared MANAGED TAG (3b/ADR-0014) is a SEMANTIC grouping — its whole purpose is to relate concepts that
+# share a THEME without sharing a file. A single tag still fires the `shares-tag` EDGE (the thematic
+# relation stays VISIBLE), but a managed tag is UNCURATED + auto-applied (no merge/retire until 3c), so one
+# tag alone must NOT force a cluster: W_TAG < CLUSTER_THRESHOLD by design. At 2.0 a single shared tag (2.0)
+# scores BELOW the 3.0 bar, while CORROBORATION clears it — two shared tags (4.0), or a shared tag + a
+# shared file (2.0+3.0) or repo (2.0+1.0). This protects 3c's per-cluster LLM passes from garbage,
+# over-broad clusters (a `general` tag smeared across 50 concepts) before the vocab is trustworthy. Staging:
+# once 3c's tag merge/retire makes the vocab curated, W_TAG is raised toward/above CLUSTER_THRESHOLD.
+# Untuned, like the rest — pending a gold set.
+W_TAG = 2.0
 TEMPORAL_WINDOW_SECONDS = 7 * 24 * 3600  # "close in time" = within a week (sessions on one task cluster by days)
 
-EDGE_KINDS = ("shares-file", "shares-repo", "shares-tool", "temporal-proximity")
+EDGE_KINDS = ("shares-file", "shares-repo", "shares-tool", "shares-tag", "temporal-proximity")
 
 
 # --- one cleaned blob's facets: recompute from the raw ground truth (one derived_from hop) ---------
@@ -122,12 +135,19 @@ def _cleaned_facets(cleaned_hash: str, root: Path, cache: dict | None = None) ->
     return facets
 
 
-def concept_facets(concept: dict, root: Path | None = None, *, cache: dict | None = None) -> dict:
+def concept_facets(concept: dict, root: Path | None = None, *, cache: dict | None = None,
+                   tags: list[str] | None = None) -> dict:
     """UNION the facets of every cleaned blob a concept cites → `{repos, files, tools, sessions,
     time_range}`. A concept can span MULTIPLE sessions (each strengthen/refine appends another event's
     evidence — ADR-0010), so this folds them all. Sets come back as SORTED lists (stable, JSON-ready);
     `time_range` is `[earliest, latest]` ISO over the cited sessions, or None when no session has a
-    time. The empty concept (no resolvable evidence) yields all-empty facets — it simply never shares."""
+    time. The empty concept (no resolvable evidence) yields all-empty facets — it simply never shares.
+
+    `tags` (3b/ADR-0014) is the SECOND facet source — the gardener's managed tags for this concept, a
+    SEMANTIC grouping axis the provenance facets lack. It is threaded in (the graph folds the assignments
+    once and passes the per-concept list), NOT recomputed here. A `tags` key is added ONLY when non-empty:
+    an untagged concept's facet bytes stay IDENTICAL to 3a, so the 3a graph (and its golden) is unchanged
+    and `shares-tag` never fires until a tag exists."""
     root = root or config.data_root()
     repos: set[str] = set()
     files: set[str] = set()
@@ -149,7 +169,7 @@ def concept_facets(concept: dict, root: Path | None = None, *, cache: dict | Non
         tools |= cf["tools"]
         if cf["time"]:
             times.append(cf["time"])
-    return {
+    out = {
         "repos": sorted(repos),
         "files": sorted(files),
         "tools": sorted(tools),
@@ -157,6 +177,9 @@ def concept_facets(concept: dict, root: Path | None = None, *, cache: dict | Non
         # min/max over ISO STRINGS reads chronological only because every mtime is tz-aware UTC ISO (tap).
         "time_range": [min(times), max(times)] if times else None,
     }
+    if tags:                                    # only when present — keeps the untagged facet bytes == 3a
+        out["tags"] = sorted(set(tags))
+    return out
 
 
 # --- the facet-overlap relation: shared sets + temporal nearness, then a weighted score -----------
@@ -194,6 +217,9 @@ def facet_overlap(fa: dict, fb: dict) -> dict:
         "shares-file": sorted(set(fa["files"]) & set(fb["files"])),
         "shares-repo": sorted(set(fa["repos"]) & set(fb["repos"])),
         "shares-tool": sorted(set(fa["tools"]) & set(fb["tools"])),
+        # tags read DEFENSIVELY: an untagged concept's facets carry no `tags` key (3b keeps the 3a facet
+        # bytes identical when no tags exist), so `.get` returns () → no shared tag → no `shares-tag` edge.
+        "shares-tag": sorted(set(fa.get("tags", ())) & set(fb.get("tags", ()))),
         "temporal-proximity": _temporal_proximate(fa, fb),
     }
 
@@ -205,7 +231,9 @@ def facet_score(fa: dict, fb: dict) -> float:
     ov = facet_overlap(fa, fb)
     score = (W_FILE * len(ov["shares-file"])
              + W_REPO * len(ov["shares-repo"])
-             + W_TOOL * len(ov["shares-tool"]))
+             + W_TOOL * len(ov["shares-tool"])
+             + W_TAG * len(ov["shares-tag"]))      # a shared tag adds W_TAG — below the bar ALONE, it clusters
+                                                   # only WITH corroboration (a 2nd tag or a file/repo; ADR-0014)
     if ov["temporal-proximity"]:
         score += W_TEMPORAL_BONUS
     return score
@@ -259,10 +287,17 @@ def leader_clusters(ids: list[str], facets: dict[str, dict]) -> list[dict]:
 def _facet_index(root: Path) -> tuple[list[dict], list[str], dict[str, dict]]:
     """The shared spine of every view: the valid concepts (sorted by id), their ids, and their facets —
     computed ONCE per call with a per-call cleaned-blob cache so a concept cited by many edges resolves
-    its sidecars once. Valid concepts = `dream.load_concepts` (latest version per id, minus retired)."""
+    its sidecars once. Valid concepts = `dream.load_concepts` (latest version per id, minus retired). The
+    gardener's managed tags (3b/ADR-0014) are folded ONCE here and threaded into each concept's facets as
+    the second grouping axis. The `garden` import is LAZY (function-local): garden imports `concept_facets`
+    from this module, so a top-level import here would be a cycle — the tag-FOLD readers carry no Block, so
+    a runtime import breaks it cleanly."""
+    from . import garden                          # lazy: avoids the garden <-> concepts import cycle
     concepts = sorted(dream.load_concepts(root), key=lambda c: c["id"])
+    tag_map = garden.all_concept_tags(root)        # concept_id -> current tags, one scan
     cache: dict = {}
-    facets = {c["id"]: concept_facets(c, root, cache=cache) for c in concepts}
+    facets = {c["id"]: concept_facets(c, root, cache=cache, tags=tag_map.get(c["id"]))
+              for c in concepts}
     return concepts, [c["id"] for c in concepts], facets
 
 
