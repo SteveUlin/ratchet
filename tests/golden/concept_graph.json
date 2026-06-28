@@ -1,0 +1,215 @@
+{
+  "nodes": [
+    {
+      "id": "c1-foo",
+      "title": "foo edits",
+      "facets": {
+        "repos": [
+          "alpha"
+        ],
+        "files": [
+          "/repo/foo.py"
+        ],
+        "tools": [
+          "Bash",
+          "Edit",
+          "Read"
+        ],
+        "sessions": [
+          "sess-a"
+        ],
+        "time_range": [
+          "2026-06-01T10:00:00+00:00",
+          "2026-06-01T10:00:00+00:00"
+        ]
+      }
+    },
+    {
+      "id": "c2-foobar",
+      "title": "foo and bar",
+      "facets": {
+        "repos": [
+          "alpha"
+        ],
+        "files": [
+          "/repo/bar.py",
+          "/repo/foo.py"
+        ],
+        "tools": [
+          "Bash",
+          "Edit"
+        ],
+        "sessions": [
+          "sess-b"
+        ],
+        "time_range": [
+          "2026-06-01T11:00:00+00:00",
+          "2026-06-01T11:00:00+00:00"
+        ]
+      }
+    },
+    {
+      "id": "c3-beta",
+      "title": "beta baz",
+      "facets": {
+        "repos": [
+          "beta"
+        ],
+        "files": [
+          "/other/baz.py"
+        ],
+        "tools": [
+          "Grep",
+          "Write"
+        ],
+        "sessions": [
+          "sess-c"
+        ],
+        "time_range": [
+          "2026-07-01T10:00:00+00:00",
+          "2026-07-01T10:00:00+00:00"
+        ]
+      }
+    },
+    {
+      "id": "c4-span",
+      "title": "alpha spanning",
+      "facets": {
+        "repos": [
+          "alpha"
+        ],
+        "files": [
+          "/repo/bar.py",
+          "/repo/foo.py"
+        ],
+        "tools": [
+          "Bash",
+          "Edit",
+          "MultiEdit",
+          "Read"
+        ],
+        "sessions": [
+          "sess-a",
+          "sess-d"
+        ],
+        "time_range": [
+          "2026-06-01T10:00:00+00:00",
+          "2026-06-01T12:00:00+00:00"
+        ]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "c1-foo",
+      "target": "c2-foobar",
+      "kind": "shares-file",
+      "shared": [
+        "/repo/foo.py"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c2-foobar",
+      "kind": "shares-repo",
+      "shared": [
+        "alpha"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c2-foobar",
+      "kind": "shares-tool",
+      "shared": [
+        "Bash",
+        "Edit"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c2-foobar",
+      "kind": "temporal-proximity",
+      "shared": []
+    },
+    {
+      "source": "c1-foo",
+      "target": "c4-span",
+      "kind": "shares-file",
+      "shared": [
+        "/repo/foo.py"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c4-span",
+      "kind": "shares-repo",
+      "shared": [
+        "alpha"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c4-span",
+      "kind": "shares-tool",
+      "shared": [
+        "Bash",
+        "Edit",
+        "Read"
+      ]
+    },
+    {
+      "source": "c1-foo",
+      "target": "c4-span",
+      "kind": "temporal-proximity",
+      "shared": []
+    },
+    {
+      "source": "c2-foobar",
+      "target": "c4-span",
+      "kind": "shares-file",
+      "shared": [
+        "/repo/bar.py",
+        "/repo/foo.py"
+      ]
+    },
+    {
+      "source": "c2-foobar",
+      "target": "c4-span",
+      "kind": "shares-repo",
+      "shared": [
+        "alpha"
+      ]
+    },
+    {
+      "source": "c2-foobar",
+      "target": "c4-span",
+      "kind": "shares-tool",
+      "shared": [
+        "Bash",
+        "Edit"
+      ]
+    },
+    {
+      "source": "c2-foobar",
+      "target": "c4-span",
+      "kind": "temporal-proximity",
+      "shared": []
+    }
+  ],
+  "clusters": [
+    {
+      "leader": "c1-foo",
+      "members": [
+        "c1-foo",
+        "c2-foobar",
+        "c4-span"
+      ]
+    },
+    {
+      "leader": "c3-beta",
+      "members": [
+        "c3-beta"
+      ]
+    }
+  ]
+}

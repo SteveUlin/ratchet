@@ -34,12 +34,17 @@ tap → raw → weave → cleaned → chunk → chunkset → glean → events �
   and escalates to investigate the doubtful cases) and you make every call. accept/reject/snooze/edit
   are append-only decision blobs; an accept mints a concept, closing the loop (dream reads concepts to
   judge belief-change). The queue and the valid concept set are derived queries, never stored lists.
+- `concepts` — the **concept-graph view**: derived edges + clusters between concepts from PROVENANCE
+  FACETS (shared repo/file/tool, temporal proximity — recomputed on read from each cited session's raw
+  transcript, never stored), NO LLM and NO text similarity (ADR-0013). A rebuildable read-side view; the substrate
+  the gardener (managed tags, structural ops) is built on.
 
 ## Layout
 
 - `ratchet/` — the Python package: `config`, `blobstore` (every artifact is a content-addressed,
   versioned blob — ADR-0007), `block` (the one driver every stage runs on — ADR-0009), `tap`, `weave`,
-  `chunk`, `glean`, `dream`, `review`, and `completer` (the injected LLM seam).
+  `chunk`, `glean`, `dream`, `review`, `concepts` (the rebuildable concept-graph view — ADR-0013), and
+  `completer` (the injected LLM seam).
 - `.claude/skills/ratchet-review/` — the `/ratchet-review` skill (the human gate's interaction).
 - Every batch stage (tap/weave/chunk/glean/dream) is a **Block**: same `--all`/`--source-id`/`--max-usd`/
   `--limit`/`--dry-run`/`--quiet` CLI, same streaming per-item progress, same per-item commit + resume.
