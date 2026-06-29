@@ -7,8 +7,8 @@ The unifying `ratchet` service does not exist yet — the project is built as co
 over a content-addressed **blobstore**, each step a materialized, lineage-linked artifact:
 
 ```
-tap → raw → weave → cleaned → chunk → chunkset → glean → events → dream → takeaways → review → concepts
-  (fetch)      (render)            (window)        (extract, LLM)    (synthesize, LLM)   (human gate)
+tap → raw → weave → cleaned → chunk → chunkset → glean → events → dream → takeaways → review → concepts → generate → CLAUDE.md
+  (fetch)      (render)            (window)        (extract, LLM)    (synthesize, LLM)   (human gate)        (project, no LLM)
 ```
 
 - `tap` — locate new/changed Claude Code transcripts and copy each in as an immutable **raw** blob.
@@ -46,6 +46,14 @@ tap → raw → weave → cleaned → chunk → chunkset → glean → events �
   + `merge_tags`/`retire_tag` of the vocab, plus **asserted edges** (the gardener's stored claims, vs the
   derived ones), all invalidate-don't-delete with the trust chain re-proven on every write, no LLM
   (ADR-0015). The LLM that drives them + the human gate for the high-stakes ones are 3c-ii / 3d.
+- `generate` — the **loop-closer**: a mechanical, deterministic projection of the VALID concepts (the
+  source of truth) into a **marked region** of a CLAUDE.md — concepts grouped by their facet cluster, each
+  a rule (its reviewed `statement` verbatim + a `<!-- c-id -->` provenance marker + a "when working in
+  &lt;repo&gt;/with &lt;tag&gt;" trigger). NO LLM. generate owns ONLY the delimited region (human content
+  outside is byte-preserved); `--apply` refreshes it in place, so a retired concept's rule UNMAKES itself
+  (retraction-for-free) and re-apply with unchanged concepts is a no-op. The default `--target` is a STAGED
+  path under the data root, so it never clobbers a real CLAUDE.md; `--diff` is the second review tier
+  (ADR-0020).
 
 ## Layout
 
@@ -88,6 +96,10 @@ nix run .#dream -- --show --max-usd 2.00                 # synthesize takeaways 
 
 nix run .#review -- --pending                            # the review queue (takeaways + verified evidence)
 nix run .#review -- --accept <takeaway> --assessment ".."  # promote a takeaway → concept
+
+nix run .#generate                                       # print the projected CLAUDE.md region (no write)
+nix run .#generate -- --diff --target ~/proj/CLAUDE.md   # review the proposed region vs the target's current one
+nix run .#generate -- --apply --target ~/proj/CLAUDE.md  # refresh the marked region in place (human content preserved)
 ```
 
 The review gate is meant to be driven by the **`/ratchet-review` skill** (Claude presents each

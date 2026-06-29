@@ -32,6 +32,8 @@
           glean = block "glean";  # extract:   chunkset → events (LLM)
           dream = block "dream";  # synthesize: events → takeaways (LLM)
           review = block "review"; # gate:      takeaways → concepts (human + the /ratchet-review skill)
+          # generate is a GLOBAL projection, not a Block (ADR-0020) — but the same command wrapper runs it.
+          generate = block "generate"; # project:   valid concepts → a marked CLAUDE.md region (no LLM)
         });
     };
 }
