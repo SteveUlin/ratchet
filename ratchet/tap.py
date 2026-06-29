@@ -43,6 +43,15 @@ def discover(datastore: Path, project: str | None = None) -> Iterator[Path]:
         yield from sorted(proj_dir.glob("*.jsonl"))
 
 
+def _parse_since(s: str) -> datetime:
+    """Parse a `--since` selector (an ISO date or datetime) to a tz-aware UTC cutoff. A bare date
+    (`2026-06-01`) reads as midnight UTC; a naive datetime reads as UTC — file mtimes are compared in
+    UTC (`datetime.fromtimestamp(mtime, timezone.utc)`). Raises `ValueError` on an unparseable string;
+    `main()` catches it and `ap.error`s, so a bad date fails fast rather than silently selecting nothing."""
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def read_origin(path: Path) -> tuple[str, dict]:
     """Return (raw text, origin_ref backlink) for a transcript file."""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -148,12 +157,18 @@ class TapBlock:
     # a per-file fingerprint — the done-key's only per-item part is key(item)).
     params: tuple[tuple[str, str], ...] = ()
 
-    def __init__(self, datastore: Path = DEFAULT_DATASTORE, project: str | None = None) -> None:
-        # datastore/project scope the enumeration (tap-specific, not block.run knobs). The cursor +
-        # in-run latest index live on the instance so items()/process()/finalize() share them; they
-        # are (re)loaded at items() start so a re-used instance always reflects on-disk state.
+    def __init__(self, datastore: Path = DEFAULT_DATASTORE, project: str | None = None,
+                 last: int | None = None, since: str | None = None) -> None:
+        # datastore/project/last/since scope the enumeration (tap-specific FETCH SELECTION, not block.run
+        # knobs — selection is per-source, owned by the fetcher; ADR-0022). `--last`/`--since` SELECT which
+        # to-ingest candidates exist; the driver's `--limit` caps how many are EXAMINED — distinct levers,
+        # both useful (e.g. `--last 200` then a smaller `--limit` per tick). The cursor + in-run latest
+        # index live on the instance so items()/process()/finalize() share them; they are (re)loaded at
+        # items() start so a re-used instance always reflects on-disk state.
         self.datastore = datastore
         self.project = project
+        self.last = last
+        self.since = since
         self._state: dict[str, list] = {}
         self._latest: dict[str, tuple[str, str]] = {}
         self._dirty = False
@@ -171,19 +186,37 @@ class TapBlock:
         self._state = load_fetch_state(root)
         self._latest = blobstore.latest_index(root)  # source_id -> (fetched_at, hash); current in-run
         self._dirty = False
+        since_dt = _parse_since(self.since) if self.since else None
+        # FETCH SELECTION (`--last`/`--since`, ADR-0022) narrows the SURVIVORS of the cursor skip — "the
+        # last N I haven't already pulled" / "only since this date". It buffers candidates ONLY when a
+        # selector is active; with neither set the loop stays a pure stream, so a no-knob run is
+        # byte-identical to before (same items, same inline order — incl. an unstatable file's position).
+        selecting = self.last is not None or since_dt is not None
+        buf: list[tuple[Path, list, float]] = []     # (path, fingerprint, raw mtime) survivors to select over
         for path in discover(self.datastore, self.project):
             if source_id is not None and path.stem != source_id:
                 continue
             try:
                 st = path.stat()
             except OSError:
-                yield (path, [])                    # unstatable → process() raises → errored
-                continue
+                yield (path, [])                    # unstatable → process() raises → errored. Never
+                continue                            # suppressed by --last/--since (it has no mtime to select on)
             fp = [st.st_size, datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()]
             prior = self._state.get(str(path))
             if prior is not None and prior[:2] == fp:
                 continue  # cheap tier: (size, mtime) unchanged since last tap — never examined
-            yield (path, fp)
+            if not selecting:
+                yield (path, fp)
+                continue
+            if since_dt is not None and datetime.fromtimestamp(st.st_mtime, timezone.utc) < since_dt:
+                continue                            # --since: modified before the cutoff — not selected
+            buf.append((path, fp, st.st_mtime))
+        if selecting:
+            if self.last is not None:               # --last N: the N most-recently-MODIFIED survivors. Stable
+                buf.sort(key=lambda c: c[2], reverse=True)   # sort by mtime desc; ties keep discover order
+                buf = buf[:self.last]
+            for path, fp, _mtime in buf:
+                yield (path, fp)
 
     def key(self, item: tuple[Path, list]) -> str:
         """The done-key target: the session id PLUS the (size, mtime) fingerprint. Keying on the bare
@@ -239,6 +272,12 @@ def main(argv=None) -> None:
     ap.add_argument("--datastore", type=Path, default=DEFAULT_DATASTORE,
                     help=f"transcript root (default: {DEFAULT_DATASTORE})")
     ap.add_argument("--project", help="only project dirs whose name contains this string")
+    # FETCH SELECTION (ADR-0022) — owned by the fetcher (selection is per-source), distinct from the
+    # driver's --limit (which caps items EXAMINED): --last/--since SELECT which to-ingest candidates exist.
+    ap.add_argument("--last", type=int, metavar="N",
+                    help="FETCH SELECTION: only the N most-recently-MODIFIED to-ingest files (after the cursor skip)")
+    ap.add_argument("--since", metavar="ISO-DATE",
+                    help="FETCH SELECTION: only files modified at/after this ISO date (e.g. 2026-06-01)")
     # uniform block surface (per ADR-0009):
     ap.add_argument("--source-id", help="ingest just this session (path.stem == session id)")
     ap.add_argument("--all", action="store_true",
@@ -251,8 +290,13 @@ def main(argv=None) -> None:
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
                     help="ordering policy (inert — tap emits no per-item signal, so every policy is arrival order)")
     args = ap.parse_args(argv)
+    if args.since is not None:                       # fail fast on a bad date rather than silently selecting nothing
+        try:
+            _parse_since(args.since)
+        except ValueError:
+            ap.error(f"--since {args.since!r} is not an ISO date/datetime (e.g. 2026-06-01)")
 
-    blk = TapBlock(datastore=args.datastore, project=args.project)
+    blk = TapBlock(datastore=args.datastore, project=args.project, last=args.last, since=args.since)
     # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
     # else built from this stage's args + OUT_NOUN. tap has params=() and no LLM cost (cap omitted).
     progress = None if (args.quiet or args.dry_run) else block.Progress(

@@ -349,6 +349,29 @@ def session_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     return sid
 
 
+def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> str | None:
+    """The originating PROJECT of a cleaned blob, via the SAME content-addressed lineage `session_of`
+    walks: cleaned blob → `derived_from` (raw) → the raw blob's `origin_ref.project` (the datastore
+    project-dir name `tap.read_origin` stamped). The one hop `concepts._cleaned_facets` already uses for
+    its `repo` facet, single-sourced here so dream/glean/review share one spelling for the `--topic`
+    operator filter (ADR-0022). An optional `cache` memoizes across calls; absent/broken meta → None
+    (never fatal — a `--topic` run then simply doesn't match that item). One meta hop per call, no
+    content read, no LLM."""
+    root = root or config.data_root()
+    if cache is not None and cleaned_hash in cache:
+        return cache[cleaned_hash]
+    proj = None
+    try:
+        raw = get_meta(cleaned_hash, root).get("derived_from")
+        if raw:
+            proj = (get_meta(raw, root).get("origin_ref") or {}).get("project")
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        proj = None
+    if cache is not None:
+        cache[cleaned_hash] = proj
+    return proj
+
+
 def ingest(
     text: str,
     *,

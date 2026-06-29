@@ -115,9 +115,42 @@ def _is_out_of_queue(d: dict) -> bool:
     return False
 
 
-def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> list[dict]:
-    """The review queue: every MATURE takeaway with no terminal decision and no live snooze, each
-    presented with its verified evidence. Derived from references — stores nothing (ADR-0007).
+def importance(tk: dict) -> float:
+    """A takeaway's REVIEW IMPORTANCE — the signal `pending` orders DESCENDING so the human sees the
+    highest-leverage calls first (the active-learning "spend your attention where it matters most"; ADR-0022).
+    NET entrenchment × confidence: `dream.net_sessions` (distinct SUPPORTING sessions minus CONTRADICTING
+    ones — the SAME signal the maturity gate graduates on, ADR-0012) scaled by the takeaway's own durability
+    `confidence`. Both already live ON the takeaway, so ordering reads no extra blob and adds no LLM. A
+    belief corroborated across more net sessions, held with more confidence, is the most consequential to
+    review now; a thinly-/contested-but-still-mature one sinks. Deterministic, and the sort is STABLE, so
+    equal-importance takeaways keep their derivation order. (A richer roll-up of the seed events' salience
+    is the deferred upgrade — net×confidence is the signal already on the blob.)"""
+    conf = tk.get("confidence")
+    conf = conf if isinstance(conf, (int, float)) else 0.5
+    return dream.net_sessions(tk) * conf
+
+
+def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> bool:
+    """Does ANY cited span come from a PROJECT whose name contains `topic` (case-insensitive)? The
+    `--topic` queue filter (ADR-0022) — a takeaway/concept spans the sessions it cites, so it matches the
+    topic if any one of them does. Same lineage hop dream/glean use: `cleaned_hash` → raw
+    `origin_ref.project` (`blobstore.project_of`, one cached meta read per span, no LLM)."""
+    t = topic.lower()
+    for ev in evidence or []:
+        ch = ev.get("cleaned_hash") if isinstance(ev, dict) else None
+        if not ch:
+            continue
+        proj = blobstore.project_of(ch, root, cache)
+        if proj and t in proj.lower():
+            return True
+    return False
+
+
+def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
+            limit: int | None = None, topic: str | None = None) -> list[dict]:
+    """The review queue: every MATURE takeaway with no terminal decision and no live snooze, ORDERED by
+    IMPORTANCE descending and presented with its verified evidence. Derived from references — stores
+    nothing (ADR-0007).
 
     The MATURITY GATE is `dream.current_takeaways`: it returns only takeaways whose NET distinct-session
     entrenchment (support sessions MINUS contradicting sessions, ADR-0012) crosses `dream.MATURITY_SESSIONS`
@@ -125,16 +158,28 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> 
     gate — a one-off lesson costs review attention and risks promoting a false belief from a single moment
     — but it stays LIVE in the routing catalog so a later session can strengthen it across the bar; a once-
     mature takeaway that gets CONTESTED un-graduates back out of the queue (never deleted) and re-graduates
-    if corroboration returns (see `incubating`)."""
+    if corroboration returns (see `incubating`).
+
+    ORDERING + the operator knobs (ADR-0022): the queue surfaces in no order otherwise, so `importance`
+    (net entrenchment × confidence) sorts it DESCENDING — highest-leverage first. `--topic` filters to a
+    PROJECT (substring match over cited evidence); `--limit N` returns the top-N for a one-sitting review.
+    Filter + sort run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`) is paid
+    only for the survivors the human will actually see."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
-    out: list[dict] = []
+    cache: dict = {}
+    tks: list[dict] = []
     for tk in dream.current_takeaways(root):       # the maturity gate (sessions >= MATURITY_SESSIONS)
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
-        out.append(_present(tk, root, context_bytes=context_bytes))
-    return out
+        if topic is not None and not _evidence_in_topic(tk.get("evidence"), topic, root, cache):
+            continue                               # FOCUS: drop takeaways with no evidence from the topic project
+        tks.append(tk)
+    tks.sort(key=importance, reverse=True)         # IMPORTANCE descending; stable → ties keep derivation order
+    if limit is not None:
+        tks = tks[:limit]                          # the top-N for a one-sitting review (after the ordering)
+    return [_present(tk, root, context_bytes=context_bytes) for tk in tks]
 
 
 def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_SESSIONS) -> list[dict]:
@@ -348,16 +393,46 @@ def _present_proposal(proposal: dict, root: Path, *, context_bytes: int) -> dict
     }
 
 
-def pending_proposals(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> list[dict]:
-    """The SECOND review tier: the gardener's open structural-op proposals (`garden.open_proposals`), each
-    rendered for the human with its op + params + rationale and the CITED concepts' RE-VALIDATED evidence. The
-    rationale is UNTRUSTED (a proposer's justification, like a takeaway's `why`); the EVIDENCE is the ground
-    truth the trust chain carries to the reviewer (re-resolved via `resolve_evidence`, a stale span dropped).
-    The rich VIEW over the raw `garden.open_proposals` source. Distinct from the takeaway `pending` tier — a
-    parallel queue with its own accept/reject verbs."""
+def _proposal_in_topic(proposal: dict, topic: str, root: Path, cache: dict) -> bool:
+    """Does a structural-op proposal touch the `topic` PROJECT? It cites concepts, not events, so the hop
+    is one longer: each cited concept → its evidence spans → `cleaned_hash` → raw `origin_ref.project`
+    (`_evidence_in_topic`). True if ANY cited concept has evidence from a project matching the substring."""
+    from . import garden
+    for cid in proposal.get("concept_ids") or []:
+        blob = garden._concept_blob(cid, root) or {}
+        if _evidence_in_topic(blob.get("evidence"), topic, root, cache):
+            return True
+    return False
+
+
+def pending_proposals(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
+                      limit: int | None = None, topic: str | None = None) -> list[dict]:
+    """The SECOND review tier: the gardener's open structural-op proposals (`garden.open_proposals`), ORDERED
+    by STAKES descending and each rendered for the human with its op + params + rationale and the CITED
+    concepts' RE-VALIDATED evidence. The rationale is UNTRUSTED (a proposer's justification, like a takeaway's
+    `why`); the EVIDENCE is the ground truth the trust chain carries to the reviewer (re-resolved via
+    `resolve_evidence`, a stale span dropped). The rich VIEW over the raw `garden.open_proposals` source.
+    Distinct from the takeaway `pending` tier — a parallel queue with its own accept/reject verbs.
+
+    ORDERING + the operator knobs (ADR-0022): proposals carry `stakes` (the 3c-ii fuzzy gradient — how much
+    an op changes what concepts EXIST/ASSERT, `garden.op_stakes`), so the queue sorts by it DESCENDING —
+    the highest-leverage restructurings first. (The cluster's `tension` that DROVE a proposal is a propose-
+    time signal NOT carried on the proposal blob, so `stakes` is the on-proposal importance stand-in.)
+    `--topic` filters to a PROJECT (substring over the cited concepts' evidence); `--limit N` takes the
+    top-N. Filter + sort run on the raw proposals FIRST, so the per-concept evidence resolution is paid only
+    for the survivors."""
     from . import garden
     root = root or config.data_root()
-    return [_present_proposal(p, root, context_bytes=context_bytes) for p in garden.open_proposals(root)]
+    props = garden.open_proposals(root)
+    if topic is not None:
+        cache: dict = {}
+        props = [p for p in props if _proposal_in_topic(p, topic, root, cache)]
+    # stakes DESCENDING (a missing/non-numeric stakes sinks to 0.0); stable → ties keep open_proposals order.
+    props = sorted(props, key=lambda p: p.get("stakes") if isinstance(p.get("stakes"), (int, float)) else 0.0,
+                   reverse=True)
+    if limit is not None:
+        props = props[:limit]
+    return [_present_proposal(p, root, context_bytes=context_bytes) for p in props]
 
 
 def _apply_proposal(proposal: dict, *, root: Path, run_id: str, reviewer: str,
@@ -464,6 +539,10 @@ def main(argv=None) -> None:
     g.add_argument("--reject-proposal", metavar="PROPOSAL",
                    help="reject a structural-op proposal (NOT applied; suppresses re-surfacing)")
     ap.add_argument("--json", action="store_true", help="machine-readable output (the skill uses this)")
+    # the operator knobs (ADR-0022) — apply to --pending and --proposals: a PRIORITIZED, SCOPED subset.
+    ap.add_argument("--limit", type=int, metavar="N",
+                    help="review the top-N only (by importance for takeaways, stakes for proposals)")
+    ap.add_argument("--topic", help="filter the queue to a PROJECT whose name contains this substring")
     ap.add_argument("--split-parts",
                     help="a split accept's per-part EVIDENCE PARTITION: JSON [{title,statement,evidence}] "
                          "(the human's to choose — a queued split carries only title/statement)")
@@ -479,7 +558,8 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
 
     if args.pending:
-        q = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES)
+        q = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
+                    limit=args.limit, topic=args.topic)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
@@ -519,7 +599,8 @@ def main(argv=None) -> None:
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
               else "\n".join(f"  {c['id']}  {c.get('title', '')}" for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
-        q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES)
+        q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
+                              limit=args.limit, topic=args.topic)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:

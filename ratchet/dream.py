@@ -283,6 +283,20 @@ def working_set(root: Path | None = None, *, min_confidence: float = 0.0) -> lis
     return out
 
 
+def filter_by_topic(events: list[ResolvedEvent], topic: str, root: Path) -> list[ResolvedEvent]:
+    """PROCESSING FOCUS (`dream --topic`, ADR-0022): keep only events from a PROJECT whose name CONTAINS
+    `topic` (case-insensitive substring). The project is reached by the SAME lineage hop the stage already
+    walks for age/facets — event → `cleaned_hash` → raw `origin_ref.project` (`blobstore.project_of`,
+    one cached meta read per event, no LLM/content). An event whose project can't be resolved does NOT
+    match (focus NARROWS — an unknowable origin is excluded, not waved through). Default (no topic) skips
+    this entirely. Semantic-topic (focus by a concept TAG, not the source project) is the deferred richer
+    version — this is the cheap project/source substring."""
+    t = topic.lower()
+    cache: dict = {}
+    return [rv for rv in events
+            if (p := blobstore.project_of(rv.event.get("cleaned_hash"), root, cache)) and t in p.lower()]
+
+
 def _event_born_map(root: Path | None = None) -> dict[str, str | None]:
     """event_id → its blob's `fetched_at` (the recency stamp) — the AGE source for the `Aging` priority
     policy (ADR-0021): an event's age = `now() - born`. ONE scan over `latest_by_kind('event')` + a meta
@@ -962,7 +976,8 @@ class DreamBlock:
                  route_model: str = ROUTE_MODEL, synth_model: str = SYNTH_MODEL,
                  min_confidence: float = 0.0, drift_threshold: float = DRIFT_THRESHOLD,
                  maturity: int = MATURITY_SESSIONS, forget: bool = True,
-                 forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR) -> None:
+                 forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR,
+                 topic: str | None = None) -> None:
         self.complete_route = complete_route
         self.complete_synth = complete_synth
         self.route_model = route_model
@@ -970,6 +985,7 @@ class DreamBlock:
         self.min_confidence = min_confidence
         self.drift_threshold = drift_threshold
         self.maturity = maturity
+        self.topic = topic                             # PROCESSING FOCUS: consolidate only this project's events (ADR-0022)
         self.forget_on = forget
         self.forget_tau = forget_tau
         self.forget_floor = forget_floor
@@ -1010,6 +1026,8 @@ class DreamBlock:
         self._cat = catalog(root)
         self._cat_by_id = {t["id"]: t for t in self._cat}
         ws = working_set(root, min_confidence=self.min_confidence)
+        if self.topic is not None:                     # PROCESSING FOCUS: only this project's events (ADR-0022)
+            ws = filter_by_topic(ws, self.topic, root)
         self.n_events = len(ws)
         return ws
 
@@ -1124,7 +1142,7 @@ def run(complete_route: Completer, complete_synth: Completer, *, route_model: st
         synth_model: str = SYNTH_MODEL, min_confidence: float = 0.0,
         drift_threshold: float = DRIFT_THRESHOLD, maturity: int = MATURITY_SESSIONS,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
-        priority: block.PriorityStrategy | None = None,
+        priority: block.PriorityStrategy | None = None, topic: str | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> RunReport:
     """Consolidate the working set incrementally — a thin shim over `block.run(DreamBlock(...))` (mirrors
     v1's run/RunReport-wrapper pattern), so callers/CLI keep a stable surface. TWO separate injected
@@ -1132,7 +1150,7 @@ def run(complete_route: Completer, complete_synth: Completer, *, route_model: st
     (silent) so a setup helper doesn't spew per-event lines."""
     blk = DreamBlock(complete_route, complete_synth, route_model=route_model, synth_model=synth_model,
                      min_confidence=min_confidence, drift_threshold=drift_threshold, maturity=maturity,
-                     forget=forget)
+                     forget=forget, topic=topic)
     report = block.run(blk, max_usd=max_usd, limit=limit, root=root, priority=priority, progress=progress)
     return RunReport(report, blk)
 
@@ -1147,6 +1165,8 @@ def main(argv=None) -> None:
     ap.add_argument("--route-model", default=ROUTE_MODEL, help=f"router model (default: {ROUTE_MODEL})")
     ap.add_argument("--synth-model", default=SYNTH_MODEL, help=f"synthesis model (default: {SYNTH_MODEL})")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="ignore events below this glean confidence")
+    ap.add_argument("--topic", help="PROCESSING FOCUS: consolidate only events from a PROJECT/source whose "
+                    "name contains this substring (case-insensitive; semantic-tag topic is deferred)")
     ap.add_argument("--drift-threshold", type=float, default=DRIFT_THRESHOLD,
                     help="lexical drift above which a strengthen re-synthesizes the why")
     ap.add_argument("--maturity", type=int, default=MATURITY_SESSIONS,
@@ -1179,6 +1199,8 @@ def main(argv=None) -> None:
     if args.dry_run:                                # eyeball the queue + catalog before spending
         root = config.ensure_layout()
         ws = working_set(root, min_confidence=args.min_confidence)
+        if args.topic is not None:                     # mirror the real run's FOCUS so the preview can't lie about order
+            ws = filter_by_topic(ws, args.topic, root)
         born = _event_born_map(root) if args.priority == "aging" else {}   # only Aging needs the recency read
         ws = block.priority_strategy(args.priority).order(   # mirror the real run's POLICY (incl. age) so the
             ws, lambda rv: salience(rv.event),               # preview can't lie about order
@@ -1200,7 +1222,8 @@ def main(argv=None) -> None:
     report = run(complete_route, complete_synth, route_model=args.route_model, synth_model=args.synth_model,
                  min_confidence=args.min_confidence, drift_threshold=args.drift_threshold,
                  maturity=args.maturity, forget=not args.no_forget, max_usd=args.max_usd,
-                 limit=args.limit, priority=block.priority_strategy(args.priority), progress=progress)
+                 limit=args.limit, priority=block.priority_strategy(args.priority), topic=args.topic,
+                 progress=progress)
     if args.show:
         for t in report.takeaways:
             sup, rel = t["support"], t["relation"]["kind"]

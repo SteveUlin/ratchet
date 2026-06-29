@@ -310,10 +310,11 @@ class GleanBlock:
     finalize = block.no_finalize
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
-                 targets: list[str] | None = None) -> None:
+                 targets: list[str] | None = None, topic: str | None = None) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
+        self.topic = topic        # PROCESSING FOCUS: extract only this project's chunks (ADR-0022)
         self.params: tuple[tuple[str, str], ...] = (
             ("prompt_version", PROMPT_VERSION), ("model", model))
         # run-total tallies (instance-scoped; the Report stays uniform)
@@ -356,12 +357,22 @@ class GleanBlock:
         absence surfaces in `process` when it slices the cleaned bytes (→ FileNotFoundError → errored
         → retried), not here, so a missing blob is isolated per chunk, never a crashed enumeration."""
         self._root = root                         # capture the driver's root for age() (called during ordering)
+        # PROCESSING FOCUS (`glean --topic`, ADR-0022): keep only chunks whose source PROJECT contains the
+        # topic substring (case-insensitive), reached by the same `cleaned_hash` → raw `origin_ref.project`
+        # hop age() walks — one cached meta read per cleaned blob (chunks share a cleaned_hash), no LLM. A
+        # chunk whose project can't be resolved does NOT match (focus narrows). Default (None) → no filter.
+        topic = self.topic.lower() if self.topic else None
+        proj_cache: dict = {}
         for cs in self._target_chunksets(root, source_id):
             try:
                 chunks = chunk.load(cs, root)
             except FileNotFoundError:
                 continue                          # the chunkset blob itself is gone — nothing to enumerate
             for ch in chunks:
+                if topic is not None:
+                    proj = blobstore.project_of(ch.cleaned_hash, root, proj_cache)
+                    if not proj or topic not in proj.lower():
+                        continue
                 yield ChunkItem(chunk=ch, chunkset_hash=cs)
 
     def key(self, item: ChunkItem) -> str:
@@ -575,6 +586,8 @@ def main(argv=None) -> None:
     ap.add_argument("--all", action="store_true", help="every materialized chunkset in the store")
     ap.add_argument("--model", default=completer.DEFAULT_MODEL,
                     help=f"claude model (default: {completer.DEFAULT_MODEL})")
+    ap.add_argument("--topic", help="PROCESSING FOCUS: extract only chunks from a PROJECT/source whose name "
+                    "contains this substring (case-insensitive; semantic-tag topic is deferred)")
     ap.add_argument("--limit", type=int,
                     help="cap CHUNKS examined this run, before the done-skip (per-chunk now, ADR-0009)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this (between chunks)")
@@ -602,7 +615,7 @@ def main(argv=None) -> None:
         ap.error("give a chunkset hash, --source-id, or --all")
 
     complete = completer.make_cli_completer(args.model)
-    blk = GleanBlock(complete, model=args.model, targets=targets)
+    blk = GleanBlock(complete, model=args.model, targets=targets, topic=args.topic)
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
     progress = None if (args.quiet or args.dry_run) else block.Progress(
