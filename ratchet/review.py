@@ -115,19 +115,20 @@ def _is_out_of_queue(d: dict) -> bool:
     return False
 
 
-def importance(tk: dict) -> float:
+def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = None,
+               root: Path | None = None) -> float:
     """A takeaway's REVIEW IMPORTANCE — the signal `pending` orders DESCENDING so the human sees the
     highest-leverage calls first (the active-learning "spend your attention where it matters most"; ADR-0022).
-    NET entrenchment × confidence: `dream.net_sessions` (distinct SUPPORTING sessions minus CONTRADICTING
-    ones — the SAME signal the maturity gate graduates on, ADR-0012) scaled by the takeaway's own durability
-    `confidence`. Both already live ON the takeaway, so ordering reads no extra blob and adds no LLM. A
-    belief corroborated across more net sessions, held with more confidence, is the most consequential to
-    review now; a thinly-/contested-but-still-mature one sinks. Deterministic, and the sort is STABLE, so
-    equal-importance takeaways keep their derivation order. (A richer roll-up of the seed events' salience
-    is the deferred upgrade — net×confidence is the signal already on the blob.)"""
+    RECENCY-WEIGHTED net entrenchment × confidence: `dream.net_entrenchment` (support sessions minus
+    contradicting ones, each weighted by its valid-time — the SAME signal the maturity gate graduates on,
+    ADR-0012/0023) scaled by the takeaway's own durability `confidence`. So the queue's order respects
+    recency for free: a belief sustained by RECENT corroboration outranks one entrenched only by old
+    evidence. `valid_times` is built once in `pending` and threaded so the sort pays the transcript scan
+    ONCE, not per takeaway; absent, `net_entrenchment` recomputes it from `root`. Deterministic, and the
+    sort is STABLE, so equal-importance takeaways keep their derivation order."""
     conf = tk.get("confidence")
     conf = conf if isinstance(conf, (int, float)) else 0.5
-    return dream.net_sessions(tk) * conf
+    return dream.net_entrenchment(tk, now, valid_times=valid_times, root=root) * conf
 
 
 def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> bool:
@@ -167,34 +168,37 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     only for the survivors the human will actually see."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
+    valid_times = dream._session_valid_times(root) # session → valid-time, scanned ONCE for the gate + the sort
     cache: dict = {}
     tks: list[dict] = []
-    for tk in dream.current_takeaways(root):       # the maturity gate (sessions >= MATURITY_SESSIONS)
+    for tk in dream.current_takeaways(root, valid_times=valid_times):   # the recency-weighted maturity gate
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
         if topic is not None and not _evidence_in_topic(tk.get("evidence"), topic, root, cache):
             continue                               # FOCUS: drop takeaways with no evidence from the topic project
         tks.append(tk)
-    tks.sort(key=importance, reverse=True)         # IMPORTANCE descending; stable → ties keep derivation order
+    tks.sort(key=lambda t: importance(t, valid_times=valid_times), reverse=True)   # IMPORTANCE desc; stable ties
     if limit is not None:
         tks = tks[:limit]                          # the top-N for a one-sitting review (after the ordering)
     return [_present(tk, root, context_bytes=context_bytes) for tk in tks]
 
 
-def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_SESSIONS) -> list[dict]:
+def incubating(root: Path | None = None) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
     them), but not yet shown to the human gate. The counterpart to `pending`: `catalog` minus the mature
-    set, minus anything already terminally decided. The bar is NET distinct-session entrenchment (support
-    sessions minus contradicting sessions, ADR-0012), single-sourced in `dream.net_sessions`/
-    `current_takeaways` — so "below the bar" here means below the SAME net gate `pending` graduates on,
-    and a CONTESTED takeaway that un-graduated re-appears here (not silently lost). Surfaced so the
-    reviewer can SEE what is accruing toward review (and decide to act early) without it crowding — or
-    pre-biasing — the queue. A light projection (no evidence resolution); `needs` is the count of further
-    distinct sessions to cross the net bar."""
+    set, minus anything already terminally decided. The bar is the recency-WEIGHTED net entrenchment
+    (`dream.current_takeaways`/`net_entrenchment`, ADR-0023) — the SAME gate `pending` graduates on, so a
+    CONTESTED takeaway that un-graduated re-appears here (not silently lost). Surfaced so the reviewer can
+    SEE what is accruing toward review (and decide to act early) without it crowding — or pre-biasing — the
+    queue. A light projection (no evidence resolution); `needs` is the count of further distinct sessions to
+    cross the bar, the human-legible RAW count (`MATURITY_SESSIONS - net_sessions`) — an integer shortfall,
+    not the float weight (a takeaway held below the bar only by AGED evidence can read `needs 0` yet
+    incubate; the honest signal there is "needs RECENT corroboration", surfaced by the weighted gate itself)."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
-    mature = {t["id"] for t in dream.current_takeaways(root, min_sessions=min_sessions)}
+    valid_times = dream._session_valid_times(root)
+    mature = {t["id"] for t in dream.current_takeaways(root, valid_times=valid_times)}
     out: list[dict] = []
     for tk in dream.catalog(root):
         if tk["id"] in mature:
@@ -203,8 +207,12 @@ def incubating(root: Path | None = None, *, min_sessions: int = dream.MATURITY_S
         if d and _is_out_of_queue(d):              # accepted/rejected/etc. directly — no longer accruing
             continue
         sup = tk.get("support") or {"events": 0, "sessions": 0}
+        raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
         out.append({"takeaway_id": tk["id"], "title": tk.get("title", ""), "support": sup,
-                    "needs": max(0, min_sessions - dream.net_sessions(tk))})   # net bar, single-sourced
+                    "needs": raw_needs,                    # distinct-session shortfall on the RAW count, but …
+                    "needs_recent": raw_needs == 0})       # … if 0 yet incubating, it's held below the bar by
+                    # AGED evidence (recency-weighted gate, ADR-0023) — it needs RECENT corroboration, not more
+                    # old sessions; the flag stops the queue reading a misleading "needs 0".
     return out
 
 

@@ -236,10 +236,13 @@ seed_takeaway(id="C", sessions=2, confidence=0.8, root=R4)
 seed_takeaway(id="A", sessions=5, confidence=0.9, root=R4)
 seed_takeaway(id="D", sessions=3, confidence=0.4, root=R4)
 seed_takeaway(id="B", sessions=4, confidence=0.5, root=R4)
-# importance() is net_sessions × confidence, on the takeaway alone (no extra blob read).
-assert review.importance({"support": {"sessions": 5}, "confidence": 0.9}) == 4.5, "importance = net sessions × conf"
-assert review.importance({"support": {"sessions": 3}, "contradictions": {"sessions": 1}, "confidence": 1.0}) == 2.0, \
-    "a contradiction NETS the entrenchment down (ADR-0012)"
+# importance() is net_ENTRENCHMENT × confidence (ADR-0023): recency-weighted net distinct sessions. The
+# session ids here are not real transcripts → undated → weight 1.0 (fresh), so net_entrenchment == the raw
+# count and importance reduces to net_sessions × confidence (back-compat for fresh evidence).
+assert review.importance({"sessions_seen": ["a", "b", "c", "d", "e"], "support": {"sessions": 5},
+                          "confidence": 0.9}) == 4.5, "importance = net entrenchment × conf (fresh → count)"
+assert review.importance({"sessions_seen": ["a", "b", "c"], "contradiction_evidence": [{"session_id": "x"}],
+                          "confidence": 1.0}) == 2.0, "a contradiction NETS the entrenchment down (ADR-0012/0023)"
 
 ordered = [t["takeaway_id"] for t in review.pending(R4)]
 assert ordered == ["A", "B", "C", "D"], f"pending() is ORDERED by importance descending: {ordered}"

@@ -77,7 +77,21 @@ ROUTE_MODEL = "haiku"                    # the router is cheap + per-event → t
 SYNTH_MODEL = "sonnet"                   # synthesis is rare (new + drift) → afford a sharper model
 OUT_NOUN = "takeaways"                   # the per-event output noun the Progress bar/line shows
 
-MATURITY_SESSIONS = 2                    # the review bar: corroborated across this many DISTINCT sessions
+MATURITY_SESSIONS = 2                    # the raw distinct-session count kept for audit/back-compat (net_sessions)
+
+# Recency-trust weighting (ADR-0023): entrenchment is weighted by each evidence's VALID-TIME (the session's
+# date — when the conversation happened), so a months-long backfill of OLD conversations can neither
+# re-entrench a stale takeaway nor strongly overturn a current one. "Newer = higher trust", a continuous
+# curve, not a gate. Both dials are UNTUNED — they want a gold set, like every weight in dream.
+RECENCY_HALF_LIFE_DAYS = 180.0          # UNTUNED — "how fast does the world change": the age at which a piece
+                                        # of evidence is worth HALF a fresh one. A months scale (~6mo) so a
+                                        # year-old corroboration counts ~1/4, a 2-year-old ~1/16. One edit retunes.
+MATURITY_WEIGHT = 1.5                   # UNTUNED — the FLOAT review bar net_entrenchment must cross. Sits in the
+                                        # integer gap [MATURITY_SESSIONS-1, MATURITY_SESSIONS): with FRESH evidence
+                                        # (every weight ≈1, net_entrenchment integer-valued) `>= 1.5` is byte-
+                                        # identical to the old `net_sessions >= 2`, so today's graduations are
+                                        # preserved — yet it leaves headroom so mildly-aged-but-recent evidence
+                                        # still matures (2 sessions a few weeks old don't fall under the bar).
 DRIFT_THRESHOLD = 0.5                    # lexical drift above which a strengthen re-synthesizes the why
 FORGET_TAU = 4                           # dream cycles an event may sit un-consolidated before forget-eligible
 FORGET_SALIENCE_FLOOR = 0.05             # AND its salience must be below this (never age alone — ADR-0010 §6)
@@ -337,28 +351,107 @@ def catalog(root: Path | None = None) -> list[dict]:
 
 
 def net_sessions(tk: dict) -> int:
-    """NET distinct-session entrenchment (ADR-0012): supporting distinct sessions MINUS contradicting
-    distinct sessions. The SINGLE SOURCE of the demotion rule — `current_takeaways` (and so review's
-    `pending`/`incubating`, which ride it) gate on this, never on a duplicated formula. Read defensively:
-    a dream/2 blob with no `contradictions` field reads as 0, so net == support and behaviour is
-    identical to before any contradiction arrives. NO clamp: net may go NEGATIVE (a strongly-contested
-    takeaway) — it only ever feeds a `>=` gate, so negative is just deep quarantine (and `incubating`'s
-    `needs` shortfall may then be large — intended)."""
+    """NET distinct-session entrenchment, the RAW INTEGER COUNT (ADR-0012): supporting distinct sessions
+    MINUS contradicting distinct sessions. Kept for AUDIT / back-compat and as the human-legible "sessions
+    to go" signal (`incubating.needs`); the maturity GATE itself now reads the recency-WEIGHTED
+    `net_entrenchment` (ADR-0023), which reduces to this count when all evidence is fresh. Read defensively:
+    a dream/2 blob with no `contradictions` field reads as 0, so net == support and behaviour is identical
+    to before any contradiction arrives. NO clamp: net may go NEGATIVE (a strongly-contested takeaway)."""
     sup = (tk.get("support") or {}).get("sessions", 0)
     con = (tk.get("contradictions") or {}).get("sessions", 0)
     return sup - con
 
 
-def current_takeaways(root: Path | None = None, *, min_sessions: int = MATURITY_SESSIONS) -> list[dict]:
+def recency_weight(valid_time: str | None, now: str | None = None) -> float:
+    """The recency TRUST of ONE piece of evidence, by its VALID-TIME age (ADR-0023): exponential decay,
+    `0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)` — weight 1.0 at age 0, 0.5 at one half-life, halving every
+    half-life thereafter and → 0 as the evidence recedes. "Newer = higher trust", a smooth curve, not a
+    cliff. A missing/unparseable valid-time → 1.0: `config.age_days` degrades a missing stamp to 0.0 age →
+    weight 1.0, so we treat undateable evidence as FRESH — RECALL-SAFE (never silently DISCOUNT evidence we
+    can't date; the costly error is dropping a real learning). `now` is the reference instant (default real
+    now); net_entrenchment pins one `now` and threads it so every session decays against the same clock."""
+    return 0.5 ** (config.age_days(valid_time, now=now) / RECENCY_HALF_LIFE_DAYS)
+
+
+def _session_valid_times(root: Path | None = None) -> dict[str, str | None]:
+    """session_id → its raw transcript's VALID-TIME — `origin_ref.mtime`, when the conversation ACTUALLY
+    happened (the session's date), NOT when ratchet ingested it (`fetched_at`). The valid-time/transaction-
+    time split is the whole point: a months-late backfill has a recent `fetched_at` but an OLD valid-time,
+    and entrenchment must weight by the latter (ADR-0023).
+
+    RECOMPUTE-ON-READ in ONE scan over the transcript metas (ADR-0013 ethos — never stored on the takeaway):
+    a takeaway already lists its support/contradiction SESSION IDS (`sessions_seen`/`contradiction_evidence`),
+    so the dates recompute from those exactly like `concepts._cleaned_facets` recompute facets from evidence
+    — no date field to desync. The session id IS the raw transcript's `source_id`; a transcript appended-to
+    over time has multiple versions, so keep the LATEST version's mtime (most recent session activity, the
+    same recency fold `latest_version` does). A session with no transcript / no mtime → None → weight 1.0
+    (fresh) downstream. Built ONCE per gate pass and threaded into `net_entrenchment` so the scan is paid
+    once, not per takeaway."""
+    root = root or config.data_root()
+    best: dict[str, tuple[tuple[str, str], str | None]] = {}
+    for m in blobstore.iter_meta(root):
+        if m.get("kind", "raw") != "raw" or m.get("source_kind") != "transcript":
+            continue
+        sid = m.get("source_id")
+        if not sid:
+            continue
+        key = (m.get("fetched_at", ""), m.get("content_hash", ""))     # the latest-version recency fold
+        if sid not in best or key > best[sid][0]:
+            best[sid] = (key, (m.get("origin_ref") or {}).get("mtime"))
+    return {sid: vt for sid, (key, vt) in best.items()}
+
+
+def net_entrenchment(tk: dict, now: str | None = None, *, valid_times: dict | None = None,
+                     root: Path | None = None) -> float:
+    """The RECENCY-WEIGHTED net entrenchment the maturity gate now reads (ADR-0023) — the recency-aware
+    replacement for `net_sessions` AT THE GATE. Each supporting DISTINCT session contributes
+    `recency_weight(its valid-time)`, each contradicting DISTINCT session SUBTRACTS the same, all evaluated
+    at one pinned `now`:
+
+        Σ recency_weight(valid_time(s)) over support sessions  −  Σ over contradiction sessions
+
+    So recent corroboration matures a takeaway while OLD-only corroboration decays below the bar (a stale
+    backfill can't re-entrench), and a RECENT contradiction subtracts hard while a years-old one barely
+    moves (a stale backfill can't overturn a current belief). The self-sorting consequence: a still-true
+    preference keeps getting RE-LIVED — fresh evidence sustains its weight — while a moved-on fact simply
+    stops being re-evidenced and fades on its own, so no timeless-vs-changing classification is needed.
+
+    Reads the session-ID LISTS (`sessions_seen`; `contradiction_evidence[].session_id`) — the same ground
+    truth `support.sessions`/`_contradiction_stats` count — so with FRESH evidence (every weight ≈1) this
+    REDUCES to `net_sessions` as a float, and the gate behaves exactly as today. `net_sessions` (the raw
+    int) is kept for audit/back-compat. `valid_times` is built once per gate pass and threaded in; absent,
+    it recomputes from `root`. `now` is pinned ONCE (default real now) so every session decays against the
+    same reference (deterministic when a test injects it)."""
+    now = now or config.now()
+    if valid_times is None:
+        valid_times = _session_valid_times(root)
+    sup = {s for s in (tk.get("sessions_seen") or []) if s}
+    con = {e.get("session_id") for e in (tk.get("contradiction_evidence") or []) if e.get("session_id")}
+    sw = sum(recency_weight(valid_times.get(s), now) for s in sup)
+    cw = sum(recency_weight(valid_times.get(s), now) for s in con)
+    return sw - cw
+
+
+def current_takeaways(root: Path | None = None, *, min_weight: float = MATURITY_WEIGHT,
+                      now: str | None = None, valid_times: dict | None = None) -> list[dict]:
     """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways by
-    NET distinct-session entrenchment (`net_sessions >= min_sessions` — support sessions minus contradicting
-    sessions, ADR-0012). `review.pending()` calls this with the default bar, so only takeaways corroborated
-    across that many DISTINCT sessions NET of contradictions reach the human gate; incubating (and CONTESTED)
-    ones stay live (routable via `catalog()`) but invisible to review. A strongly-corroborated takeaway
-    survives a lone contradiction; a contested one un-graduates yet is never retired — it re-graduates if
-    corroboration returns. This REPLACES v1's supersede-conditioned current_takeaways — same name/return
-    type, so review.py is untouched."""
-    return [t for t in catalog(root) if net_sessions(t) >= min_sessions]
+    RECENCY-WEIGHTED net entrenchment (`net_entrenchment >= min_weight`, ADR-0023 — the float that weights
+    each support/contradiction session by its valid-time, superseding the raw `net_sessions` count at the
+    gate, ADR-0012). `review.pending()` calls this with the default bar, so only takeaways corroborated
+    across enough DISTINCT, RECENT-ENOUGH sessions NET of contradictions reach the human gate; incubating
+    (and CONTESTED) ones stay live (routable via `catalog()`) but invisible to review. A strongly-,
+    recently-corroborated takeaway survives a lone (or aged) contradiction; a contested one un-graduates yet
+    is never retired — it re-graduates if RECENT corroboration returns. A months-old backfill can neither
+    re-mature a stale takeaway (its weight decayed below the bar) nor strongly overturn a current one. With
+    FRESH evidence `net_entrenchment == net_sessions`, so this graduates exactly the takeaways the old
+    `net_sessions >= MATURITY_SESSIONS` gate did. Same name/return type — review.py rides it unchanged.
+
+    `valid_times` (built once, threaded) and `now` (a pinned instant) make the scan-once + deterministic
+    properties explicit; absent, both default — one transcript scan + real now."""
+    root = root or config.data_root()
+    if valid_times is None:
+        valid_times = _session_valid_times(root)
+    return [t for t in catalog(root) if net_entrenchment(t, now, valid_times=valid_times) >= min_weight]
 
 
 def contradicted_takeaways(root: Path | None = None) -> list[dict]:
@@ -975,7 +1068,7 @@ class DreamBlock:
     def __init__(self, complete_route: Completer, complete_synth: Completer, *,
                  route_model: str = ROUTE_MODEL, synth_model: str = SYNTH_MODEL,
                  min_confidence: float = 0.0, drift_threshold: float = DRIFT_THRESHOLD,
-                 maturity: int = MATURITY_SESSIONS, forget: bool = True,
+                 maturity: float = MATURITY_WEIGHT, forget: bool = True,
                  forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR,
                  topic: str | None = None) -> None:
         self.complete_route = complete_route
@@ -1140,7 +1233,7 @@ class RunReport:
 
 def run(complete_route: Completer, complete_synth: Completer, *, route_model: str = ROUTE_MODEL,
         synth_model: str = SYNTH_MODEL, min_confidence: float = 0.0,
-        drift_threshold: float = DRIFT_THRESHOLD, maturity: int = MATURITY_SESSIONS,
+        drift_threshold: float = DRIFT_THRESHOLD, maturity: float = MATURITY_WEIGHT,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None, topic: str | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> RunReport:
@@ -1169,8 +1262,9 @@ def main(argv=None) -> None:
                     "name contains this substring (case-insensitive; semantic-tag topic is deferred)")
     ap.add_argument("--drift-threshold", type=float, default=DRIFT_THRESHOLD,
                     help="lexical drift above which a strengthen re-synthesizes the why")
-    ap.add_argument("--maturity", type=int, default=MATURITY_SESSIONS,
-                    help="distinct-session bar a takeaway must cross to reach review")
+    ap.add_argument("--maturity", type=float, default=MATURITY_WEIGHT,
+                    help="recency-weighted net-entrenchment bar a takeaway must cross to reach review "
+                         "(net_entrenchment >= this; ~MATURITY_SESSIONS for fresh evidence)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
     ap.add_argument("--limit", type=int, help="cap events examined this run (the salience-ordered top)")
     ap.add_argument("--no-forget", action="store_true", help="skip the straggler-eviction (forget) pass")
@@ -1206,7 +1300,7 @@ def main(argv=None) -> None:
             ws, lambda rv: salience(rv.event),               # preview can't lie about order
             lambda rv: config.age_days(born.get(rv.id)))
         cat = catalog(root)
-        mature = current_takeaways(root, min_sessions=args.maturity)
+        mature = current_takeaways(root, min_weight=args.maturity)
         print(f"{len(ws)} un-consolidated events ({args.priority}-ordered) · catalog {len(cat)} takeaways "
               f"({len(mature)} mature):")
         for rv in ws[:40]:

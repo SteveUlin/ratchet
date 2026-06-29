@@ -16,14 +16,23 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def age_days(stamp: str | None) -> float:
-    """Wall-clock DAYS (fractional) between an ISO `fetched_at` stamp and now — the wait-time AGE the
-    `Aging` priority policy adds to a backlogged item's score (`effective = score + λ·age`, ADR-0021). The
-    blobstore stamps every version's recency on `meta.fetched_at`; this turns it into "how long has this
-    item waited". Degrades to 0.0 ("treat as FRESH") on a missing or unparseable stamp — a recency we can't
-    read must NEVER crash the ordering, and 0.0 just leaves that item un-boosted (the safe direction). A
-    naive stamp is read as UTC (every producer stamps `now()`, which is tz-aware, so this only guards a
-    legacy/hand-written body); a future-dated stamp (clock skew) clamps to 0.0 — negative age is meaningless."""
+def age_days(stamp: str | None, now: str | None = None) -> float:
+    """Wall-clock DAYS (fractional) between an ISO `stamp` and a reference instant — the wait-time AGE the
+    `Aging` priority policy adds to a backlogged item's score (`effective = score + λ·age`, ADR-0021), and
+    the VALID-TIME age the recency-trust weighting decays evidence by (ADR-0023). The blobstore stamps every
+    version's recency on `meta.fetched_at`; this turns a stamp into "how long ago".
+
+    `now` (ISO) injects the reference instant; default (None) is real wall-clock UTC. Recency weighting
+    passes a FIXED `now` so its decay is deterministic and testable — every piece of evidence on one
+    takeaway decays against the same reference, and a test never ages with real time. An unparseable/empty
+    `now` falls back to real now (the same recall-safe degrade as a missing stamp), so injecting it can
+    never crash the read.
+
+    Degrades to 0.0 ("treat as FRESH") on a missing or unparseable `stamp` — a recency we can't read must
+    NEVER crash the ordering/gate, and 0.0 just leaves that item un-boosted / un-discounted (the safe
+    direction). A naive stamp is read as UTC (every producer stamps `now()`, which is tz-aware, so this only
+    guards a legacy/hand-written body); a future-dated stamp (clock skew) clamps to 0.0 — negative age is
+    meaningless."""
     if not stamp:
         return 0.0
     try:
@@ -32,7 +41,17 @@ def age_days(stamp: str | None) -> float:
         return 0.0
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
-    days = (datetime.now(timezone.utc) - then).total_seconds() / 86400.0
+    ref: datetime | None = None
+    if now:
+        try:
+            ref = datetime.fromisoformat(now)
+            if ref.tzinfo is None:
+                ref = ref.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            ref = None
+    if ref is None:
+        ref = datetime.now(timezone.utc)
+    days = (ref - then).total_seconds() / 86400.0
     return days if days > 0.0 else 0.0
 
 
