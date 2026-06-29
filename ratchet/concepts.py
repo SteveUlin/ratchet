@@ -101,6 +101,21 @@ def session_facts(spine: list[dict]) -> dict:
     return {"files_edited": sorted(files), "tools": sorted(tools)}
 
 
+def _repo_label(origin: dict) -> str | None:
+    """The repo facet — a CLEAN repo name. Prefer the transcript's `cwd` basename (`ratchet` from
+    `/home/sulin/ratchet`): unambiguous, and what a human calls the repo. Fall back to the datastore
+    project-dir slug (`-home-sulin-ratchet`) only when no cwd was recorded — that slug is a lossy
+    `/`→`-` encoding that drags the home path into a rule's `When working in …:` trigger. The value is
+    the same for every blob in one repo, so clustering (shares-repo) is unchanged; only the label reads
+    better (and `tap` already captures cwd, so no backfill — old blobs just keep the slug fallback)."""
+    cwd = origin.get("cwd")
+    if cwd:
+        name = Path(cwd).name
+        if name:
+            return name
+    return origin.get("project")
+
+
 def _cleaned_facets(cleaned_hash: str, root: Path, cache: dict | None = None) -> dict | None:
     """The provenance facets of ONE cleaned blob — `{repo, session, files, tools, time}` — RECOMPUTED
     from the raw ground truth, NEVER read from a stored sidecar. One `derived_from` hop reaches the raw
@@ -122,7 +137,7 @@ def _cleaned_facets(cleaned_hash: str, root: Path, cache: dict | None = None) ->
             origin = m.get("origin_ref") or {}
             sf = session_facts(active_path(parse(blobstore.get(raw, root))))
             facets = {
-                "repo": origin.get("project"),
+                "repo": _repo_label(origin),
                 "session": origin.get("session_id") or m.get("source_id"),
                 "files": set(sf["files_edited"]),
                 "tools": set(sf["tools"]),

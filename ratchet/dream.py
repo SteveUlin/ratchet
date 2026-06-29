@@ -101,6 +101,24 @@ TITLE_MAX = 80
 WHY_MAX = 280
 NOTE_MAX = 160
 
+
+def _clip(text: str, limit: int = WHY_MAX) -> str:
+    """Length-cap a synthesized field WITHOUT chopping mid-word. A hard `[:limit]` once shipped a rule
+    ending `…evaluates the s` — the why becomes the concept STATEMENT becomes the CLAUDE.md rule, so a
+    guillotined sentence lands verbatim in a human's config. Prefer the last SENTENCE boundary that fits
+    (a complete thought, no ellipsis); else the last WORD boundary + `…` (clearly abbreviated, never
+    broken). Stays within `limit`."""
+    t = text.strip()
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end >= limit // 2:                          # a real sentence break, not a stray early period
+        return cut[:end + 1].rstrip()
+    sp = cut.rfind(" ")
+    base = cut[:sp] if sp >= limit // 2 else cut[:limit - 1]
+    return base.rstrip() + "…"
+
 # Salience weights: surprise highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
 W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
 
@@ -717,7 +735,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest:
     parsed = completer.parse_json_object(comp.text) or {}
     if not parsed or parsed.get("drop"):
         return None, cost
-    why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+    why = _clip(str(parsed.get("why", "")))
     if not why:                                    # no usable principle → treat as noise
         return None, cost
     tk = {
@@ -784,7 +802,7 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
         comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concept_digest))
         cost = completer.cost_of(comp)
         parsed = completer.parse_json_object(comp.text) or {}
-        why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+        why = _clip(str(parsed.get("why", "")))
         if why:
             nv["why"] = why
             nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
@@ -1034,7 +1052,7 @@ def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, mo
         comp = complete_synth(SYNTH_SYSTEM, user)
         cost = completer.cost_of(comp)
         parsed = completer.parse_json_object(comp.text) or {}
-        why = str(parsed.get("why", "")).strip()[:WHY_MAX]
+        why = _clip(str(parsed.get("why", "")))
         if why:
             nv["why"] = why
             nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
