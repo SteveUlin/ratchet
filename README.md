@@ -63,6 +63,9 @@ tap → raw → weave → cleaned → chunk → chunkset → glean → events �
   `garden` (the gardener's managed-tags pass over concepts — ADR-0014), and `completer` (the injected
   LLM seam).
 - `.claude/skills/ratchet-review/` — the `/ratchet-review` skill (the human gate's interaction).
+- `.claude/skills/ratchet-generate/` — the `/ratchet-generate` skill: craft the CLAUDE.md projection
+  with Claude (tighten wording, group by theme, fit your voice) over the mechanical `generate` CLI, every
+  rule kept faithful to its concept's statement + evidence.
 - Every batch stage (tap/weave/chunk/glean/dream) is a **Block**: same `--all`/`--source-id`/`--max-usd`/
   `--limit`/`--dry-run`/`--quiet` CLI, same streaming per-item progress, same per-item commit + resume.
 - `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.

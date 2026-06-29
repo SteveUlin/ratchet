@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 from pathlib import Path
 
 from . import concepts, config
@@ -133,6 +134,37 @@ def project(root: Path | None = None) -> str:
     return f"{START}\n{_render_body(ctx)}\n{END}"
 
 
+# --- the faithfulness context: each projected concept's statement + verified evidence -------------
+
+def projected_concepts(root: Path | None = None) -> list[dict]:
+    """The FAITHFULNESS context for the projection — each VALID concept (the ones the region renders),
+    paired with the verified EVIDENCE behind its statement. Read-only, NO LLM: `valid_concepts` enriched
+    with the `concepts.digest_context` facets (`repos`/`tags` — the grouping + repo-trigger inputs) and
+    `review.resolve_evidence` (spans RE-VALIDATED, a stale one dropped — the same verified quotes the
+    review gate is served). The `/ratchet-generate` skill reads this to keep a re-worded rule TRUE to its
+    source: the region's `<!-- c-id -->` marker maps to an `id` here, whose `statement` is the verbatim
+    text the mechanical render uses and whose `evidence` quotes are the trust chain reaching the
+    projection. Sorted by id, so the dump is order-stable like every other ratchet view.
+
+    `review` is imported FUNCTION-LOCALLY — review doesn't import generate (no cycle), but the lazy import
+    matches the convention used for the other cross-module reads and keeps the module's import graph flat."""
+    from . import review                         # function-local: review serves the canonical evidence resolver
+    root = root or config.data_root()
+    by_node = concepts.digest_context(root)["by_node"]
+    out: list[dict] = []
+    for c in sorted(review.valid_concepts(root), key=lambda c: c["id"]):
+        facets = by_node.get(c["id"], {}).get("facets", {})
+        out.append({
+            "id": c["id"],
+            "title": c.get("title", ""),
+            "statement": c.get("statement", ""),
+            "repos": facets.get("repos") or [],
+            "tags": facets.get("tags") or [],
+            "evidence": review.resolve_evidence(c, root),   # pointers → re-validated verbatim quotes
+        })
+    return out
+
+
 # --- the marked region: locate, splice (refresh-in-place), diff -----------------------------------
 
 def _region_span(text: str) -> tuple[int, int] | None:
@@ -214,6 +246,9 @@ def main(argv=None) -> None:
                    help="unified diff of the proposed region vs the target's current one (review before --apply)")
     g.add_argument("--apply", action="store_true",
                    help="write the projection into the target's marked region (refresh-in-place; human content preserved)")
+    g.add_argument("--concepts", action="store_true",
+                   help="JSON: each projected concept's statement + re-validated evidence (the faithfulness "
+                        "context the /ratchet-generate skill reads; read-only, no LLM)")
     ap.add_argument("--target",
                     help="the file whose ratchet:generated region to manage (default: a STAGED "
                          "$RATCHET_DATA_DIR/generated/CLAUDE.md that never clobbers a real CLAUDE.md)")
@@ -226,6 +261,8 @@ def main(argv=None) -> None:
             res = apply(root, target=target)
             print(f"{res['action']} ratchet region in {res['target']}"
                   + ("" if res["changed"] else " (no change — byte-identical)"))
+        elif args.concepts:
+            print(json.dumps(projected_concepts(root), ensure_ascii=False, indent=2))
         elif args.diff:
             d = diff(root, target=target)
             tgt = target if target is not None else default_target(root)
