@@ -66,6 +66,19 @@ class RecordingBlock:
 
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
+    age = block.no_age                               # the SECOND signal: 0.0 (fresh) → Aging is inert here
+
+
+class AgingRecordingBlock(RecordingBlock):
+    """RecordingBlock + a controlled per-item AGE (in DAYS) — the second signal the `Aging` policy reads.
+    Everything else (enumeration, the score signal, the order recording) is the base block's, so the SAME
+    driver path exercises Aging end to end: `effective = score + λ·age` decides the order process() sees."""
+    def __init__(self, items, scores, ages):
+        super().__init__(items, scores)
+        self._ages = ages
+
+    def age(self, item):
+        return self._ages[item]
 
 
 def _diff(expected, actual):
@@ -87,6 +100,15 @@ def run_order(strategy, items, scores):
     """Drive the recording block over a fresh root with `strategy`, return the recorded process() order."""
     blk = RecordingBlock(items, scores)
     block.run(blk, root=fresh_root("run"), priority=strategy, progress=None)
+    return blk.processed_keys
+
+
+def run_order_aged(strategy, items, scores, ages):
+    """Drive an AgingRecordingBlock (scores AND ages) through the real driver, return the process() order —
+    so the Aging assertions exercise `priority.order(items, block.priority, block.age)` end to end, not the
+    strategy in isolation."""
+    blk = AgingRecordingBlock(items, scores, ages)
+    block.run(blk, root=fresh_root("aged"), priority=strategy, progress=None)
     return blk.processed_keys
 
 
@@ -153,5 +175,80 @@ else:
 print("OK §4 — PriorityStrategy is a structural Protocol; the registry is fresh-per-call; unknown name raises")
 
 
+# === 5. AGING: the anti-starvation policy — effective = score + λ·age (ADR-0021) ======================
+# The whole point: a fresh HIGH-score item and an old LOW-score one. Greedy ALWAYS runs the high scorer
+# first (it ignores age) — so under a persistent --limit/--max-usd the low scorer never surfaces (starves).
+# Aging lifts the old one once λ·age covers the score gap, bounding its worst-case latency. We pin the
+# CROSSOVER precisely off the live LAMBDA so the test survives retuning: with a score gap G, the old item
+# overtakes at age = G/λ — assert it stays sunk just BELOW and surfaces just ABOVE.
+LAMBDA = block.AGING_LAMBDA
+GAP = 2.0                                            # fresh_hi score 3.0 − old_lo score 1.0
+ag_items = ["fresh_hi", "old_lo"]                    # enumeration order: high scorer first
+ag_scores = {"fresh_hi": 3.0, "old_lo": 1.0}
+crossover = GAP / LAMBDA                             # the age (days) at which old_lo's λ·age == the score gap
+
+# Greedy IGNORES age — high scorer first no matter how old the low one is (the starvation Aging fixes).
+assert run_order_aged(block.Greedy(), ag_items, ag_scores, {"fresh_hi": 0.0, "old_lo": 10 * crossover}) \
+    == ["fresh_hi", "old_lo"], "Greedy must order by score alone, ignoring age"
+
+# Aging, age JUST BELOW the crossover → old_lo still sunk (eff 1+λ(cross−1) < 3.0): greedy-like order.
+below = run_order_aged(block.Aging(), ag_items, ag_scores,
+                       {"fresh_hi": 0.0, "old_lo": crossover - 1.0})
+assert below == ["fresh_hi", "old_lo"], f"below the crossover the old item must stay sunk: {below}"
+
+# Aging, age JUST ABOVE the crossover → old_lo's λ·age overtakes the score gap → it surfaces FIRST.
+above = run_order_aged(block.Aging(), ag_items, ag_scores,
+                       {"fresh_hi": 0.0, "old_lo": crossover + 1.0})
+assert above == ["old_lo", "fresh_hi"], \
+    f"once λ·age overtakes the score gap the old low-score item must surface first: {above}"
+print(f"OK §5a — Aging crossover: old low-score item (score 1.0) overtakes a fresh high-score one "
+      f"(score 3.0) at age {crossover:.0f}d (λ={LAMBDA}); sunk at {crossover-1:.0f}d, surfaces at {crossover+1:.0f}d")
+
+# All-equal ages == Greedy ordering: age adds a UNIFORM constant to every effective score → no reorder.
+eq_ages = {"fresh_hi": 123.0, "old_lo": 123.0}
+assert run_order_aged(block.Aging(), ag_items, ag_scores, eq_ages) \
+    == run_order(block.Greedy(), ag_items, ag_scores) == ["fresh_hi", "old_lo"], \
+    "Aging with all-equal ages must reproduce Greedy ordering (a uniform age constant cannot reorder)"
+
+# No age signal (the no_age default → 0.0 everywhere) makes Aging INERT == Greedy, through the real driver.
+inert = RecordingBlock(rep_items, rep_scores)        # base block: age = no_age (0.0)
+block.run(inert, root=fresh_root("aging-inert"), priority=block.Aging(), progress=None)
+assert inert.processed_keys == ["hi", "mid", "lo"], \
+    f"Aging on a stage with no age signal must collapse to Greedy: {inert.processed_keys}"
+print("OK §5b — equal ages (and the no_age default) collapse Aging to Greedy: a uniform age cannot reorder")
+
+# DETERMINISTIC + ORDER-STABLE: equal EFFECTIVE priority (score+λ·age) keeps enumeration order, repeatably.
+# t1 (score 2.0, age 0) and t2 (score 1.0, age 1/λ) tie at effective 2.0; t1 enumerated first must stay first.
+stab_items = ["t1", "t2", "t3"]
+stab_scores = {"t1": 2.0, "t2": 1.0, "t3": 0.0}
+stab_ages = {"t1": 0.0, "t2": 1.0 / LAMBDA, "t3": 0.0}   # t1,t2 effective 2.0; t3 effective 0.0
+first = run_order_aged(block.Aging(), stab_items, stab_scores, stab_ages)
+again = run_order_aged(block.Aging(), stab_items, stab_scores, stab_ages)
+assert first == again == ["t1", "t2", "t3"], \
+    f"Aging must be deterministic and stable on an effective tie (enumeration order preserved): {first} / {again}"
+print("OK §5c — Aging is deterministic and order-stable: an effective-priority tie keeps enumeration order")
+
+
+# === 6. SELECTION: --priority aging by code and by the CLI registry reach the same order ===============
+by_code_ag = run_order_aged(block.Aging(), ag_items, ag_scores,
+                            {"fresh_hi": 0.0, "old_lo": crossover + 1.0})
+by_name_ag = run_order_aged(block.priority_strategy("aging"), ag_items, ag_scores,
+                            {"fresh_hi": 0.0, "old_lo": crossover + 1.0})
+assert by_code_ag == by_name_ag == ["old_lo", "fresh_hi"], \
+    f"aging by code != by name: {by_code_ag} / {by_name_ag}"
+assert isinstance(block.priority_strategy("aging"), block.PriorityStrategy), "Aging satisfies the Protocol"
+# the CLI surface: `aging` is in every stage's `--priority` choices (choices=sorted(PRIORITY_STRATEGIES)).
+assert "aging" in block.PRIORITY_STRATEGIES and "aging" in sorted(block.PRIORITY_STRATEGIES), \
+    "aging must be registered so every stage's --priority offers it"
+
+# Exercise a real stage CLI end-to-end: `dream --dry-run --priority aging` parses the choice, resolves the
+# strategy, and runs the aging-aware dry-run preview (over an empty store → 0 events, no LLM, no crash).
+import contextlib, io  # noqa: E402
+from ratchet import dream  # noqa: E402
+with contextlib.redirect_stdout(io.StringIO()):
+    dream.main(["--dry-run", "--priority", "aging"])   # argparse choices accept it; the dry-run age path runs
+print("OK §6 — --priority aging selectable by code == by name; registered for every CLI; dream --dry-run runs it")
+
+
 print("\nOK — priority policy: golden order per strategy, byte-identical greedy default, "
-      "code/name/default selection agree, structural Protocol seam")
+      "code/name/default selection agree, structural Protocol seam, Aging anti-starvation crossover")

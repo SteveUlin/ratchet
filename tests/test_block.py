@@ -90,6 +90,7 @@ class FakeBlock:
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
     priority = block.no_priority                       # default 0.0 → stable sort preserves order
+    age = block.no_age                                 # default 0.0 → Aging inert (the seam's second signal)
 
 
 def fresh_root(prefix):
@@ -284,6 +285,7 @@ class FinalizeBlock:
 
     marker_extra = block.no_marker_extra
     priority = block.no_priority
+    age = block.no_age                                 # default 0.0 → Aging inert (the seam's second signal)
 
 r6 = fresh_root("finalize")
 fb = FinalizeBlock(["c1", "c2", "c3"], cost=0.0)

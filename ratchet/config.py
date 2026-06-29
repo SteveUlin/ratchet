@@ -16,6 +16,26 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def age_days(stamp: str | None) -> float:
+    """Wall-clock DAYS (fractional) between an ISO `fetched_at` stamp and now — the wait-time AGE the
+    `Aging` priority policy adds to a backlogged item's score (`effective = score + λ·age`, ADR-0021). The
+    blobstore stamps every version's recency on `meta.fetched_at`; this turns it into "how long has this
+    item waited". Degrades to 0.0 ("treat as FRESH") on a missing or unparseable stamp — a recency we can't
+    read must NEVER crash the ordering, and 0.0 just leaves that item un-boosted (the safe direction). A
+    naive stamp is read as UTC (every producer stamps `now()`, which is tz-aware, so this only guards a
+    legacy/hand-written body); a future-dated stamp (clock skew) clamps to 0.0 — negative age is meaningless."""
+    if not stamp:
+        return 0.0
+    try:
+        then = datetime.fromisoformat(stamp)
+    except (ValueError, TypeError):
+        return 0.0
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    days = (datetime.now(timezone.utc) - then).total_seconds() / 86400.0
+    return days if days > 0.0 else 0.0
+
+
 def run_id() -> str:
     """A unique, recency-sortable id per producer run: timestamp + pid + a ZERO-PADDED process-local
     counter + a small RANDOM suffix. Every part earns its place: `strftime` is only second-precision,

@@ -34,6 +34,10 @@ from . import blobstore, config
 
 Item = Any   # opaque to the driver — only the block's key()/process() interpret it
 ScoreOf = Callable[[Item], float]   # a stage's `priority` signal fn, handed to a PriorityStrategy
+AgeOf = Callable[[Item], float]     # a stage's `age` signal fn — the SECOND per-item scalar (how long an
+                                    # item has waited un-processed) Aging needs, symmetric to ScoreOf. The
+                                    # driver hands it alongside score_of; non-Aging strategies ignore it
+                                    # and the default `no_age` (0.0) makes aging inert (ADR-0011/0021).
 
 
 @runtime_checkable
@@ -80,6 +84,17 @@ class Block(Protocol):
         salience, glean by pre-LLM structural cues."""
         ...
 
+    def age(self, item: Item) -> float:
+        """The item's AGE — how long it has waited un-processed, the SECOND per-item signal the `Aging`
+        POLICY needs (ADR-0021). Symmetric to `priority`: the STAGE owns the signal (naturally `now() -
+        item's fetched_at`, in DAYS — the recency stamp lives in blob meta the strategy can't reach), the
+        DRIVER's `PriorityStrategy` owns the policy. Default (`no_age`) returns 0.0 — every item is treated
+        FRESH, so `Aging`'s `score + λ·age` collapses to `score` and aging is inert; under the default
+        `Greedy` (which ignores age entirely) the stage is byte-for-byte identical. The budget-gated
+        backlog stages (glean/dream) override to expose real age so an old item eventually surfaces; the
+        cheap deterministic stages (tap/weave/chunk) inherit the 0.0 default — aging is moot for them."""
+        ...
+
 
 # --- defaults a stage mixes in for the optional knobs (so a stage declares only what it overrides) --
 
@@ -106,6 +121,15 @@ def no_priority(_self, item: Item) -> float:
     return 0.0
 
 
+def no_age(_self, item: Item) -> float:
+    """The default `age` SIGNAL — every item ages at 0.0 (treated FRESH). It makes `Aging` INERT: `score +
+    λ·0 == score`, so `--priority aging` on a stage that does not expose age behaves exactly like `Greedy`
+    (and `Greedy`/`Arrival` ignore age outright). A stage where backlog-starvation can't happen — the cheap
+    deterministic ones (tap/weave/chunk) and the gardener — inherits this rather than wiring a recency read;
+    glean/dream override with `now() - fetched_at` so an aged, modestly-scored item climbs the queue."""
+    return 0.0
+
+
 # --- the priority POLICY: a pluggable ordering strategy over the per-stage SIGNAL ------------------
 
 # Priority couples two SEPARABLE concerns. The SIGNAL — `block.priority(item)->float`, the item's value
@@ -118,12 +142,18 @@ def no_priority(_self, item: Item) -> float:
 
 @runtime_checkable
 class PriorityStrategy(Protocol):
-    """The ordering POLICY — `order(items, score_of) -> list[item]`, where `score_of` is the stage's
-    `block.priority`. The driver hands it the eager enumeration and the signal function; the strategy
-    returns the processing order. A `Protocol` (not a base class) so a strategy is any object exposing
-    `order` — stdlib-only, no inheritance, no registry coupling."""
+    """The ordering POLICY — `order(items, score_of, age_of) -> list[item]`, where `score_of` is the
+    stage's `block.priority` and `age_of` its `block.age`. The driver hands it the eager enumeration and
+    BOTH per-item signal functions; the strategy returns the processing order. A `Protocol` (not a base
+    class) so a strategy is any object exposing `order` — stdlib-only, no inheritance, no registry coupling.
 
-    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+    `age_of` is the seam EXTENSION ADR-0011 foresaw (the single foreseeable pressure point), realized in
+    ADR-0021: `Aging` needs a SECOND per-item scalar — age — that `order(items, score_of)` alone could not
+    carry. It is KEYWORD-DEFAULTED to None so the extension is NON-BREAKING: `Greedy`/`Arrival` accept-and-
+    ignore it, a caller passing only `score_of` (dream's dry-run preview) still works, and only `Aging`
+    reads it. The driver always passes `block.age` (every block has it via the `no_age` mixin)."""
+
+    def order(self, items: list[Item], score_of: ScoreOf, age_of: AgeOf | None = None) -> list[Item]:
         ...
 
 
@@ -133,9 +163,12 @@ class Greedy:
     reverse=True)` is the same stable Timsort the old in-place `items.sort(key=…, reverse=True)` ran, so
     the default `no_priority` (0.0 everywhere) still preserves enumeration order and every stage is
     identical. Greedy is value-of-information optimal under a myopic, stationary signal — the right
-    default; the anti-starvation/anti-ossification policies below trade myopic optimality for fairness."""
+    default; the anti-starvation/anti-ossification policies below trade myopic optimality for fairness.
 
-    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+    `age_of` is accepted (the extended seam) but DELIBERATELY IGNORED — Greedy sorts by score ALONE, so
+    its body stays byte-identical to the pre-Aging driver and the default path provably never reorders."""
+
+    def order(self, items: list[Item], score_of: ScoreOf, age_of: AgeOf | None = None) -> list[Item]:
         return sorted(items, key=score_of, reverse=True)
 
 
@@ -145,8 +178,41 @@ class Arrival:
     no-signal stage already lands via the stable Greedy default on a uniform 0.0 score, so `--priority
     arrival` only differs once a stage emits a non-uniform signal.)"""
 
-    def order(self, items: list[Item], score_of: ScoreOf) -> list[Item]:
+    def order(self, items: list[Item], score_of: ScoreOf, age_of: AgeOf | None = None) -> list[Item]:
         return list(items)
+
+
+# UNTUNED — the fairness/hot-work dial (ADR-0021). Age is in DAYS (`now() - fetched_at`), score is the
+# stage's O(1)-O(3) signal (glean's structural cues, dream's salience), so λ is the dollars of effective
+# priority an item gains PER DAY of waiting: at 0.05/day a backlogged item climbs +1.0 every 20 days, so
+# the lowest-scored item overtakes a one-point score gap in ~20 days and a full salience gap in ~2 months
+# — the worst-case latency bound that turns a months-long backlog from "never drained" into "eventually
+# drained". Too HIGH and aging swamps the score (FIFO, hot work starves); too LOW and the long tail still
+# starves (Greedy). The right value trades fairness vs. hot-work throughput and wants a GOLD SET to fit —
+# this is a defensible default, not a fitted one. A single module-level constant so retuning is one edit.
+AGING_LAMBDA = 0.05
+
+
+class Aging:
+    """The ANTI-STARVATION policy: a STABLE descending sort by `effective(item) = score + λ·age` (ADR-0021).
+    Greedy PROVABLY STARVES the long tail — an item that never tops the score is never in the top slice a
+    persistent `--limit`/`--max-usd` budget takes, so under sustained high-priority load its wait → ∞
+    (classic priority-queue starvation; queueing theory). Aging is the standard fix: a low-score item's
+    effective priority CLIMBS with the time it has waited (`λ·age`) until it overtakes fresher high-score
+    arrivals, so every item is processed in BOUNDED time — worst-case latency ≈ (score gap)/λ. It is the
+    Multilevel-Feedback-Queue / Unix-scheduler aging trick (and PER's ε-floor in additive, deterministic
+    form): trade a little of Greedy's myopic value-of-information optimality for fairness to the backlog.
+
+    The seam EXTENSION (ADR-0011's one foreseen pressure point) lives HERE: Aging is the only shipped
+    strategy that reads `age_of`. With the default `no_age` (0.0 everywhere) `effective == score`, so Aging
+    collapses to Greedy and is INERT — it only bites on the stages that expose real age (glean/dream).
+    `age_of=None` (a caller that passes only `score_of`) is treated as all-fresh, same collapse. Stable,
+    like Greedy, so equal-`effective` items keep enumeration order (all-equal ages == Greedy ordering: age
+    adds a uniform constant, no reorder)."""
+
+    def order(self, items: list[Item], score_of: ScoreOf, age_of: AgeOf | None = None) -> list[Item]:
+        age = age_of if age_of is not None else (lambda _it: 0.0)   # None → all-fresh: Aging collapses to Greedy
+        return sorted(items, key=lambda it: score_of(it) + AGING_LAMBDA * age(it), reverse=True)
 
 
 # The name→strategy registry the CLIs' `--priority` resolves against. Values are zero-arg FACTORIES (the
@@ -155,6 +221,7 @@ class Arrival:
 PRIORITY_STRATEGIES: dict[str, Callable[[], PriorityStrategy]] = {
     "greedy": Greedy,
     "arrival": Arrival,
+    "aging": Aging,
 }
 
 
@@ -168,20 +235,21 @@ def priority_strategy(name: str) -> PriorityStrategy:
                          f"choose from {sorted(PRIORITY_STRATEGIES)}") from None
 
 
-# EXTENSION SEAM (documented, NOT built — ADR-0011): a new policy is a new `PriorityStrategy` class
-# registered above. The spine is value-of-information — Greedy is myopically optimal; these trade a
-# little of that for anti-starvation / anti-ossification:
+# EXTENSION SEAM (ADR-0011): a new policy is a new `PriorityStrategy` class registered above. The spine is
+# value-of-information — Greedy is myopically optimal; these trade a little of that for anti-starvation /
+# anti-ossification. `Aging` (above) is BUILT — it realized the one foreseeable PRESSURE POINT ADR-0011
+# recorded: `score + λ·age` needs a SECOND per-item scalar (age) the original `order(items, score_of)`
+# seam did not carry (items are opaque; `fetched_at` lives in blob meta the strategy can't reach), so the
+# seam was EXTENDED with a symmetric `age_of` fn (+ a `Block.age`/`no_age` mixin) — the single bend the ADR
+# foresaw, now straightened (ADR-0021). `Greedy` stays byte-identical (it ignores `age_of`). Still UNBUILT:
 #   Stochastic — PER (Prioritized Experience Replay): sample WITHOUT replacement with `P ∝ score^α` plus
 #                an ε-floor so every item keeps nonzero mass (anti-starvation) and the high scorers don't
 #                ossify the head (anti-ossification). Needs a SEEDED `random.Random` (a constructor arg)
 #                for deterministic tests — exactly why the registry hands out fresh instances per run.
 #   RankBased  — PER's outlier-robust variant: `P ∝ 1/rank(score)`, insensitive to score scale, so one
 #                runaway salience cannot monopolize the head. Same seeded-RNG sampling shape as Stochastic.
-# Stochastic + RankBased drop in with ZERO driver/stage change (RNG via the constructor, value via
-# `score_of`). Aging is the one foreseeable PRESSURE POINT: `score + λ·age` needs a SECOND per-item
-# scalar — age — that the `order(items, score_of)` seam does not carry (items are opaque; `fetched_at`
-# lives in blob meta the strategy can't reach). So Aging EXTENDS the seam (a second `age_of` fn, or the
-# driver passing a feature map) rather than slotting into it — the single bend in the decoupling.
+# Stochastic + RankBased drop in with ZERO further seam change (RNG via the constructor, value via
+# `score_of`); `age_of` is already threaded for any future age-aware policy.
 
 
 # --- the done-set + the processed marker (0007's per-input decisions, generalized to per-item) ------
@@ -393,10 +461,12 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
       (key, *params)) → 4. budget gate (--max-usd, clean exit) → 5. dry-run list-only → 6. process
       (commit blobs) → 7. the marker LAST (per-item commit) → 8. progress.tick → 9. optional finalize.
 
-    PRIORITY is split like PROGRESS: the SIGNAL (`block.priority(item)`) is the stage's, the POLICY
-    (`priority.order`, ADR-0011) is the driver's, default `Greedy`. The order is applied to the eager
-    enumeration BEFORE the cap and the backlog count, so the cap takes the top slice and dream's
-    `commits_per_item=False` path is unaffected (it re-orders the same working set, commits in finalize).
+    PRIORITY is split like PROGRESS: the SIGNALS are the stage's — the value SCORE (`block.priority(item)`)
+    and the wait-time AGE (`block.age(item)`, the ADR-0021 extension) — and the POLICY (`priority.order`,
+    ADR-0011) is the driver's, default `Greedy`. The order is applied to the eager enumeration BEFORE the
+    cap and the backlog count, so the cap takes the top slice and dream's `commits_per_item=False` path is
+    unaffected (it re-orders the same working set, commits in finalize). Default Greedy ignores age, so a
+    non-Aging run is byte-identical; only `--priority aging` reads `block.age` (`no_age` → 0.0 elsewhere).
 
     The four invariants the driver guarantees so no stage re-implements them:
       PER-ITEM COMMIT — output blobs (in process) then the marker (here, LAST), so a kill/crash keeps
@@ -424,9 +494,10 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     pvals = tuple(v for _, v in params)
     done = done_index(block.name, root)            # one scan
     items = list(block.items(root, source_id=source_id))   # eager: the bar + startup summary need the total
-    items = priority.order(items, block.priority)  # apply the ordering POLICY over the stage's SIGNAL — see
-                                                   # the run() docstring + ADR-0011 (default Greedy is a stable
-                                                   # no-op on the 0.0 signal, so a non-opting stage is identical).
+    items = priority.order(items, block.priority, block.age)  # apply the POLICY over the stage's TWO signals —
+                                                   # SCORE (`priority`) + AGE (`age`); see the run() docstring +
+                                                   # ADR-0011/0021. Default Greedy ignores age and is a stable
+                                                   # no-op on the 0.0 score, so a non-opting stage is identical.
     backlog = sum(1 for it in items if (block.key(it), *pvals) not in done)  # FULL un-done count, pre-limit:
                                                    # the amortized backlog this run draws from (AMORTIZATION
                                                    # VISIBILITY — what is still pending at this stage, not

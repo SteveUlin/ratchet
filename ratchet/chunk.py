@@ -164,6 +164,7 @@ class ChunkBlock:
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
     priority = block.no_priority
+    age = block.no_age                       # cheap deterministic stage — aging is moot (ADR-0021)
 
     def __init__(self, budget: int = DEFAULT_BUDGET) -> None:
         self.budget = budget

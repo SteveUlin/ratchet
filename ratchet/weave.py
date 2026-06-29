@@ -344,6 +344,7 @@ class WeaveBlock:
     finalize = block.no_finalize             # no cross-item dependency
     marker_extra = block.no_marker_extra     # no per-item audit fields
     priority = block.no_priority             # arrival order
+    age = block.no_age                       # cheap deterministic stage — aging is moot (ADR-0021)
 
     def __init__(self) -> None:
         # render_version is read at construction so a single instance pins one logic version per run.

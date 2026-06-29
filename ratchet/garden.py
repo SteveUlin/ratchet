@@ -316,6 +316,10 @@ class GardenBlock:
     commits_per_item = True
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
+    age = block.no_age                       # garden's backlog is bounded-SMALL (dozens–hundreds of
+                                             # concepts/clusters, not a months-long transcript backlog), so
+                                             # Greedy drains it before starvation bites — aging deferred, a
+                                             # one-line `def age` opt-in if it ever does (ADR-0021)
 
     def __init__(self, tagger: Completer, *, model: str = TAG_MODEL, root: Path | None = None) -> None:
         self.tagger = tagger
@@ -1301,6 +1305,10 @@ class GardenOpsBlock:
     commits_per_item = True
     finalize = block.no_finalize
     marker_extra = block.no_marker_extra
+    age = block.no_age                       # garden's backlog is bounded-SMALL (dozens–hundreds of
+                                             # concepts/clusters, not a months-long transcript backlog), so
+                                             # Greedy drains it before starvation bites — aging deferred, a
+                                             # one-line `def age` opt-in if it ever does (ADR-0021)
 
     def __init__(self, propose: Completer, *, model: str = PROPOSE_MODEL,
                  auto_max_stakes: float = AUTO_APPLY_MAX_STAKES, min_cluster: int = 2,

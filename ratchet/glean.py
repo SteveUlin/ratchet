@@ -333,6 +333,12 @@ class GleanBlock:
         self._digest_failed = False
         # per-chunk audit recorded for marker_extra (set in process, read by the driver immediately after)
         self._last: dict = {}
+        # the Aging seam (ADR-0021): `age` needs the run's root + a recency read. `_root` is captured in
+        # items() (the driver's root, set before ordering calls age); `_age_cache` memoizes each cleaned
+        # blob's `fetched_at` so the many chunks SHARING one cleaned_hash pay a single meta read, not one
+        # each. Only the Aging strategy calls age() — Greedy ignores it, so a non-aging run touches neither.
+        self._root: Path | None = None
+        self._age_cache: dict[str, str | None] = {}
 
     # -- enumeration: target chunksets → their chunks ----------------------------------------
 
@@ -349,6 +355,7 @@ class GleanBlock:
         the item. `chunk.load` returns the chunk pointers even if the cleaned blob is TTL-gone — that
         absence surfaces in `process` when it slices the cleaned bytes (→ FileNotFoundError → errored
         → retried), not here, so a missing blob is isolated per chunk, never a crashed enumeration."""
+        self._root = root                         # capture the driver's root for age() (called during ordering)
         for cs in self._target_chunksets(root, source_id):
             try:
                 chunks = chunk.load(cs, root)
@@ -377,6 +384,23 @@ class GleanBlock:
         diversity = 0.5 * len(kinds)
         interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
         return has_user + diversity + interaction
+
+    def age(self, item: ChunkItem) -> float:
+        """The chunk's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the chunk's
+        source CLEANED blob — how long this transcript material has waited un-gleaned. glean is budget-gated
+        (LLM + `--max-usd`), so under a months-long backlog Greedy's lowest-yield chunks could starve
+        forever; aging lets an old chunk's `score + λ·age` eventually overtake fresher richer ones (bounded
+        latency). CHEAP — one cached meta read (no content slice, no LLM), so it keeps the amortized-queue
+        O(1)-per-item promise: chunks share a cleaned_hash, so `_age_cache` reads each blob's stamp once.
+        Degrades to 0.0 ("fresh") if the blob/stamp is gone or unparseable — never raises (a missing recency
+        must not crash ordering). Only Aging calls this; Greedy ignores age, so glean stays byte-identical."""
+        ch = item.chunk.cleaned_hash
+        if ch not in self._age_cache:
+            try:
+                self._age_cache[ch] = blobstore.get_meta(ch, self._root).get("fetched_at")
+            except (OSError, json.JSONDecodeError):
+                self._age_cache[ch] = None        # absent/unreadable meta → treat as fresh (0.0), never raise
+        return config.age_days(self._age_cache[ch])
 
     # -- the concept digest seam: "what we already know", provenance-relevant to THIS chunk --------
 

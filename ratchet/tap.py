@@ -142,6 +142,7 @@ class TapBlock:
     commits_per_item = True
     marker_extra = block.no_marker_extra     # no per-item audit fields
     priority = block.no_priority             # arrival order — no salience to prioritize on
+    age = block.no_age                       # cheap deterministic stage — aging is moot (ADR-0021)
     # params is EMPTY: tap has no prompt/model/render version (no logic version to bump). The per-item
     # content discriminator lives in key() instead (params is a run-level constant, so it cannot carry
     # a per-file fingerprint — the done-key's only per-item part is key(item)).

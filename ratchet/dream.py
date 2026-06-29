@@ -283,6 +283,22 @@ def working_set(root: Path | None = None, *, min_confidence: float = 0.0) -> lis
     return out
 
 
+def _event_born_map(root: Path | None = None) -> dict[str, str | None]:
+    """event_id → its blob's `fetched_at` (the recency stamp) — the AGE source for the `Aging` priority
+    policy (ADR-0021): an event's age = `now() - born`. ONE scan over `latest_by_kind('event')` + a meta
+    read per event; built LAZILY (only when Aging is selected — Greedy never reads age) and shared by
+    `DreamBlock.age` and the `--dry-run` preview so the preview can't lie about the aging order. A gone /
+    unreadable meta maps to None → `config.age_days` treats it as fresh (0.0); never raises."""
+    root = root or config.data_root()
+    out: dict[str, str | None] = {}
+    for sid, h in blobstore.latest_by_kind("event", root).items():
+        try:
+            out[sid] = blobstore.get_meta(h, root).get("fetched_at")
+        except (OSError, json.JSONDecodeError):
+            out[sid] = None
+    return out
+
+
 def catalog(root: Path | None = None) -> list[dict]:
     """The full LIVE routing catalog: `latest_by_kind('takeaway')` (latest version per stable id) MINUS
     any takeaway whose latest lifecycle decision is in {merge, retire, reject}. INCLUDES incubating
@@ -966,6 +982,12 @@ class DreamBlock:
         self._digest: str = ""                         # the bounded structured concept digest, built once
         self._cat: list[dict] = []
         self._cat_by_id: dict[str, dict] = {}
+        # the Aging seam (ADR-0021): `age` needs the run's root + each event's `fetched_at`. `_root` is
+        # captured in items() (the driver's root, set before ordering calls age); `_born` is the event→
+        # fetched_at map, built LAZILY on the first age() call so a Greedy run (which never reads age) pays
+        # nothing. Only the Aging strategy calls age() — Greedy ignores it, so a non-aging run is untouched.
+        self._root: Path | None = None
+        self._born: dict[str, str | None] | None = None
         # RunReport-shaped tallies (read by the shim/CLI).
         self.takeaways: list[dict] = []
         self.n_events = 0
@@ -980,6 +1002,8 @@ class DreamBlock:
         `source_id` is ignored (dream is a global pass). The driver eager-lists this, sorts by `priority`,
         and caps by --limit."""
         from .concepts import concept_digest          # lazy: breaks the dream↔concepts cycle (ADR-0018)
+        self._root = root                              # capture for age() (called during ordering, post-items)
+        self._born = None                              # reset the lazy age map: a fresh run re-reads recency
         self._concepts = load_concepts(root)
         self._known_ids = {c["id"] for c in self._concepts}      # all str (load_concepts guarantees it)
         self._digest = concept_digest(root)            # the STRUCTURED render synth judges belief-change on
@@ -994,6 +1018,19 @@ class DreamBlock:
 
     def priority(self, rv: ResolvedEvent) -> float:
         return salience(rv.event)
+
+    def age(self, rv: ResolvedEvent) -> float:
+        """The event's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the event blob —
+        how long this learning has waited un-consolidated. dream is budget-gated (route + synth LLM calls,
+        `--max-usd`), so under a months-long backlog Greedy's lowest-salience events could starve forever;
+        aging lets an old event's `salience + λ·age` eventually overtake fresher salient ones (bounded
+        latency, the anti-starvation complement to `forget`'s straggler eviction). The event→`fetched_at`
+        map is built ONCE on the first call (`_event_born_map`) and reused — O(1) per item after, so ordering
+        stays O(n log n). 0.0 ("fresh") if the stamp is missing/unparseable. Only Aging calls this; Greedy
+        ignores age, so dream stays byte-identical."""
+        if self._born is None:                         # lazy: only an Aging run pays the scan (Greedy never calls age)
+            self._born = _event_born_map(self._root)
+        return config.age_days(self._born.get(rv.id))
 
     def process(self, rv: ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
         """Route the event against the on-instance catalog, apply the verdict (committing the takeaway +
@@ -1142,8 +1179,10 @@ def main(argv=None) -> None:
     if args.dry_run:                                # eyeball the queue + catalog before spending
         root = config.ensure_layout()
         ws = working_set(root, min_confidence=args.min_confidence)
-        ws = block.priority_strategy(args.priority).order(ws, lambda rv: salience(rv.event))   # mirror the
-                                                   # real run's POLICY so the preview can't lie about order
+        born = _event_born_map(root) if args.priority == "aging" else {}   # only Aging needs the recency read
+        ws = block.priority_strategy(args.priority).order(   # mirror the real run's POLICY (incl. age) so the
+            ws, lambda rv: salience(rv.event),               # preview can't lie about order
+            lambda rv: config.age_days(born.get(rv.id)))
         cat = catalog(root)
         mature = current_takeaways(root, min_sessions=args.maturity)
         print(f"{len(ws)} un-consolidated events ({args.priority}-ordered) · catalog {len(cat)} takeaways "
