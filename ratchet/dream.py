@@ -1178,13 +1178,11 @@ class DreamBlock:
 
 # --- run: a thin compat shim over the block driver ------------------------------------------------
 
-class RunReport:
+class RunReport(block.ProxyReport):
     """The shape `dream.run` returns — a thin WRAPPER over the uniform `block.Report` the driver
-    populated plus the DreamBlock instance, exposing every field by reading THROUGH them. Nothing is
-    copied at construction, so there is no hand-maintained desync surface."""
-    def __init__(self, report: block.Report, blk: DreamBlock) -> None:
-        self._report = report
-        self._blk = blk
+    populated plus the DreamBlock instance, exposing every field by reading THROUGH them. The uniform
+    fields come from the `block.ProxyReport` base (nothing copied → no desync surface); this subclass
+    adds dream's consolidation tallies, read off the block."""
 
     @property
     def n_events(self) -> int:
@@ -1207,28 +1205,6 @@ class RunReport:
     @property
     def staled(self) -> list[str]:
         return self._blk.staled
-
-    @property
-    def run_id(self) -> str:
-        return self._report.run_id
-    @property
-    def examined(self) -> int:
-        return self._report.examined
-    @property
-    def processed(self) -> int:
-        return self._report.processed
-    @property
-    def skipped(self) -> int:
-        return self._report.skipped
-    @property
-    def errored(self) -> int:
-        return self._report.errored
-    @property
-    def cost_usd(self) -> float:
-        return self._report.cost_usd
-    @property
-    def stopped_on_budget(self) -> bool:
-        return self._report.stopped_on_budget
 
 
 def run(complete_route: Completer, complete_synth: Completer, *, route_model: str = ROUTE_MODEL,

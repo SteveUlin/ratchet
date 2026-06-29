@@ -495,16 +495,13 @@ class GleanBlock:
 
 # --- run: a thin compat shim over the block driver (keeps dream/review setup untouched) -----
 
-class _ShimReport:
-    """The shape the old `glean.run` returned — a thin WRAPPER, not a copy. It holds the uniform
-    `block.Report` the driver populated plus the GleanBlock instance, and exposes every field by reading
-    THROUGH them via @property (`@anti-desync`, the spec's #4): the uniform fields proxy the Report, the
-    genuinely-extra instance tallies (events/rejected) proxy the block. No field is copied at construction,
-    so there is no hand-maintained surface that can silently drift from what the driver wrote. dream/review
-    call `glean.run([cs], fake, model='fake')` purely to populate the event store; they read `.events`/`.skipped`."""
-    def __init__(self, report: block.Report, blk: GleanBlock) -> None:
-        self._report = report
-        self._blk = blk
+class _ShimReport(block.ProxyReport):
+    """The shape the old `glean.run` returned — a thin WRAPPER, not a copy. The `block.ProxyReport` base
+    holds the uniform `block.Report` the driver populated plus the GleanBlock instance and forwards every
+    uniform field by reading THROUGH them (`@anti-desync`, the spec's #4 — no copy that can drift); this
+    subclass adds only the genuinely-extra instance tallies (events/rejected), read off the block.
+    dream/review call `glean.run([cs], fake, model='fake')` purely to populate the event store; they read
+    `.events`/`.skipped`."""
 
     # the genuinely-extra instance tallies (the Report has no place for these) — read off the block
     @property
@@ -513,32 +510,6 @@ class _ShimReport:
     @property
     def rejected(self) -> int:
         return self._blk.rejected
-
-    # the uniform fields — proxied straight off the wrapped Report (never copied → never stale)
-    @property
-    def run_id(self) -> str:
-        return self._report.run_id
-    @property
-    def skipped(self) -> int:
-        return self._report.skipped
-    @property
-    def errored(self) -> int:
-        return self._report.errored
-    @property
-    def cost_usd(self) -> float:
-        return self._report.cost_usd
-    @property
-    def stopped_on_budget(self) -> bool:
-        return self._report.stopped_on_budget
-    @property
-    def examined(self) -> int:
-        return self._report.examined
-    @property
-    def processed(self) -> int:
-        return self._report.processed
-    @property
-    def outputs(self) -> int:
-        return self._report.outputs
 
 
 def run(chunkset_hashes: list[str], complete: Completer, *, model: str = completer.DEFAULT_MODEL,

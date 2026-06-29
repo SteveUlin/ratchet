@@ -222,11 +222,12 @@ print("OK §4 — a vocab change (a new tag) flips the fingerprint and re-tags e
 # VOCAB_MAX (256 in prod, never hit on the happy path) is the hard backstop. Shrink it for the test, then
 # FILL the vocab to the cap out-of-band — which also flips the fingerprint, so the next run RE-tags rather
 # than done-skips — and assert a tagger proposing fresh novel tags grows the fold NO further.
-garden.VOCAB_MAX = len(garden.vocabulary(R)) + 2        # a small cap for the test (prod is 256)
-while len(garden.vocabulary(R)) < garden.VOCAB_MAX:     # fill to EXACTLY the cap with throwaway tags
+garden.tag.VOCAB_MAX = len(garden.vocabulary(R)) + 2    # a small cap for the test (prod is 256); the cap
+                                                        # lives in the `tag` submodule `_clean_new_tags` reads
+while len(garden.vocabulary(R)) < garden.tag.VOCAB_MAX:  # fill to EXACTLY the cap with throwaway tags
     garden.add_tag(f"filler-{len(garden.vocabulary(R))}", "filler", R, run_id="seed", model="seed")
 cap = len(garden.vocabulary(R))
-assert cap == garden.VOCAB_MAX, "seeded the vocab to exactly the cap"
+assert cap == garden.tag.VOCAB_MAX, "seeded the vocab to exactly the cap"
 
 flood = TaggerFake({"jj over git": ["novel-a", "novel-b"], "commit early often": ["novel-c"],
                     "nix develop shell": ["novel-d"], "flake inputs pin": ["novel-e"]})

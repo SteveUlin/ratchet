@@ -326,6 +326,43 @@ class Report:
                                # a capped/budgeted run left work for the next tick (errored items count).
 
 
+class ProxyReport:
+    """The shared shape of a stage's run-report — a thin WRAPPER, not a copy, over the uniform `Report`
+    the driver populated PLUS the stage's Block instance. It forwards every uniform Report field by reading
+    THROUGH the wrapped Report via @property (never copied → never stale, the anti-desync discipline);
+    each stage SUBCLASSES this and adds its genuinely-extra tallies as @property reads off the block
+    (`self._blk`), which the Report has no place for. One base for glean/dream/garden's report wrappers —
+    so the uniform forwarding lives in ONE place and only the stage-specific surface differs (ADR-0009)."""
+    def __init__(self, report: Report, blk) -> None:
+        self._report = report
+        self._blk = blk
+
+    @property
+    def run_id(self) -> str:
+        return self._report.run_id
+    @property
+    def examined(self) -> int:
+        return self._report.examined
+    @property
+    def processed(self) -> int:
+        return self._report.processed
+    @property
+    def skipped(self) -> int:
+        return self._report.skipped
+    @property
+    def errored(self) -> int:
+        return self._report.errored
+    @property
+    def outputs(self) -> int:
+        return self._report.outputs
+    @property
+    def cost_usd(self) -> float:
+        return self._report.cost_usd
+    @property
+    def stopped_on_budget(self) -> bool:
+        return self._report.stopped_on_budget
+
+
 # --- live progress: spinner + ▰▱ bar + spend on a TTY; idempotent per-item lines when piped --------
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
