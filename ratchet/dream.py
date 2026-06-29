@@ -69,7 +69,7 @@ from pathlib import Path
 
 from . import blobstore, block, completer, config
 from .completer import Completer
-from .glean import MARKER_KINDS          # the marker vocabulary is glean's; dream carries it upward
+from .glean import MARKER_KINDS, clean_relevance   # the marker + relevance vocab is glean's; dream carries it up
 
 PROMPT_VERSION = "dream/3"               # bump to re-route NOT-yet-consolidated events with a sharper prompt
                                          # (dream/3 adds the WEAKEN verdict — ADR-0012)
@@ -89,6 +89,16 @@ NOTE_MAX = 160
 
 # Salience weights: surprise highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
 W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
+
+# Relevance multipliers (4b/ADR-0019): glean's Bayesian-surprise-vs-the-store verdict SCALES salience so
+# the queue drains NOVEL/CONTRADICTING events first and ALREADY-KNOWN ones last. RECALL-FIRST — `known`
+# only SINKS (deferred under budget), it never hard-drops; the invisible false-negative (silently dropping
+# a learning we wrongly called known) is the costly error (ADR-0005). `novel` is the NEUTRAL ×1.0 default,
+# so a pre-4b event with no relevance field — coerced to `novel` — keeps its EXACT prior salience (the
+# 4b change perturbs only events glean marked `known`/`contradicts`). `contradicts` boosts highest: a
+# belief change is the most valuable to surface, the cheap-early echo of dream's precise LATE weaken
+# judgment (ADR-0012). Untuned, like every weight here — pending a gold set.
+W_REL = {"contradicts": 1.5, "novel": 1.0, "known": 0.4}
 
 _RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
 
@@ -349,17 +359,30 @@ def render_catalog(cat: list[dict]) -> str:
 _score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
 
 
-def salience(event: dict) -> float:
-    """A pure score of an un-consolidated event for the priority queue: confidence × weighted marker
-    mass. Surprise weighed highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
-    Each untrusted field is scrubbed through `clean_score`. The recurrence bonus (does the event already
-    match a catalog takeaway) is DEFERRED (it needs a pre-route scan). `DreamBlock.priority` delegates
-    here."""
+def _intrinsic_salience(event: dict) -> float:
+    """The relevance-FREE salience: confidence × weighted marker mass (with its +EPS floor) — the event's
+    OWN durable-value score, no novelty term. Surprise weighed highest among markers — a corrective/failure
+    signal is the highest-value cue (ADR-0010 §8). Each untrusted field is scrubbed through `clean_score`.
+    This is the pre-4b salience; `salience` scales it by relevance to order the QUEUE, but `forget` gates
+    eviction on THIS — so a `known` verdict (×0.4) can re-ORDER an event yet never EVICT it. Relevance
+    orders, it never drops (recall-first; the ADR-0019 invariant)."""
     conf = _score(event.get("confidence"), 0.5)
     m = event.get("markers") or {}
-    mass = (W_SURPRISE * _score(m.get("surprise")) + W_INSIGHT * _score(m.get("insight"))
-            + W_RESEARCH * _score(m.get("research")) + EPS)
-    return conf * mass
+    return conf * (W_SURPRISE * _score(m.get("surprise")) + W_INSIGHT * _score(m.get("insight"))
+                   + W_RESEARCH * _score(m.get("research")) + EPS)
+
+
+def salience(event: dict) -> float:
+    """A pure score of an un-consolidated event for the priority QUEUE: `_intrinsic_salience` × the
+    RELEVANCE multiplier. The relevance term (4b/ADR-0019) is glean's novelty-vs-the-store verdict:
+    `contradicts`/`novel` BOOST (drain first), `known` SINKS (deferred under budget) — RECALL-FIRST, so
+    `known` only reorders, it never hard-drops, and a missing field coerces to `novel` (×1.0), never
+    sinking an event on doubt. Relevance scales the queue ORDER ONLY — NOT the forget gate: `forget` reads
+    `_intrinsic_salience`, so a `known` verdict can never DRIVE an eviction (a pre-4b event reads novel×1.0
+    → salience == intrinsic, byte-identical). The recurrence bonus (does the event already match a catalog
+    takeaway) is DEFERRED. `DreamBlock.priority` delegates here."""
+    rel = W_REL[clean_relevance(event.get("relevance"))]   # missing/unknown → novel (×1.0): never sink on doubt
+    return _intrinsic_salience(event) * rel
 
 
 def _event_markers(event: dict) -> dict:
@@ -785,9 +808,12 @@ def forget(root: Path | None = None, *, tau: int = FORGET_TAU,
            salience_floor: float = FORGET_SALIENCE_FLOOR, run_id: str) -> list[str]:
     """Stale the stragglers: for each un-consolidated event, `cycles_resident` = the count of DISTINCT
     dream run_ids in the stored dream-stage decisions whose `at` postdates the event blob (no mutable
-    per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (salience < floor)
-    — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Reversible. Cheap, no LLM
-    — runs in `DreamBlock.finalize`. Returns the staled event ids."""
+    per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (`_intrinsic_salience`
+    < floor) — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Gates on the
+    relevance-FREE intrinsic salience, NOT `salience`: relevance (4b/ADR-0019) orders the queue but must
+    never DRIVE an eviction — a `known` ×0.4 verdict can re-order an event yet never evict it (recall-first;
+    4b adds no new drop path). Reversible. Cheap, no LLM — runs in `DreamBlock.finalize`. Returns the
+    staled event ids."""
     root = root or config.data_root()
     ws = working_set(root)
     latest = blobstore.latest_by_kind("event", root)
@@ -803,7 +829,7 @@ def forget(root: Path | None = None, *, tau: int = FORGET_TAU,
                 born = ""
         runs = {d.get("run_id") for d in dream_decs
                 if d.get("run_id") and str(d.get("at", "")) > born}
-        if len(runs) >= tau and salience(rv.event) < salience_floor:
+        if len(runs) >= tau and _intrinsic_salience(rv.event) < salience_floor:
             _write_stale(rv.id, "aged + low salience", run_id=run_id, root=root)
             staled.append(rv.id)
     return staled

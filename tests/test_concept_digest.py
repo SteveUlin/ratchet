@@ -112,6 +112,27 @@ dall = concepts.concept_digest(R, budget=0)
 assert all(f"{c}:" in dall for c in ("c-a", "c-b", "c-c", "c-d")) and "more" not in dall, dall
 
 
+# === 2b. relevant_to ORDERS by provenance facet overlap — the false-novelty fix (4b/ADR-0019) =======
+# A chunk that touched /other/baz.py is most likely covered by c-d (the THIN, single-session beta concept
+# on that file), NOT by c-a (entrenched across two sessions, but on a different file). Under pure
+# entrenchment, budget=1 keeps c-a and DROPS c-d (proven by §2's d1) — so a near-duplicate of c-d would be
+# judged falsely NOVEL. relevant_to = this chunk's facet set reorders by facet OVERLAP, so c-d survives.
+baz = concepts.chunk_facets(ch3, R)                    # the beta chunk's facets: file /other/baz.py, repo beta
+drel = concepts.concept_digest(R, budget=1, relevant_to=baz)
+assert "c-d: beta baz" in drel, f"the provenance-relevant thin concept survives the budget cut:\n{drel}"
+assert "c-a:" not in drel, f"the entrenched-but-IRRELEVANT concept is the one dropped:\n{drel}"
+assert "…(+3 more" in drel, drel
+# the contrast is real: WITHOUT relevant_to, the SAME budget=1 keeps c-a (entrenchment) and drops c-d.
+assert "c-a:" in d1 and "c-d:" not in d1, "pure entrenchment keeps c-a, drops c-d — the risk relevant_to fixes"
+# a chunk on /repo/foo.py instead surfaces the foo concepts ahead of the disjoint beta outlier.
+foo = concepts.chunk_facets(ch1, R)
+dfoo = concepts.concept_digest(R, budget=2, relevant_to=foo)
+assert "c-a:" in dfoo and "c-d:" not in dfoo, f"a foo chunk surfaces the foo concepts, not the beta outlier:\n{dfoo}"
+# DETERMINISTIC, and relevant_to=None is byte-identical to the default (dream's global use is unchanged).
+assert concepts.concept_digest(R, budget=1, relevant_to=baz) == drel, "the relevant_to ordering is deterministic"
+assert concepts.concept_digest(R, relevant_to=None) == concepts.concept_digest(R), "relevant_to=None == the default"
+
+
 # === 3. the empty store → the clear sentinel ========================================================
 
 empty = config.ensure_layout(Path(tempfile.mkdtemp(prefix="ratchet-test-digest-empty-")))

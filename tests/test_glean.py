@@ -154,6 +154,9 @@ assert ev["id"] == glean.event_id(cleaned_hash, span["byte_start"], span["byte_e
 assert ev["cleaned_hash"] == cleaned_hash and "quote" not in ev, "event points into the cleaned blob; never copies its text"
 assert set(ev["markers"]) == set(glean.MARKER_KINDS) and ev["markers"]["insight"] == 0.8, "markers scored per kind"
 assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record status field"
+# the RELEVANCE marker (4b/ADR-0019): the fake gave no verdict → coerced to `novel` (recall-safe) and stored
+assert ev["relevance"] == "novel", "an event with no model relevance defaults to novel (recall-safe, 4b)"
+assert glean.event_content(ev)["relevance"] == "novel", "relevance is part of the stored content projection"
 
 # the trust check (verify) returns a span; record assembly (build_event) is a separate step
 owner = [c for c in chunks if REAL_QUOTE in chunk.resolve(c)][0]
@@ -166,6 +169,14 @@ dirty = glean.build_event({"quote": REAL_QUOTE, "summary": "x", "markers": {"ins
 assert dirty["markers"] == {"surprise": 0.0, "insight": 1.0, "research": 0.0}, "markers coerced/clamped, unknowns dropped"
 assert dirty["confidence"] == 1.0, "confidence clamped to [0,1]"
 assert dirty["producer"]["stage"] == "glean" and dirty["producer"]["prompt_version"] == glean.PROMPT_VERSION
+
+# the RELEVANCE marker coercion (4b/ADR-0019): a known verdict is kept; an unknown/missing one coerces to
+# `novel` (the recall-safe default — never silently sink a learning by calling it `known`)
+assert glean.clean_relevance("contradicts") == "contradicts" and glean.clean_relevance("known") == "known"
+assert glean.clean_relevance("wat") == "novel" and glean.clean_relevance(None) == "novel", "unknown/missing → novel"
+assert dirty["relevance"] == "novel", "a candidate with no relevance field defaults to novel (recall-safe)"
+assert glean.build_event({"quote": REAL_QUOTE, "relevance": "contradicts"}, owner, ok_span,
+                         model="fake", run_id="r")["relevance"] == "contradicts", "a valid verdict is kept verbatim"
 
 # a quote that IS a real substring but too short to be useful evidence is rejected (no span)
 assert glean.verify({"quote": SHORT_QUOTE}, owner, cleaned.encode("utf-8")) is None, "too-short quote rejected"
@@ -448,6 +459,28 @@ assert pb.priority(rich) > pb.priority(useronly) > pb.priority(work) > pb.priori
 assert pb.priority(useronly) > pb.priority(dump), "a terse human turn outranks a long tool dump (NOT length)"
 assert pb.priority(work) == pb.priority(_ci(["assistant", "tool"], 8)), "priority is pure in the pointer"
 print("OK — priority: capped tick drains best-first by free pointer cues (user-presence > diversity > turns, not bytes).")
+
+
+# --- 8c. the relevance marker flows completer → store, coerced (4b/ADR-0019) ----------------
+# glean asks the model to judge each event's novelty vs the concept digest ("what we already know",
+# injected into the prompt — empty here, so the fake just echoes a verdict) and STORES it on the event.
+# The trust anchor is unchanged (only the REAL_QUOTE candidate verifies): we assert a VALID verdict is
+# stored verbatim and an UNKNOWN one coerces to `novel` end-to-end (the recall-safe default).
+def _store_relevance(tag, verdict):
+    raw_x, _ = blobstore.ingest(blob.replace("kick off", f"kick off {tag}"), source_kind="transcript",
+                                source_id=f"glean-{tag}", origin_ref={"session_id": f"glean-{tag}"})
+    cs_x, _, xchunks = chunk.materialize(raw_x, budget=600)
+    fx = FakeCompleter([{"quote": REAL_QUOTE, "summary": "x", "relevance": verdict,
+                         "markers": {"surprise": 0.5}, "confidence": 0.9}])
+    block.run(glean.GleanBlock(fx, model=tag, targets=[cs_x]), progress=None)
+    evs = [e for e in glean.load_events() if e["cleaned_hash"] == xchunks[0].cleaned_hash]
+    assert len(evs) == 1, f"the durable line is exactly one event in {tag}'s source"
+    return evs[0]["relevance"]
+
+assert _store_relevance("contra", "contradicts") == "contradicts", "a valid verdict is stored verbatim"
+assert _store_relevance("junkrel", "not-a-verdict") == "novel", "an unknown verdict coerces to novel in the store"
+print("OK — relevance (4b): a valid verdict stores verbatim; an unknown one coerces to novel (recall-safe),")
+print("     end-to-end through completer → verify → build_event → ingest → load_events.")
 
 
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------

@@ -182,6 +182,17 @@ def concept_facets(concept: dict, root: Path | None = None, *, cache: dict | Non
     return out
 
 
+def chunk_facets(cleaned_hash: str, root: Path | None = None, *, cache: dict | None = None) -> dict:
+    """The provenance facets of a single CHUNK's cleaned blob — `{repos, files, tools, sessions,
+    time_range}`, in the SAME shape `concept_facets` yields, so `facet_score`/`facet_overlap` can score a
+    chunk AGAINST a concept. A chunk IS a concept with one piece of evidence (its own cleaned blob), so
+    this folds straight through `concept_facets` — no second copy of the raw re-parse. glean (4b/ADR-0019)
+    passes the result as `concept_digest`'s `relevant_to` to order the concepts most likely to already
+    cover THIS chunk ahead of the truncation cut — the false-novelty fix. `cache` is the shared
+    cleaned-blob facet cache (re-used across a run's chunks)."""
+    return concept_facets({"evidence": [{"cleaned_hash": cleaned_hash}]}, root, cache=cache)
+
+
 # --- the facet-overlap relation: shared sets + temporal nearness, then a weighted score -----------
 
 def _temporal_proximate(fa: dict, fb: dict) -> bool:
@@ -404,7 +415,23 @@ def _digest_shared(members: list[str], by_node: dict) -> str:
     return ""
 
 
-def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET) -> str:
+def digest_context(root: Path | None = None) -> dict:
+    """The run-invariant inputs to `concept_digest` — the facet GRAPH (the one expensive raw re-parse,
+    ADR-0013) plus each concept's statement / evidence-count / outgoing asserted relations — everything the
+    render needs EXCEPT the `budget` and the `relevant_to` ordering. Split out so a PER-CHUNK caller
+    (glean's relevance check, 4b/ADR-0019) pays the facet pass ONCE per run and re-renders per chunk with
+    that chunk's `relevant_to`; dream's single global call folds it straight back into `concept_digest`."""
+    root = root or config.data_root()
+    g = concept_graph(root)
+    by_node = {n["id"]: n for n in g["nodes"]}
+    blobs = {c["id"]: c for c in dream.load_concepts(root)}     # statements + evidence count live on the blob
+    evid = {cid: len(blobs.get(cid, {}).get("evidence") or []) for cid in by_node}
+    return {"clusters": g["clusters"], "by_node": by_node, "blobs": blobs, "evid": evid,
+            "relations": _digest_relations(g["edges"])}
+
+
+def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET,
+                   relevant_to: dict | None = None, context: dict | None = None) -> str:
     """A BOUNDED, STRUCTURED rendering of the current valid concept layer for prompt injection — the "what
     we already know" read-back the upstream LLM stages judge novelty/belief-change against (ADR-0018,
     replacing dream's flat `_render_concepts`). Built from `concept_graph` in ONE facet pass: concepts
@@ -413,25 +440,33 @@ def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET) -> 
     (generalizes/supersedes/relates-to — the hierarchy spine, 3c/ADR-0015). A rebuildable read-view, never
     stored, like the rest of this module.
 
-    BOUNDED by `budget` (a CONCEPT cap): with more than `budget` concepts, keep the most-ENTRENCHED (most
-    distinct cited sessions, then most evidence — `_digest_entrench`) and drop the long tail, emitting a
-    `…(+N more)` marker so the model KNOWS the view is partial — those concepts EXIST, they are just not
-    shown — rather than treating a dropped lesson as new. The empty set yields a clear sentinel so a stage is
-    never asked to relate against nothing. budget <= 0 disables the cap (render all)."""
-    root = root or config.data_root()
-    g = concept_graph(root)
-    nodes = g["nodes"]
-    if not nodes:
-        return DIGEST_EMPTY
-    by_node = {n["id"]: n for n in nodes}
-    blobs = {c["id"]: c for c in dream.load_concepts(root)}     # statements + evidence count live on the blob
-    evid = {cid: len(blobs.get(cid, {}).get("evidence") or []) for cid in by_node}
-    relations = _digest_relations(g["edges"])
+    `relevant_to` is the PROVENANCE-RELEVANT ordering knob (4b/ADR-0019): a chunk's facet set (its
+    `{repos, files, tools}`, via `chunk_facets`). When given, concepts are kept/ordered by facet-OVERLAP
+    with it (`facet_score`) FIRST, so the concepts most likely to already cover THIS chunk survive the
+    `budget` cut — fixing the false-novelty risk where a near-duplicate would match a thin, single-session
+    concept that global-entrenchment truncation drops. When None (dream's global use), the ranking is pure
+    ENTRENCHMENT (unchanged). `context` (from `digest_context`) lets a per-chunk caller reuse one facet pass
+    across many `relevant_to` renders; None recomputes it (the standalone path dream/CLI/tests use).
 
-    # RANK every concept entrenchment-DESC, id-ASC; the top `budget` survive, the long tail drops. `rank`
-    # drives both member order (most-entrenched first) and cluster order (each cluster follows its best).
+    BOUNDED by `budget` (a CONCEPT cap): past it, keep the top-ranked (relevance-then-entrenchment, or pure
+    entrenchment — most distinct cited sessions, then most evidence, `_digest_entrench`) and drop the long
+    tail, emitting a `…(+N more)` marker so the model KNOWS the view is partial — those concepts EXIST, they
+    are just not shown — rather than treating a dropped lesson as new. The empty set yields a clear sentinel
+    so a stage is never asked to relate against nothing. budget <= 0 disables the cap (render all)."""
+    ctx = context if context is not None else digest_context(root or config.data_root())
+    by_node = ctx["by_node"]
+    if not by_node:
+        return DIGEST_EMPTY
+    blobs, evid, relations = ctx["blobs"], ctx["evid"], ctx["relations"]
+
+    # RANK the concepts; the top `budget` survive, the long tail drops. `rank` drives both member order
+    # (best first) and cluster order (each cluster follows its best member). With `relevant_to`, facet-
+    # OVERLAP with this chunk leads (the concepts likely to cover it beat the cut — false-novelty fix);
+    # entrenchment (sessions, then evidence) + id break ties — deterministic either way.
     def sortkey(cid: str) -> tuple:
         s, e = _digest_entrench(by_node[cid], evid[cid])
+        if relevant_to is not None:
+            return (-facet_score(by_node[cid]["facets"], relevant_to), -s, -e, cid)
         return (-s, -e, cid)
     ordered = sorted(by_node, key=sortkey)
     kept = set(ordered[:budget]) if budget > 0 else set(ordered)
@@ -439,7 +474,7 @@ def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET) -> 
     dropped = len(ordered) - len(kept)
 
     rendered: list[tuple[int, str, list[str]]] = []     # (best-member rank, leader, surviving members)
-    for cl in g["clusters"]:
+    for cl in ctx["clusters"]:
         members = sorted((m for m in cl["members"] if m in kept), key=lambda m: rank[m])
         if members:
             rendered.append((rank[members[0]], cl["leader"], members))

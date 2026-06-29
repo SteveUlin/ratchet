@@ -41,7 +41,8 @@ from pathlib import Path
 from . import blobstore, block, chunk, completer, config, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
-PROMPT_VERSION = "glean/2"     # bump to re-extract over the same frozen chunks (idempotency key)
+PROMPT_VERSION = "glean/3"     # bump to re-extract over the same frozen chunks (idempotency key);
+                               # glean/3 adds the RELEVANCE marker judged vs the concept digest (4b/ADR-0019)
 MIN_QUOTE_BYTES = 12           # a shorter "quote" is ambiguous (matches anywhere) → low-value evidence
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
 OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
@@ -51,6 +52,24 @@ OUT_NOUN = "events"            # the per-item output noun the Progress bar/line 
 # They classify, they do not gate — the gate is "is this a durable learning at all", so a plain
 # preference (all markers low) still comes through.
 MARKER_KINDS = ("surprise", "insight", "research")
+
+# RELEVANCE is the per-event Bayesian-surprise-vs-the-store verdict (4b/ADR-0019, the long-deferred
+# roadmap-#1 marker of ADR-0005): each event is judged against the concept digest ("what we already
+# know") injected into the prompt — `novel` (nothing covers it) / `known` (a concept already states it)
+# / `contradicts` (it overturns a concept). It FEEDS dream's salience ORDERING (novel/contradicts drain
+# first, known sinks) — it does NOT gate. RECALL-FIRST coercion: an unknown/missing verdict → `novel`,
+# the safe default — never silently call a learning `known` and sink it (the invisible false-negative is
+# the costly error). It is the CHEAP, EARLY complement to dream's precise LATE belief-change judgment.
+RELEVANCE_KINDS = ("novel", "known", "contradicts")
+RELEVANCE_DEFAULT = "novel"    # the recall-safe default: doubt resolves toward "process it", never "drop it"
+
+
+def clean_relevance(v) -> str:
+    """Coerce the model's untrusted relevance verdict to a known kind, defaulting unknown/missing →
+    `novel` (the recall-safe direction — `novel` boosts/keeps an event in dream's queue, `known` sinks it;
+    so doubt must resolve to `novel`, never `known`). Mirrors `_clean_markers`/`_clean_relation`; dream
+    reads the same coercion when it scales salience, so producer and consumer agree on one spelling."""
+    return v if v in RELEVANCE_KINDS else RELEVANCE_DEFAULT
 
 SYSTEM_PROMPT = (
     "You extract durable, reusable learnings from a single excerpt of a Claude Code session "
@@ -70,7 +89,15 @@ SYSTEM_PROMPT = (
     "    research — a researched finding or external fact established during the session.\n"
     "  A learning may score on several at once; a plain preference or fact that is none of these "
     "scores them all low (but is still worth returning).\n"
-    "- \"confidence\": a number 0-1, how durable and reusable this is.\n\n"
+    "- \"confidence\": a number 0-1, how durable and reusable this is.\n"
+    "- \"relevance\": judge this learning against WHAT WE ALREADY KNOW — the catalog of already-known "
+    "concepts shown below the excerpt — one of:\n"
+    "    novel — nothing in what we already know covers this; it is new information.\n"
+    "    known — a known concept already states this; it is not new.\n"
+    "    contradicts — this OVERTURNS or corrects something a known concept asserts (a belief change — "
+    "the most important to surface).\n"
+    "  When the catalog is empty or you are unsure, answer \"novel\": never suppress a learning by "
+    "calling it known.\n\n"
     "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
     "holds nothing durable, output {\"events\": []}."
 )
@@ -115,9 +142,14 @@ def structural_cues(text: str) -> list[str]:
     return cues
 
 
-def _user_prompt(chunk_text: str, cues: list[str]) -> str:
+def _user_prompt(chunk_text: str, cues: list[str], known: str | None = None) -> str:
     hint = ("\n\nStructural cues (weigh, do not over-trust): " + "; ".join(cues)) if cues else ""
-    return f"Excerpt:\n{chunk_text}{hint}"
+    # The concept digest ("what we already know") rides BELOW the excerpt so the model judges each event's
+    # `relevance` against it (4b/ADR-0019). It is PROVENANCE-RELEVANT to this chunk (ordered by facet
+    # overlap), so the concepts most likely to already cover it survive the digest's budget cut.
+    known_block = (f"\n\nWHAT WE ALREADY KNOW (judge each learning's relevance against this):\n{known}"
+                   if known else "")
+    return f"Excerpt:\n{chunk_text}{hint}{known_block}"
 
 
 def parse_candidates(text: str) -> list[dict]:
@@ -183,6 +215,7 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
         "evidence": [{"byte_start": bstart, "byte_end": bend}],
         "summary": str(candidate.get("summary", "")).strip()[:SUMMARY_MAX],
         "markers": _clean_markers(candidate.get("markers")),
+        "relevance": clean_relevance(candidate.get("relevance")),   # novelty vs the store (unknown → novel)
         "confidence": _clean_score(candidate.get("confidence"), 0.5),
         "producer": {"stage": "glean", "model": model, "prompt_version": PROMPT_VERSION,
                      "run_id": run_id, "cost_usd": None},
@@ -215,6 +248,10 @@ def event_content(ev: dict) -> dict:
         "evidence": ev["evidence"],
         "summary": ev["summary"],
         "markers": ev["markers"],
+        # `relevance` reads DEFENSIVELY: a pre-4b (glean/2) event blob lacks it → projects as `novel`, the
+        # recall-safe default, so an old event never sinks in dream's queue on a missing field. A glean/3
+        # re-extraction (the PROMPT_VERSION bump) re-stamps the real verdict; latest version wins.
+        "relevance": clean_relevance(ev.get("relevance")),
         "confidence": ev["confidence"],
         "supersedes": ev.get("supersedes"),
     }
@@ -283,6 +320,17 @@ class GleanBlock:
         self.events = 0           # events ingested this run (== block.Report.outputs)
         self.rejected = 0         # candidates whose quote failed verification
         self.calls = 0            # LLM calls made (signal-bearing chunks; filter-skips don't call)
+        # The concept digest seam (4b/ADR-0019): the run-invariant facet pass is built ONCE (first signal
+        # chunk) and re-rendered per chunk with that chunk's `relevant_to`, so the O(concepts) raw re-parse
+        # is paid once per run, not once per chunk; `_facet_cache` shares each cleaned blob's facets across
+        # chunks. `None` until built — a glean run with zero signal chunks never touches concepts.
+        self._digest_ctx: dict | None = None
+        self._facet_cache: dict = {}
+        # The digest-disable latch (4b/ADR-0019): a persistent build failure (a bug in `digest_context`/
+        # `chunk_facets`/`concept_digest`) sets this on the FIRST exception, so every later chunk
+        # short-circuits to the empty sentinel WITHOUT re-attempting the expensive build (no retry-storm).
+        # Surfaced ONCE in the run summary — a permanent novelty-disable must be detectable, not silent.
+        self._digest_failed = False
         # per-chunk audit recorded for marker_extra (set in process, read by the driver immediately after)
         self._last: dict = {}
 
@@ -330,6 +378,31 @@ class GleanBlock:
         interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
         return has_user + diversity + interaction
 
+    # -- the concept digest seam: "what we already know", provenance-relevant to THIS chunk --------
+
+    def _relevant_digest(self, cleaned_hash: str, root: Path) -> str:
+        """The bounded, structured "what we already know" render (ADR-0018) ORDERED to THIS chunk: the
+        concepts most facet-overlapping the chunk's provenance survive the digest's budget cut, so a
+        near-duplicate of a thin, single-session concept is judged `known`, not falsely `novel` (4b/ADR-
+        0019). The expensive facet pass (`digest_context`) is cached on the instance — built once per run,
+        re-rendered per chunk with the chunk's `relevant_to`.
+
+        ADVISORY + RECALL-FIRST: this only shapes the model's relevance verdict, never the trust anchor, so
+        any failure to BUILD the context degrades to the empty sentinel rather than costing an extraction —
+        the model then sees nothing known and defaults every event to `novel` (the recall-safe direction).
+        The `concepts` import is FUNCTION-LOCAL: concepts→dream→glean would cycle on a top-level import."""
+        from . import concepts                       # lazy: avoids the concepts→dream→glean import cycle
+        if self._digest_failed:                      # a prior build raised → novelty is OFF for the run;
+            return concepts.DIGEST_EMPTY             # don't re-attempt the expensive build every chunk
+        try:
+            if self._digest_ctx is None:
+                self._digest_ctx = concepts.digest_context(root)
+            facets = concepts.chunk_facets(cleaned_hash, root, cache=self._facet_cache)
+            return concepts.concept_digest(root, relevant_to=facets, context=self._digest_ctx)
+        except Exception:                            # advisory signal: never block extraction (recall-first;
+            self._digest_failed = True               # KeyboardInterrupt/BaseException still propagate, ADR-
+            return concepts.DIGEST_EMPTY             # 0009). Latch OFF + surface once — not silent forever.
+
     # -- extract ONE chunk -------------------------------------------------------------------
 
     def process(self, item: ChunkItem, *, root: Path, run_id: str) -> tuple[int, float]:
@@ -346,7 +419,10 @@ class GleanBlock:
             self._last = {"n_rejected": 0, "n_calls": 0, "cleaned_hash": ch.cleaned_hash}
             return (0, 0.0)                       # filter-skip: still marked done (0-output marker)
 
-        prompt = _user_prompt(text, structural_cues(text))   # our code; a bug here surfaces (not isolated)
+        known = self._relevant_digest(ch.cleaned_hash, root)   # "what we already know", relevant to THIS chunk;
+        # the per-chunk digest build is glean's DELIBERATE advisory exception — a bug there is ISOLATED +
+        # recall-first (swallowed → empty sentinel, latched off; see `_relevant_digest`), NOT surfaced.
+        prompt = _user_prompt(text, structural_cues(text), known)  # our code; a bug HERE surfaces (driver errored)
         comp = self.complete(SYSTEM_PROMPT, prompt)           # the sole LLM call; raising → driver errored
         self.calls += 1
         call_cost = completer.cost_of(comp)
@@ -519,6 +595,10 @@ def main(argv=None) -> None:
     print(f"\nglean-{report.run_id}: {report.examined} examined, {report.processed} done, "
           f"{report.skipped} skipped, {report.outputs} events, {blk.rejected} rejected{errs}, "
           f"${report.cost_usd:.4f}{tail}")
+    if blk._digest_failed:                           # the digest-disable latch tripped — surface it ONCE so a
+        print("  WARNING: concept digest build failed — novelty awareness was DISABLED this run "  # permanent
+              "(every event judged `novel`); see GleanBlock._relevant_digest. This is glean's deliberate "  # off
+              "advisory exception (isolated + recall-first), not a crash.")                          # is visible
 
 
 if __name__ == "__main__":
