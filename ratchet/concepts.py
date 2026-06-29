@@ -354,6 +354,120 @@ def concept_clusters(root: Path | None = None) -> list[dict]:
     return leader_clusters(ids, facets)
 
 
+# --- the concept DIGEST: a BOUNDED, STRUCTURED "what we already know" read-view for prompts --------
+# The flat list dream injected (`- id X: title — statement`) hid every relation the gardener built. The
+# digest is the structured replacement the upstream LLM stages read to gauge Bayesian surprise against the
+# store — concepts GROUPED by their facet cluster, each carrying its managed tags + asserted relations. It
+# is rendered IN-PROMPT (no embeddings, no queryable index — ADR-0018), so it must stay BOUNDED: the
+# maturity gate + the gardener's consolidation keep the live set small, and `budget` is the backstop that
+# drops the long tail (least-corroborated first) when it does not.
+
+DIGEST_BUDGET = 80          # default CONCEPT cap — beyond it, only the most-entrenched render (rest → +N more)
+DIGEST_STATEMENT_MAX = 140  # truncate each statement so per-concept size is bounded, not just the count
+DIGEST_EMPTY = "(no concepts yet — treat everything as new)"   # the sentinel: never relate against nothing
+
+
+def _digest_entrench(node: dict, evidence_count: int) -> tuple[int, int]:
+    """The ENTRENCHMENT key a concept is ranked by when the digest must truncate — distinct cited SESSIONS
+    first (the same corroboration signal dream's maturity gate trusts: a belief seen across more sessions is
+    more durable), evidence-pointer count as the tie-break. So a partial digest keeps the load-bearing
+    beliefs and sheds the thin, single-session tail."""
+    return (len(node["facets"].get("sessions", [])), evidence_count)
+
+
+def _digest_relations(edges: list[dict]) -> dict[str, list[str]]:
+    """Per-concept OUTGOING asserted relations as compact strings (`<kind> → <dst> (note)`) — the gardener's
+    `generalizes`/`supersedes`/`relates-to` edges (3c/ADR-0015), the STRUCTURE the flat list dropped. Showing
+    a concept's outgoing `generalizes` surfaces the hierarchy spine right on the parent's line, so the tree
+    needs no separate render. The DERIVED facet-overlap edges are deliberately NOT shown — they ARE the
+    clustering (already the grouping axis); only the gardener's DELIBERATE relations add signal here."""
+    rel: dict[str, list[str]] = {}
+    for e in edges:
+        if not e.get("asserted"):
+            continue
+        note = f" ({e['note']})" if e.get("note") else ""
+        rel.setdefault(e["source"], []).append(f"{e['kind']} → {e['target']}{note}")
+    return rel
+
+
+def _digest_shared(members: list[str], by_node: dict) -> str:
+    """The facet a cluster's members hold in COMMON — the legible BASIS of the grouping, so the model sees
+    WHAT a cluster shares (`shares file: foo.py`) instead of an opaque leader id. Intersect members' facets,
+    most-salient axis first (file > repo > tool — `facet_score`'s weight order). A transitively-joined cluster
+    with no globally-common facet → no annotation (each concept's own line still carries its facets)."""
+    for axis, label in (("files", "file"), ("repos", "repo"), ("tools", "tool")):
+        common = set.intersection(*(set(by_node[m]["facets"].get(axis) or ()) for m in members))
+        if common:
+            shown = sorted(common)[:3]
+            more = f" +{len(common) - len(shown)}" if len(common) > len(shown) else ""
+            return f" · shares {label}: {', '.join(shown)}{more}"
+    return ""
+
+
+def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET) -> str:
+    """A BOUNDED, STRUCTURED rendering of the current valid concept layer for prompt injection — the "what
+    we already know" read-back the upstream LLM stages judge novelty/belief-change against (ADR-0018,
+    replacing dream's flat `_render_concepts`). Built from `concept_graph` in ONE facet pass: concepts
+    GROUPED BY their facet CLUSTER (the complete partition — every concept lands in exactly one), each line
+    its id + title + truncated statement + its managed TAGS (3b/ADR-0014) + its outgoing asserted RELATIONS
+    (generalizes/supersedes/relates-to — the hierarchy spine, 3c/ADR-0015). A rebuildable read-view, never
+    stored, like the rest of this module.
+
+    BOUNDED by `budget` (a CONCEPT cap): with more than `budget` concepts, keep the most-ENTRENCHED (most
+    distinct cited sessions, then most evidence — `_digest_entrench`) and drop the long tail, emitting a
+    `…(+N more)` marker so the model KNOWS the view is partial — those concepts EXIST, they are just not
+    shown — rather than treating a dropped lesson as new. The empty set yields a clear sentinel so a stage is
+    never asked to relate against nothing. budget <= 0 disables the cap (render all)."""
+    root = root or config.data_root()
+    g = concept_graph(root)
+    nodes = g["nodes"]
+    if not nodes:
+        return DIGEST_EMPTY
+    by_node = {n["id"]: n for n in nodes}
+    blobs = {c["id"]: c for c in dream.load_concepts(root)}     # statements + evidence count live on the blob
+    evid = {cid: len(blobs.get(cid, {}).get("evidence") or []) for cid in by_node}
+    relations = _digest_relations(g["edges"])
+
+    # RANK every concept entrenchment-DESC, id-ASC; the top `budget` survive, the long tail drops. `rank`
+    # drives both member order (most-entrenched first) and cluster order (each cluster follows its best).
+    def sortkey(cid: str) -> tuple:
+        s, e = _digest_entrench(by_node[cid], evid[cid])
+        return (-s, -e, cid)
+    ordered = sorted(by_node, key=sortkey)
+    kept = set(ordered[:budget]) if budget > 0 else set(ordered)
+    rank = {cid: i for i, cid in enumerate(ordered)}
+    dropped = len(ordered) - len(kept)
+
+    rendered: list[tuple[int, str, list[str]]] = []     # (best-member rank, leader, surviving members)
+    for cl in g["clusters"]:
+        members = sorted((m for m in cl["members"] if m in kept), key=lambda m: rank[m])
+        if members:
+            rendered.append((rank[members[0]], cl["leader"], members))
+    rendered.sort(key=lambda t: t[0])
+
+    lines = ["KNOWN CONCEPTS — what the memory already holds, grouped by facet cluster "
+             "(most-entrenched first):"]
+    for _, leader, members in rendered:
+        lines.append("")
+        shares = _digest_shared(members, by_node) if len(members) >= 2 else ""
+        lines.append(f"[{leader}] cluster ({len(members)}){shares}:")
+        for cid in members:
+            node = by_node[cid]
+            title = str(node.get("title", "")).strip()
+            _st = str(blobs.get(cid, {}).get("statement", "")).strip()
+            statement = (_st[:DIGEST_STATEMENT_MAX - 1] + "…") if len(_st) > DIGEST_STATEMENT_MAX else _st
+            tags = node["facets"].get("tags") or []
+            tagstr = f"  · tags: {', '.join(tags)}" if tags else ""
+            lines.append(f"  - {cid}: {title} — {statement}{tagstr}")
+            rels = relations.get(cid)
+            if rels:
+                lines.append(f"      {'; '.join(rels)}")
+    if dropped:
+        lines.append("")
+        lines.append(f"…(+{dropped} more, dropped as least-corroborated)")
+    return "\n".join(lines)
+
+
 # --- CLI: dump the graph for spot-checking (mirrors the other stages' read-only inspectors) -------
 
 def main(argv=None) -> None:
@@ -362,6 +476,10 @@ def main(argv=None) -> None:
     ap.add_argument("--clusters", action="store_true", help="print only the facet-overlap clusters")
     ap.add_argument("--hierarchy", action="store_true",
                     help="print only the generalization spine (the gardener's `generalizes` edges)")
+    ap.add_argument("--digest", action="store_true",
+                    help="print the bounded, structured concept digest dream injects (4a)")
+    ap.add_argument("--budget", type=int, default=DIGEST_BUDGET,
+                    help=f"the digest's concept cap (default: {DIGEST_BUDGET})")
     ap.add_argument("--json", action="store_true", help="emit the full graph as JSON (default: a summary)")
     args = ap.parse_args(argv)
 
@@ -370,6 +488,9 @@ def main(argv=None) -> None:
         return
     if args.hierarchy:
         print(json.dumps(concept_hierarchy(), ensure_ascii=False, indent=2))
+        return
+    if args.digest:
+        print(concept_digest(budget=args.budget))
         return
     graph = concept_graph()
     if args.json:

@@ -187,11 +187,11 @@ def valid_concept_ids(root: Path | None = None) -> set[str]:
     return {c["id"] for c in load_concepts(root)}
 
 
-def _render_concepts(concepts: list[dict]) -> str:
-    if not concepts:
-        return "(none known yet — treat every takeaway as new)"
-    return "\n".join(f"- id {c['id']}: {str(c.get('title', '')).strip()} — "
-                     f"{str(c.get('statement', '')).strip()[:200]}" for c in concepts)
+# The flat `_render_concepts` is GONE (4a/ADR-0018): dream now injects `concepts.concept_digest` — a
+# bounded, STRUCTURED render of the concept graph (clustered, with tags + asserted relations) so synth
+# judges belief-change against what we already know AND its structure, not a flat bag. The digest is built
+# ONCE per run in `DreamBlock.items` (a function-local import breaks the dream↔concepts cycle) and threaded
+# down as a pre-rendered string; the standalone synth fns take that string verbatim.
 
 
 # --- the resolved event: a glean event re-anchored to its TRUSTED verbatim quote -----------------
@@ -552,13 +552,13 @@ def route(rv: ResolvedEvent, cat: list[dict], complete_route: Completer) -> tupl
 
 # --- APPLY: synthesize a new takeaway, or bump an existing one's support ---------------------------
 
-def _synth_user(rv: ResolvedEvent, concepts: list[dict]) -> str:
-    return (f"Known concepts:\n{_render_concepts(concepts)}\n\n"
+def _synth_user(rv: ResolvedEvent, concept_digest: str) -> str:
+    return (f"Known concepts:\n{concept_digest}\n\n"
             f'OBSERVATION\nquote: """{rv.quote}"""\n'
             f'summary: {str(rv.event.get("summary", "")).strip()!r}')
 
 
-def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concepts: list[dict], *,
+def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
                    known_concept_ids: set[str], model: str, run_id: str) -> tuple[dict | None, float]:
     """Mint a takeaway from ONE event (the injected SYNTH Completer, Sonnet). `drop` or no usable `why`
     → (None, cost): a successful adjudication that this event is noise (apply marks it consolidated so it
@@ -566,7 +566,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concepts: list[
     entry (span + verbatim quote + context, re-validated on write), support {1, 1}, the cited event's
     markers, a coerced relation, last_seen = now. Raises only if the completer fails (the driver isolates
     it)."""
-    comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concepts))
+    comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concept_digest))
     cost = completer.cost_of(comp)
     parsed = completer.parse_json_object(comp.text) or {}
     if not parsed or parsed.get("drop"):
@@ -595,7 +595,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concepts: list[
     return tk, cost
 
 
-def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, concepts: list[dict], *,
+def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
                    known_concept_ids: set[str], drift_threshold: float,
                    model: str, run_id: str) -> tuple[dict, float]:
     """BUMP SUPPORT — the cheap path (NO LLM by default). Build a NEW VERSION of `tk` (same id): append
@@ -635,7 +635,7 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
     nv["last_seen"] = config.now()
     cost = 0.0
     if _drift(rv, tk) > drift_threshold:           # far evidence → the why may no longer cover it
-        comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concepts))
+        comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concept_digest))
         cost = completer.cost_of(comp)
         parsed = completer.parse_json_object(comp.text) or {}
         why = str(parsed.get("why", "")).strip()[:WHY_MAX]
@@ -688,7 +688,7 @@ def update_contradictions(tk: dict, rv: ResolvedEvent) -> tuple[dict, float]:
     return nv, 0.0
 
 
-def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concepts: list[dict],
+def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concept_digest: str,
           *, known_concept_ids: set[str], drift_threshold: float, model: str, run_id: str,
           root: Path) -> tuple[int, float, dict | None]:
     """Route-result → commits. The COMMIT ORDER is the crash invariant: the takeaway version FIRST
@@ -719,7 +719,7 @@ def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Complete
         _write_consolidated(rv.id, nv["id"], "weaken", run_id=run_id, root=root)  # consolidated LAST
         return 1, cost, nv
     if decision == "new":
-        tk, cost = synthesize_new(rv, complete_synth, concepts, known_concept_ids=known_concept_ids,
+        tk, cost = synthesize_new(rv, complete_synth, concept_digest, known_concept_ids=known_concept_ids,
                                   model=model, run_id=run_id)
         if tk is None:
             _write_consolidated(rv.id, None, "new", run_id=run_id, root=root)   # noise: do not re-synth
@@ -730,10 +730,10 @@ def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Complete
     # strengthen
     tk = cat_by_id.get(rr["takeaway_id"])
     if tk is None:                                 # id vanished between route + apply → fall back to new
-        return apply(rv, {"decision": "new", "takeaway_id": None}, cat_by_id, complete_synth, concepts,
+        return apply(rv, {"decision": "new", "takeaway_id": None}, cat_by_id, complete_synth, concept_digest,
                      known_concept_ids=known_concept_ids, drift_threshold=drift_threshold,
                      model=model, run_id=run_id, root=root)
-    nv, cost = update_support(tk, rv, complete_synth, concepts, known_concept_ids=known_concept_ids,
+    nv, cost = update_support(tk, rv, complete_synth, concept_digest, known_concept_ids=known_concept_ids,
                               drift_threshold=drift_threshold, model=model, run_id=run_id)
     _ingest_takeaway(nv, model=model, run_id=run_id, root=root)                  # takeaway FIRST
     _write_consolidated(rv.id, nv["id"], "strengthen", run_id=run_id, root=root)  # consolidated LAST
@@ -937,6 +937,7 @@ class DreamBlock:
         # the on-instance catalog (loaded once in items(), folded as events consolidate within the run).
         self._concepts: list[dict] = []
         self._known_ids: set[str] = set()
+        self._digest: str = ""                         # the bounded structured concept digest, built once
         self._cat: list[dict] = []
         self._cat_by_id: dict[str, dict] = {}
         # RunReport-shaped tallies (read by the shim/CLI).
@@ -952,8 +953,10 @@ class DreamBlock:
         """Load the concepts + the ON-INSTANCE catalog ONCE, then yield the salience-ordered working set.
         `source_id` is ignored (dream is a global pass). The driver eager-lists this, sorts by `priority`,
         and caps by --limit."""
+        from .concepts import concept_digest          # lazy: breaks the dream↔concepts cycle (ADR-0018)
         self._concepts = load_concepts(root)
         self._known_ids = {c["id"] for c in self._concepts}      # all str (load_concepts guarantees it)
+        self._digest = concept_digest(root)            # the STRUCTURED render synth judges belief-change on
         self._cat = catalog(root)
         self._cat_by_id = {t["id"]: t for t in self._cat}
         ws = working_set(root, min_confidence=self.min_confidence)
@@ -973,7 +976,7 @@ class DreamBlock:
         driver isolates the event as errored (no consolidated decision → retried next run)."""
         rr, route_cost = route(rv, self._cat, self.complete_route)
         n_out, apply_cost, tk = apply(
-            rv, rr, self._cat_by_id, self.complete_synth, self._concepts,
+            rv, rr, self._cat_by_id, self.complete_synth, self._digest,
             known_concept_ids=self._known_ids, drift_threshold=self.drift_threshold,
             model=self.synth_model, run_id=run_id, root=root)
         if tk is not None:
