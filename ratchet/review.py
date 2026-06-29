@@ -303,6 +303,145 @@ def valid_concepts(root: Path | None = None) -> list[dict]:
     return dream.load_concepts(root)
 
 
+# --- the SECOND review tier: the gardener's queued structural-op proposals (3d, ADR-0017) --------
+#
+# Tier 1 (above) promotes synthesized TAKEAWAYS into concepts. Tier 2 here gates the gardener's
+# STRUCTURAL ops (merge/split/abstract/reparent/retire of concepts + tag curation) — the high-stakes
+# proposals 3c-ii (ADR-0016) QUEUED rather than auto-applied. Same human-gate shape (ADR-0008): the
+# op's RATIONALE is UNTRUSTED (the exact status of a takeaway's `why`), so the reviewer is served the
+# CITED concepts' RE-VALIDATED evidence as the ground truth, accept APPLIES the op via the trusted 3c-i
+# machinery, and reject SUPPRESSES re-surfacing (the gardener remembers dismissals — `queue_proposal`).
+#
+# `garden` is imported FUNCTION-LOCALLY everywhere below: garden imports review (for `resolve_evidence`)
+# at module load, so a top-level review→garden import would cycle — the same break `concepts`↔`garden`
+# uses. review serves the materials + records the verdict; the blob shapes + op fns live in garden.
+
+
+def _present_proposal(proposal: dict, root: Path, *, context_bytes: int) -> dict:
+    """The reviewer's view of one structural-op proposal: the op + params + UNTRUSTED rationale, plus EACH
+    cited concept with its title/statement, whether it is still VALID, and its RE-VALIDATED evidence — the
+    trust chain reaches the reviewer so the faithfulness check (does the rationale FOLLOW from the evidence?)
+    has ground truth to judge against. A `retire`/`merge` of a still-valid concept is visible via the `valid`
+    flag the skill escalates on. A cited concept whose blob is gone shows empty evidence — the gap is shown,
+    never silently dropped."""
+    from . import garden
+    valid = dream.valid_concept_ids(root)
+    cited: list[dict] = []
+    for cid in proposal.get("concept_ids") or []:
+        blob = garden._concept_blob(cid, root) or {}    # the latest concept version, valid OR not
+        cited.append({
+            "concept_id": cid,
+            "title": blob.get("title", ""),
+            "statement": blob.get("statement", ""),
+            "valid": cid in valid,
+            "evidence": resolve_evidence({"evidence": blob.get("evidence") or []}, root,
+                                         context_bytes=context_bytes),
+        })
+    return {
+        "proposal_id": proposal.get("proposal_id"),
+        "op": proposal.get("op"),
+        "params": proposal.get("params") or {},
+        "rationale": proposal.get("rationale", ""),
+        "stakes": proposal.get("stakes"),
+        "cluster_leader": proposal.get("cluster_leader"),
+        "concepts": cited,
+    }
+
+
+def pending_proposals(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES) -> list[dict]:
+    """The SECOND review tier: the gardener's open structural-op proposals (`garden.open_proposals`), each
+    rendered for the human with its op + params + rationale and the CITED concepts' RE-VALIDATED evidence. The
+    rationale is UNTRUSTED (a proposer's justification, like a takeaway's `why`); the EVIDENCE is the ground
+    truth the trust chain carries to the reviewer (re-resolved via `resolve_evidence`, a stale span dropped).
+    The rich VIEW over the raw `garden.open_proposals` source. Distinct from the takeaway `pending` tier — a
+    parallel queue with its own accept/reject verbs."""
+    from . import garden
+    root = root or config.data_root()
+    return [_present_proposal(p, root, context_bytes=context_bytes) for p in garden.open_proposals(root)]
+
+
+def _apply_proposal(proposal: dict, *, root: Path, run_id: str, reviewer: str,
+                    split_parts: list[dict] | None, allow_no_evidence: bool):
+    """APPLY a proposal's op by calling the matching 3c-i `garden` fn with the proposal's params — the SAME
+    trusted, append-only machinery 3c-ii auto-applies the low-stakes ops through, so accept and auto-apply land
+    byte-identical effects. Returns the op's own result (winner id / new part ids / parent id / edge hash / None).
+
+    `split` is the one op the proposal cannot fully carry: its per-part EVIDENCE PARTITION is the human's to
+    choose (why a split is never auto-applied — ADR-0016 N1), and the queued params hold only {title, statement}
+    per part. So the reviewer supplies `split_parts` ({title, statement, evidence} each); absent it we fall back
+    to the queued parts (no evidence → `garden.split` REFUSES unless `allow_no_evidence`), surfacing the
+    requirement rather than guessing a partition."""
+    from . import garden
+    op, p = proposal["op"], proposal.get("params") or {}
+    note = proposal.get("rationale", "")
+    if op == "merge":
+        return garden.merge(p["loser_ids"], p["winner_id"], root=root, run_id=run_id,
+                            allow_no_evidence=allow_no_evidence)
+    if op == "split":
+        parts = split_parts if split_parts is not None else (p.get("parts") or [])
+        return garden.split(p["concept_id"], parts, root=root, run_id=run_id,
+                           allow_no_evidence=allow_no_evidence)
+    if op == "abstract":
+        return garden.abstract(p["child_ids"], p["title"], p.get("statement", ""), root=root,
+                              run_id=run_id, allow_no_evidence=allow_no_evidence)
+    if op == "reparent":
+        garden.reparent(p["concept_id"], p["parent_id"], root=root, run_id=run_id)
+        return None
+    if op == "retire":
+        garden.retire(p["concept_id"], reason=note, reviewer=reviewer, root=root)
+        return None
+    if op == "relate":
+        return garden.assert_edge(p["src"], "relates-to", p["dst"], note=note, root=root,
+                                  run_id=run_id, op="accept_proposal")[0]
+    if op == "merge_tags":
+        return garden.merge_tags(p["loser_slug"], p["winner_slug"], note=note, root=root, run_id=run_id)[0]
+    if op == "retire_tag":
+        return garden.retire_tag(p["slug"], note=note, root=root, run_id=run_id)[0]
+    raise ValueError(f"cannot apply proposal op {op!r}")
+
+
+def accept_proposal(proposal_id: str, root: Path | None = None, *, assessment: str = "",
+                    reviewer: str = "sulin", note: str = "", split_parts: list[dict] | None = None,
+                    allow_no_evidence: bool = False) -> dict:
+    """Accept a queued structural-op proposal: APPLY the op (its 3c-i `garden` fn) so the concept graph
+    reorganizes — a `merge` unions the winner + invalidates the losers, a `retire` drops a concept, etc. —
+    THEN RECORD the accept (reviewer + Claude's faithfulness assessment). No status flip: the accept DECISION
+    is the proposal's whole lifecycle (`garden.open_proposals` derives RESOLVED from
+    `latest_decision(pid).verb in RESOLVE_VERBS`), so it drops from the open queue with no field to write —
+    byte-symmetric with tier-1's `accept`. Apply runs FIRST: a refused op (e.g. a split whose parts re-validate
+    to nothing) raises and leaves the proposal OPEN and unrecorded, never half-resolved. Tier 2's accept beside
+    the takeaway `accept`. Returns {proposal_id, op, status, result}."""
+    from . import garden
+    root = root or config.data_root()
+    proposal = garden._proposal_blob(proposal_id, root)
+    if proposal is None:
+        raise ValueError(f"no garden proposal {proposal_id!r}")
+    run_id = config.run_id()
+    result = _apply_proposal(proposal, root=root, run_id=run_id, reviewer=reviewer,
+                             split_parts=split_parts, allow_no_evidence=allow_no_evidence)
+    _record("accept_proposal", proposal_id, root, op=proposal["op"], reviewer=reviewer,
+            assessment=str(assessment)[:ASSESSMENT_MAX], note=str(note)[:ASSESSMENT_MAX],
+            result=result if isinstance(result, (str, list)) else None)
+    return {"proposal_id": proposal_id, "op": proposal["op"], "status": "accepted", "result": result}
+
+
+def reject_proposal(proposal_id: str, root: Path | None = None, *, reason: str = "",
+                    assessment: str = "", reviewer: str = "sulin") -> dict:
+    """Reject a queued structural-op proposal — RECORD the reject; the op is NOT applied, the concept graph is
+    untouched. No status flip: the reject DECISION is the proposal's lifecycle (`garden.open_proposals` drops
+    it via `RESOLVE_VERBS`), and `garden.queue_proposal` reads that same decision so a re-gardened cluster never
+    re-opens a dismissed op — the L2 loop closing, its full why at `queue_proposal`. Returns {proposal_id, op,
+    status}."""
+    from . import garden
+    root = root or config.data_root()
+    proposal = garden._proposal_blob(proposal_id, root)
+    if proposal is None:
+        raise ValueError(f"no garden proposal {proposal_id!r}")
+    _record("reject_proposal", proposal_id, root, op=proposal["op"], reviewer=reviewer,
+            reason=str(reason)[:ASSESSMENT_MAX], assessment=str(assessment)[:ASSESSMENT_MAX])
+    return {"proposal_id": proposal_id, "op": proposal["op"], "status": "rejected"}
+
+
 # --- CLI: the thin surface the /ratchet-review skill drives --------------------------------------
 
 def main(argv=None) -> None:
@@ -318,7 +457,16 @@ def main(argv=None) -> None:
     g.add_argument("--snooze", metavar="TAKEAWAY", help="defer a takeaway (needs --until)")
     g.add_argument("--retire", metavar="CONCEPT", help="take a concept out of the valid set")
     g.add_argument("--concepts", action="store_true", help="the current valid concept set")
+    g.add_argument("--proposals", action="store_true",
+                   help="the structural-op proposal queue (3d: op + rationale + cited concepts' evidence)")
+    g.add_argument("--accept-proposal", metavar="PROPOSAL",
+                   help="accept a structural-op proposal — APPLY the op via the 3c-i machinery")
+    g.add_argument("--reject-proposal", metavar="PROPOSAL",
+                   help="reject a structural-op proposal (NOT applied; suppresses re-surfacing)")
     ap.add_argument("--json", action="store_true", help="machine-readable output (the skill uses this)")
+    ap.add_argument("--split-parts",
+                    help="a split accept's per-part EVIDENCE PARTITION: JSON [{title,statement,evidence}] "
+                         "(the human's to choose — a queued split carries only title/statement)")
     ap.add_argument("--bytes", type=int, default=None, help="surrounding-context window size")
     ap.add_argument("--edit-title", help="accept with a corrected title")
     ap.add_argument("--edit-why", help="accept with a corrected why")
@@ -370,6 +518,23 @@ def main(argv=None) -> None:
         cs = valid_concepts()
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
               else "\n".join(f"  {c['id']}  {c.get('title', '')}" for c in cs) or "  (no valid concepts yet)")
+    elif args.proposals:
+        q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES)
+        if args.json:
+            print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
+        else:
+            _print_proposals(q)
+    elif args.accept_proposal:
+        split_parts = json.loads(args.split_parts) if args.split_parts else None
+        res = accept_proposal(args.accept_proposal, assessment=args.assessment, note=args.note,
+                              split_parts=split_parts, allow_no_evidence=args.allow_no_evidence)
+        print(json.dumps(res, ensure_ascii=False) if args.json
+              else f"accepted proposal {res['proposal_id']} → applied {res['op']}"
+                   + (f" → {res['result']}" if res["result"] else ""))
+    elif args.reject_proposal:
+        res = reject_proposal(args.reject_proposal, reason=args.reason, assessment=args.assessment)
+        print(json.dumps(res, ensure_ascii=False) if args.json
+              else f"rejected proposal {res['proposal_id']} ({res['op']}) — not applied, won't re-surface")
 
 
 def _incubating_tail(incubating_count: int) -> str:
@@ -396,6 +561,27 @@ def _print_queue(q: list[dict], *, incubating_count: int = 0) -> None:
     tail = _incubating_tail(incubating_count)
     if tail:
         print(tail.lstrip("\n"))
+
+
+def _print_proposals(q: list[dict]) -> None:
+    """The structural-op proposal queue, with each cited concept's verified evidence inline (✓) — the human
+    judges whether the UNTRUSTED rationale follows from that ground truth. A still-valid `retire`/`merge`
+    target is flagged, the skill's escalation cue."""
+    if not q:
+        print("no structural-op proposals queued — nothing to review.")
+        return
+    print(f"{len(q)} structural-op proposal(s) to review:\n")
+    for i, p in enumerate(q, 1):
+        st = f" · stakes {p['stakes']:.2f}" if isinstance(p.get("stakes"), (int, float)) else ""
+        print(f"{i}/{len(q)} · {p['op']}{st}  [{p['proposal_id']}]")
+        print(f"  RATIONALE (untrusted): {p['rationale']}")
+        print(f"  PARAMS: {p['params']}")
+        for c in p["concepts"]:
+            flag = "" if c["valid"] else "  (no longer valid)"
+            print(f"    concept {c['concept_id']}{flag}: {c['title']}")
+            for ev in c["evidence"]:
+                print(f"      ✓ {ev['quote'][:100]!r}")
+        print()
 
 
 def _print_incubating(inc: list[dict]) -> None:

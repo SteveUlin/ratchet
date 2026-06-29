@@ -6,11 +6,10 @@ load-bearing checks, all on the blob model:
 
   COERCION — `_clean_op` (mirror dream's `_clean_route`) drops an op of an unknown kind, an op citing a
     concept NOT in this cluster (a valid singleton outside it), and an op citing a NONEXISTENT id.
-  ROUTE — a HIGH-stakes `merge` is QUEUED (a `garden_proposal`, status pending) and NOT applied (the
-    concepts stay valid, the winner blob unchanged, no supersedes edge); a LOW-stakes `relate` (a
-    relates-to edge) is AUTO-APPLIED (the 3c-i effect lands).
-  QUEUE — `pending_proposals` folds the open queue; the proposal carries op + cited ids + rationale +
-    stakes + status.
+  ROUTE — a HIGH-stakes `merge` is QUEUED (a `garden_proposal`) and NOT applied (the concepts stay valid,
+    the winner blob unchanged, no supersedes edge); a LOW-stakes `relate` (a relates-to edge) is AUTO-APPLIED
+    (the 3c-i effect lands).
+  QUEUE — `open_proposals` folds the open queue; the proposal carries op + cited ids + rationale + stakes.
   IDEMPOTENT — re-running done-skips a cluster already processed against the same prompt version/model
     (ZERO proposer calls).
   N1 / SPLIT — a `split` is NEVER auto-applicable (its per-part evidence partition is the human's), so even
@@ -173,20 +172,20 @@ assert not active_edge("c-k1", "relates-to", "c-ghost"), "the nonexistent-id rel
 print("OK §1 — high-stakes merge QUEUED (concepts unchanged); low-stakes relate AUTO-APPLIED; drops leave no trace.")
 
 
-# === 2. pending_proposals folds the open queue; the proposal carries the op + ids + rationale + stakes
+# === 2. open_proposals folds the open queue; the proposal carries the op + ids + rationale + stakes
 
-q = garden.pending_proposals(R)
+q = garden.open_proposals(R)
 assert len(q) == 1, f"exactly one proposal is queued (the merge): {len(q)}"
 p = q[0]
 assert p["op"] == "merge" and set(p["concept_ids"]) == {"c-k1", "c-k2"}, \
     f"the queued proposal is the merge over c-k1/c-k2: {p['op']} {p['concept_ids']}"
-assert p["status"] == "pending", "a fresh proposal is pending (awaiting the 3d gate)"
+assert "status" not in p, "a queued proposal carries NO status field — the resolve decision is its lifecycle"
 assert p["rationale"] == "k1 and k2 say the same thing", "the UNTRUSTED rationale rides into the proposal"
 assert p["stakes"] > garden.AUTO_APPLY_MAX_STAKES, "the queued op's recorded stakes are above the auto cut"
 assert p["proposal_id"] == garden.mint_proposal_id(merge_desc), "the proposal id is the op's deterministic identity"
 # the queued op did NOT touch the concept layer (re-assert: a garden_proposal is inert until 3d accepts).
 assert blobstore.latest_version("c-k1", R) == k1_before, "queuing a proposal mutates nothing in the concept layer"
-print("OK §2 — pending_proposals folds the open queue; the proposal carries op + cited ids + rationale + stakes.")
+print("OK §2 — open_proposals folds the open queue; the proposal carries op + cited ids + rationale + stakes.")
 
 
 # === 3. idempotency: re-running done-skips the already-gardened cluster (ZERO proposer calls) ========
@@ -196,7 +195,7 @@ run2 = garden.run_propose(proposer, root=R)
 assert run2.examined == 1 and run2.skipped == 1 and run2.processed == 0, \
     f"the cluster (same prompt/model) is done-skipped: examined={run2.examined} skipped={run2.skipped}"
 assert proposer.calls == calls_before, "an idempotent re-run makes ZERO proposer calls"
-assert len(garden.pending_proposals(R)) == 1, "the queue is unchanged (no duplicate proposal)"
+assert len(garden.open_proposals(R)) == 1, "the queue is unchanged (no duplicate proposal)"
 assert "c-k2" in valid_ids() and active_edge("c-k1", "relates-to", "c-k3"), "the prior run's effects are stable"
 print("OK §3 — a cluster gardened against the current prompt/model is done-skipped; no churn, no duplicate.")
 
@@ -205,7 +204,7 @@ print("OK §3 — a cluster gardened against the current prompt/model is done-sk
 # split's per-part EVIDENCE PARTITION is the human's to choose, so `_apply_op` can't apply it. WITHOUT N1, a
 # manually-raised threshold (>= 0.85) would send op_stakes .87 down the auto path INTO `_apply_op`'s raise —
 # erroring the whole cluster and stranding the split (neither applied nor queued). N1 routes a non-auto-
-# applicable op to the QUEUE unconditionally, so the split lands in pending_proposals instead.
+# applicable op to the QUEUE unconditionally, so the split lands in open_proposals instead.
 SPLIT_OP = {"op": "split", "concept_id": "c-k1",
             "parts": [{"title": "split part a", "statement": "the narrower lesson a"},
                       {"title": "split part b", "statement": "the narrower lesson b"}],
@@ -224,7 +223,7 @@ assert run4.n_applied == 0 and run4.n_queued == 1, \
     f"the split was QUEUED, not auto-applied: applied={run4.n_applied} queued={run4.n_queued}"
 
 split_pid = garden.mint_proposal_id(split_desc)
-queue_ids = {p["proposal_id"] for p in garden.pending_proposals(R)}
+queue_ids = {p["proposal_id"] for p in garden.open_proposals(R)}
 assert split_pid in queue_ids, "the split landed in the pending queue (queued, not stranded)"
 # and it did NOT apply: c-k1 stays valid (no `split` decision invalidated it) — inert until 3d accepts.
 assert "c-k1" in valid_ids(), "the queued split did NOT invalidate c-k1 (a proposal is inert until 3d accepts)"

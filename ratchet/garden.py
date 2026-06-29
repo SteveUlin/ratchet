@@ -895,9 +895,9 @@ def op_stakes(op) -> float:
 # machine trusts — the faithfulness check belongs to 3d, not the proposer.
 #
 # A `garden_proposal` is the same blob/fold shape as every other ratchet artifact (ADR-0007): keyed on a
-# DETERMINISTIC proposal id (the op's identity), latest-wins, `status` "pending" until 3d re-versions it.
-# `pending_proposals(root)` folds the open queue. The 3d accept/reject surface is the NEXT section — here a
-# high-stakes op only gets QUEUED.
+# DETERMINISTIC proposal id (the op's identity), latest-wins — a QUEUED artifact with NO lifecycle field.
+# `open_proposals(root)` folds the queue and drops any proposal a 3d resolve DECISION (accept/reject) closed.
+# The 3d accept/reject surface is the NEXT section — here a high-stakes op only gets QUEUED.
 # ==================================================================================================
 
 PROPOSE_PROMPT_VERSION = "garden-ops/1"   # bump to re-propose over every cluster with a sharper prompt
@@ -916,6 +916,11 @@ AUTO_APPLY_MAX_STAKES = 0.35   # the auto/queue cut on the `op_stakes` gradient.
 
 PROPOSAL_KIND = "garden_proposal"   # an append-only QUEUED structural-op proposal (vs an op already applied)
 PROPOSAL_PREFIX = "gp-"             # garden_proposal source_id = PREFIX + sha256(op identity)[:12]
+RESOLVE_VERBS = frozenset({"accept_proposal", "reject_proposal"})   # the 3d gate's verdict verbs — review
+                                   # records one against a `gp-` proposal id. A proposal is RESOLVED iff its
+                                   # `blobstore.latest_decision` carries a verb in here; OPEN otherwise. The
+                                   # queue derives OPEN from this — no stored status (ADR-0017). garden owns
+                                   # the proposal-verb vocabulary; review references it.
 RATIONALE_MAX = 240                 # the proposer's one-line justification (UNTRUSTED — surfaced to 3d)
 QUOTES_PER_CONCEPT = 2              # a FEW verified evidence quotes per concept ground the proposer's call
 QUOTE_MAX = 160
@@ -1167,40 +1172,73 @@ def mint_proposal_id(desc: dict) -> str:
     return PROPOSAL_PREFIX + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
 
 
+def _proposal_blob(proposal_id: str, root: Path | None = None) -> dict | None:
+    """The latest VERSION of a `garden_proposal` source — its raw content dict, or None if unknown/malformed.
+    The single loader the queue fold and the 3d gate both go through, so they agree on what "the proposal" is.
+    The proposal carries NO lifecycle field; its resolution is a separate decision (`RESOLVE_VERBS`)."""
+    h = blobstore.latest_version(proposal_id, root or config.data_root())
+    if not h:
+        return None
+    try:
+        obj = json.loads(blobstore.get(h, root or config.data_root()))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return obj if isinstance(obj, dict) and obj.get("proposal_id") else None
+
+
 def queue_proposal(desc: dict, *, cluster_leader: str, stakes: float, root: Path | None = None,
                    run_id: str, model: str) -> tuple[str, bool]:
     """QUEUE a high-stakes op as an append-only `garden_proposal` blob for the 3d gate (NOT applied). Keyed on
-    the deterministic proposal id, latest-wins; `status` "pending" until 3d re-versions it. CONTENT is
-    run-invariant ({proposal_id, op, params, concept_ids, rationale, stakes, cluster_leader, status,
-    prompt_version}) so a crash-retry re-ingests byte-identically; the producer/cost ride in `origin_ref`. The
-    rationale rides in the body as the human-facing justification — UNTRUSTED, surfaced to 3d, never acted on
-    here. Returns (hash, written)."""
+    the deterministic proposal id, latest-wins; a QUEUED artifact with NO lifecycle field — its resolution is a
+    separate 3d decision (`RESOLVE_VERBS`), never a status on the blob. CONTENT is run-invariant ({proposal_id,
+    op, params, concept_ids, rationale, stakes, cluster_leader, prompt_version}) so a crash-retry re-ingests
+    byte-identically; the producer/cost ride in `origin_ref`. The rationale rides in the body as the
+    human-facing justification — UNTRUSTED, surfaced to 3d, never acted on here. Returns (hash, written).
+
+    REJECTED-OP SUPPRESSION (the L2 loop closing — the canonical why): the gardener REMEMBERS a 3d verdict.
+    `mint_proposal_id` is deterministic on op identity, so a re-gardened cluster re-proposes the SAME id —
+    re-queuing a fresh version over a dismissed op would RESURRECT it, the "re-suggests dismissed things"
+    trust-killer `review.reject_proposal` exists to close (MemPrompt). So once the 3d gate has RESOLVED a
+    proposal — `latest_decision(pid).verb` in `RESOLVE_VERBS` (rejected, the load-bearing case, OR accepted,
+    already applied) — leave it standing: skip the re-queue, return its existing version. Decision-sourced, so
+    accept AND reject both suppress. The FIRST queue (no decision) and a still-OPEN re-queue (byte-identical
+    no-op, or a new-rationale version) proceed."""
+    root = root or config.data_root()
     pid = mint_proposal_id(desc)
+    last = blobstore.latest_decision(pid, root)          # the 3d verdict if any — derived, never a stored status
+    if last and last.get("verb") in RESOLVE_VERBS:
+        return blobstore.latest_version(pid, root), False
     content = {"proposal_id": pid, "op": desc["op"], "params": desc["params"],
                "concept_ids": desc["concept_ids"], "rationale": desc["rationale"],
                "stakes": round(float(stakes), 4), "cluster_leader": cluster_leader,
-               "status": "pending", "prompt_version": PROPOSE_PROMPT_VERSION}
+               "prompt_version": PROPOSE_PROMPT_VERSION}
     body = blobstore.canonical_json(content)
     return blobstore.ingest(body, source_kind=PROPOSAL_KIND, source_id=pid,
                             origin_ref={"stage": "garden", "phase": "ops", "op": desc["op"], "model": model,
                                         "run_id": run_id, "prompt_version": PROPOSE_PROMPT_VERSION}, root=root)
 
 
-def pending_proposals(root: Path | None = None) -> list[dict]:
-    """The OPEN proposal queue — `latest_by_kind('garden_proposal')` folded latest-wins per proposal id, kept
-    while its latest version's `status` is "pending" (ADR-0007: state is a fold, never a flipped field). The
-    3d gate RESOLVES a proposal by appending a NEW VERSION with status accepted/rejected (latest-wins), so a
-    resolved proposal simply drops out of this fold — no 3d surface is built here. Sorted for stable bytes; a
+def open_proposals(root: Path | None = None) -> list[dict]:
+    """The OPEN proposal queue — `latest_by_kind('garden_proposal')` folded latest-wins per proposal id, MINUS
+    any the 3d gate has RESOLVED (its `latest_decision` verb in `RESOLVE_VERBS`). DECISION-DRIVEN, byte-symmetric
+    with tier-1's `review.pending` (the takeaway blob carries no review state either — the decision IS the
+    lifecycle, ADR-0007/0017): a queued proposal has no status field, so an accept/reject DECISION is the only
+    thing that drops it from this fold — no blob re-version, no flipped field. Sorted for stable bytes; a
     malformed/absent blob is skipped, never fatal."""
     root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)         # `gp-` targets carry only RESOLVE_VERBS decisions
     out: list[dict] = []
     for h in blobstore.latest_by_kind(PROPOSAL_KIND, root).values():
         try:
             obj = json.loads(blobstore.get(h, root))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(obj, dict) and obj.get("proposal_id") and obj.get("status") == "pending":
-            out.append(obj)
+        if not (isinstance(obj, dict) and obj.get("proposal_id")):
+            continue
+        d = decisions.get(obj["proposal_id"])
+        if d and d.get("verb") in RESOLVE_VERBS:         # accepted/rejected → out of the open queue
+            continue
+        out.append(obj)
     out.sort(key=lambda p: (p.get("op", ""), p["proposal_id"]))
     return out
 
@@ -1435,7 +1473,7 @@ def propose_main(argv=None) -> None:
     args = ap.parse_args(argv)
 
     if args.proposals:                                  # just inspect the open 3d queue
-        q = pending_proposals()
+        q = open_proposals()
         print(f"{len(q)} pending proposal(s) queued for the 3d gate:")
         for p in q:
             print(f"  {p['proposal_id']}  [{p['op']} · stakes {p['stakes']:.2f}]  {p['concept_ids']}")
