@@ -72,7 +72,7 @@ def _trigger(repos: list[str]) -> str:
     fires more usefully when the reader knows WHERE it applies. The THEME now lives in the group HEADING
     (the tag), so the trigger carries ONLY the repo — the strongest "where am I" provenance facet — no
     longer the tag (that would just echo the heading). A concept spanning several repos takes the first
-    (sorted, deterministic); a path-shaped repo is basenamed so no `/home/sulin/…` leaks into a rule.
+    (sorted, deterministic); a path-shaped repo is basenamed so no `/home/<user>/…` leaks into a rule.
     Returns a prefix ending in ": " (the verbatim statement follows), or "" when the concept has no repo —
     an unconditional rule then renders as just its statement."""
     if not repos:
