@@ -1247,6 +1247,138 @@ def open_proposals(root: Path | None = None) -> list[dict]:
     return out
 
 
+# ==================================================================================================
+# DECAY / STALENESS (3c-iii, ADR-0024): a DETERMINISTIC pass that surfaces QUIET concepts for review
+#
+# WEAKEN (ADR-0012) handles a concept you MOVED ON from — a contradiction demotes it. But a concept that
+# simply goes QUIET — a topic untouched for months, never contradicted, just un-corroborated — has no
+# signal demoting it today. Yet the signal EXISTS: `now − the most-recent valid-time among its evidence`.
+# A concept whose newest backing conversation is many months old has gone stale by DISUSE, not by conflict.
+#
+# RECALL-FIRST, the non-negotiable: staleness only ever PROPOSES a retire — it NEVER auto-retires. A quiet
+# concept is QUEUED as a `retire` proposal for the SAME tier-2 gate the LLM proposer feeds (ADR-0016/0017),
+# and the human decides: reject the proposal → kept + SUPPRESSED (won't re-nag — `queue_proposal` remembers
+# the verdict), accept → the trusted 3c-i `retire` fires. Nothing fades on its own for going quiet.
+#
+# The SELF-CLEARING property (free, ADR-0023's ethos): a still-true preference keeps being RE-LIVED — every
+# fresh session re-corroborates it, advancing its last-corroborated valid-time, so it never goes stale. Only
+# a genuinely-untouched concept ages past the horizon. No timeless-vs-changing classification is needed;
+# disuse sorts itself, exactly as it does for the recency-weighted takeaway gate.
+#
+# RECOMPUTE-ON-READ (the facet/recency ethos, ADR-0013/0023): last-corroborated is NEVER stored on the
+# concept — it recomputes from the evidence's sessions' valid-times on every read, exactly as
+# `net_entrenchment` recomputes its weights from session ids. So a concept re-corroborated tomorrow is no
+# longer stale with NO field to desync.
+#
+# The third of the TEMPORAL TRIO (ADR-0023 named the gap): Aging (ADR-0021) ages the BACKLOG up so a starved
+# item still runs (fairness of attention); recency-trust (ADR-0023) WEIGHTS evidence down by valid-time so a
+# stale backfill can't re-entrench (trust in a belief); this flags a QUIET concept down for re-confirmation
+# (liveness of a concept). They share the `age_days` primitive and nothing else.
+# ==================================================================================================
+
+STALENESS_DAYS = 270   # UNTUNED — the disuse horizon: a concept un-corroborated for longer than this surfaces
+                       # for re-confirmation. A months scale (~9 months) — long enough that an active preference,
+                       # RE-LIVED across sessions, never trips it, yet short enough that a genuinely-abandoned
+                       # topic surfaces within a year. Wants a gold set like every weight here
+                       # (RECENCY_HALF_LIFE_DAYS, the maturity bar); ONE edit retunes. The recall-first gate
+                       # (PROPOSE, never auto-retire) makes a too-LOW value cost only review attention, never a
+                       # lost concept — so it errs generous rather than aggressive.
+
+STALE_MODEL = "deterministic"   # the staleness pass calls NO model; recorded in the proposal's origin_ref so
+                                # provenance stays HONEST — a `retire` proposal sourced from DISUSE, not a Sonnet
+                                # judgment over a cluster (a human reading the queue can tell the two apart).
+
+
+def concept_last_corroborated(concept: dict, valid_times: dict, root: Path | None = None, *,
+                              sessions: dict | None = None, now: str | None = None) -> str | None:
+    """The MOST-RECENT valid-time among a concept's evidence's sessions — when this concept was last RE-LIVED
+    (ADR-0024). The hop is the trust chain's, read-side: each evidence pointer's `cleaned_hash` →
+    `blobstore.session_of` (cleaned → raw → session id) → `valid_times[sid]` (the session's date, via
+    `dream._session_valid_times`, recompute-on-read). Returns the newest such valid-time, or None when NO
+    evidence dates — recall-safe: an undateable concept is treated as FRESH downstream (never proposed for
+    retire on a date we cannot read), mirroring `recency_weight`'s missing-date → 1.0. `now` only pins the
+    ordering reference (the RESULT is now-invariant — a constant offset cancels); threaded for one-clock
+    consistency with the staleness gate. `sessions` is an optional `session_of` cache shared across concepts."""
+    root = root or config.data_root()
+    if sessions is None:
+        sessions = {}
+    best_vt: str | None = None
+    best_age: float | None = None
+    for ev in concept.get("evidence") or []:
+        ch = ev.get("cleaned_hash") if isinstance(ev, dict) else None
+        if not ch:
+            continue
+        vt = valid_times.get(blobstore.session_of(ch, root, sessions))
+        if not vt:
+            continue
+        age = config.age_days(vt, now=now)              # smaller age = more recent; keep the newest
+        if best_age is None or age < best_age:
+            best_age, best_vt = age, vt
+    return best_vt
+
+
+def stale_concepts(root: Path | None = None, *, days: float = STALENESS_DAYS,
+                   now: str | None = None) -> list[dict]:
+    """The QUIET concepts — valid concepts whose last-corroborated valid-time is more than `days` old
+    (ADR-0024). RECOMPUTE-ON-READ: the session valid-times are folded ONCE (`dream._session_valid_times`) and
+    `now` is pinned ONCE, so every concept ages against the same clock (deterministic when a test injects
+    `now`). A concept with NO datable evidence is SKIPPED (treated fresh — recall-safe). Returns
+    [{concept, last_corroborated, age_days}] — the substrate `propose_stale` queues retire proposals from."""
+    root = root or config.data_root()
+    valid_times = dream._session_valid_times(root)
+    sessions: dict = {}
+    out: list[dict] = []
+    for concept in dream.load_concepts(root):
+        last = concept_last_corroborated(concept, valid_times, root, sessions=sessions, now=now)
+        if last is None:
+            continue                                    # undateable → fresh; never flag what we cannot date
+        age = config.age_days(last, now=now)
+        if age > days:
+            out.append({"concept": concept, "last_corroborated": last, "age_days": age})
+    return out
+
+
+def _stale_retire_desc(concept_id: str, last_corroborated: str, *, days: float) -> dict:
+    """The deterministic `retire`-stale op descriptor for one quiet concept — the SAME shape `_clean_op` emits,
+    so it rides `queue_proposal`/`op_stakes`/the tier-2 gate UNCHANGED. The rationale is anchored on the STABLE
+    last-corroborated DATE + the threshold (NOT the live age), so a re-run while the proposal is still open is a
+    byte-identical no-op: the age is recompute-on-read, never frozen into the blob (the ADR-0023/0024 ethos — an
+    age in the bytes would churn a fresh version every day the concept stays quiet)."""
+    since = str(last_corroborated)[:10]                 # the date portion — the stable, byte-identical fact
+    rationale = (f"stale: untouched since {since} — no corroboration in over {int(days)}d. "
+                 f"Re-confirm or retire?")[:RATIONALE_MAX]
+    return {"op": "retire", "params": {"concept_id": concept_id},
+            "concept_ids": [concept_id], "rationale": rationale}
+
+
+def propose_stale(root: Path | None = None, *, days: float = STALENESS_DAYS, now: str | None = None,
+                  run_id: str | None = None, model: str = STALE_MODEL) -> list[dict]:
+    """The DETERMINISTIC staleness pass — NO LLM (ADR-0024). For each stale concept, QUEUE a `retire`-stale
+    `garden_proposal` riding the EXISTING tier-2 flow: `op_stakes("retire")` is HIGH (0.80), so it always
+    QUEUES for the 3d human gate, never auto-applies (recall-first — a quiet concept is only ever PROPOSED).
+    `mint_proposal_id` keys on the op IDENTITY ({retire, concept_id}) — so a re-run re-versions the SAME
+    proposal (no duplicate; and it UNIFIES with an LLM-proposed retire of the same concept), and
+    `queue_proposal`'s reject-SUPPRESSION holds: once the human rejects (or accepts) it, a re-run leaves it
+    standing — won't re-nag. A concept later RE-CORROBORATED simply drops out of `stale_concepts`
+    (self-clearing), so nothing is queued for it at all. Deterministic + no-LLM → cheap enough to run every
+    `garden propose`. Returns one record per stale concept: {concept_id, proposal_id, last_corroborated,
+    age_days, suppressed} (suppressed = already resolved → left standing, not re-queued)."""
+    root = root or config.data_root()
+    run_id = run_id or config.run_id()
+    out: list[dict] = []
+    for s in stale_concepts(root, days=days, now=now):
+        cid = s["concept"]["id"]
+        desc = _stale_retire_desc(cid, s["last_corroborated"], days=days)
+        pid = mint_proposal_id(desc)
+        decided = blobstore.latest_decision(pid, root)           # the 3d verdict if any (reject/accept)
+        suppressed = bool(decided and decided.get("verb") in RESOLVE_VERBS)
+        queue_proposal(desc, cluster_leader=cid, stakes=op_stakes("retire"),      # a no-op when suppressed
+                       root=root, run_id=run_id, model=model)                     # (it reads the same decision)
+        out.append({"concept_id": cid, "proposal_id": pid, "last_corroborated": s["last_corroborated"],
+                    "age_days": round(s["age_days"], 1), "suppressed": suppressed})
+    return out
+
+
 # the ops `_apply_op` can auto-apply directly — every op the proposer emits EXCEPT `split` (whose per-part
 # EVIDENCE PARTITION is the 3d/human's to choose, never the machine's to guess). `process` auto-applies an op
 # ONLY when it is BOTH low-stakes AND in this set; anything else QUEUES unconditionally, so a non-auto-applicable
@@ -1461,7 +1593,8 @@ def propose_main(argv=None) -> None:
         prog="garden propose",
         description="Propose structural ops over high-tension concept clusters: a sharp model proposes "
                     "merge/split/abstract/reparent/retire (+ tag curation); low-stakes auto-apply, "
-                    "high-stakes queue for the 3d human gate (LLM).")
+                    "high-stakes queue for the 3d human gate (LLM). A DETERMINISTIC staleness sub-pass "
+                    "(no LLM) rides alongside: quiet, un-corroborated concepts surface a retire proposal.")
     ap.add_argument("--model", default=PROPOSE_MODEL,
                     help=f"claude model for the proposer (default: {PROPOSE_MODEL})")
     ap.add_argument("--limit", type=int, help="cap clusters examined this run (the tension-ordered top)")
@@ -1478,6 +1611,14 @@ def propose_main(argv=None) -> None:
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
                     help="ordering policy over the clusters (default: greedy = highest-tension first)")
+    # the DETERMINISTIC decay/staleness sub-pass (ADR-0024) — quiet concepts → retire proposals, no LLM.
+    ap.add_argument("--no-stale", action="store_true",
+                    help="skip the deterministic staleness sub-pass (run only the LLM cluster proposer)")
+    ap.add_argument("--stale-only", action="store_true",
+                    help="run ONLY the staleness sub-pass — quiet concepts → retire proposals (no LLM, no key)")
+    ap.add_argument("--stale-days", type=int, default=STALENESS_DAYS,
+                    help=f"the disuse horizon: a concept un-corroborated longer than this surfaces a retire "
+                         f"proposal (default {STALENESS_DAYS}; untuned, recall-first)")
     args = ap.parse_args(argv)
 
     if args.proposals:                                  # just inspect the open 3d queue
@@ -1486,6 +1627,17 @@ def propose_main(argv=None) -> None:
         for p in q:
             print(f"  {p['proposal_id']}  [{p['op']} · stakes {p['stakes']:.2f}]  {p['concept_ids']}")
             print(f"      {p['rationale']}")
+        return
+
+    if args.stale_only:                                 # the deterministic pass ALONE — no completer needed
+        if args.dry_run:                                # preview the quiet concepts; queue nothing
+            sc = stale_concepts(days=args.stale_days)
+            print(f"staleness (dry-run): {len(sc)} quiet concept(s) past {args.stale_days}d would surface a "
+                  f"retire proposal.")
+            for s in sc:
+                print(f"  {s['concept']['id']}  last corroborated {str(s['last_corroborated'])[:10]}")
+            return
+        _print_stale(propose_stale(days=args.stale_days), days=args.stale_days)
         return
 
     propose = completer.make_cli_completer(args.model)
@@ -1509,6 +1661,25 @@ def propose_main(argv=None) -> None:
     print(f"\ngarden-ops-{report.run_id}: {report.examined} clusters, {report.processed} gardened, "
           f"{report.skipped} skipped, {blk.n_applied} auto-applied, {blk.n_queued} queued{errs}, "
           f"${report.cost_usd:.4f}{tail}")
+
+    if not args.no_stale:                               # the DETERMINISTIC staleness sub-pass rides alongside
+        _print_stale(propose_stale(days=args.stale_days), days=args.stale_days)
+
+
+def _print_stale(stale: list[dict], *, days: float) -> None:
+    """The decay/staleness summary — the quiet concepts surfaced for re-confirmation (ADR-0024). A proposal
+    already RESOLVED (the human decided earlier) is left STANDING, not re-queued — shown so the count is
+    honest, never as a fresh nag."""
+    if not stale:
+        print(f"staleness: no quiet concepts past {int(days)}d — every concept has recent corroboration.")
+        return
+    queued = [s for s in stale if not s["suppressed"]]
+    print(f"staleness: {len(stale)} quiet concept(s) past {int(days)}d "
+          f"({len(queued)} queued to re-confirm/retire, {len(stale) - len(queued)} already decided):")
+    for s in stale:
+        mark = "  (already decided — left standing)" if s["suppressed"] else ""
+        print(f"  {s['concept_id']}  last corroborated {str(s['last_corroborated'])[:10]} "
+              f"(~{s['age_days']:.0f}d ago){mark}")
 
 
 # --- CLI: mirrors the other stages' surface -------------------------------------------------------
