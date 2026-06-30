@@ -61,7 +61,9 @@ def make_session(sid, line):
     for i in range(4):
         body = f"step {i}: " + ("λ wörk ✓ " * 20)
         if i == 2:
-            body = f"step 2: {line} — " + ("λ wörk ✓ " * 20)
+            body = line     # the durable line stands ALONE on its rendered line, so a line-selection
+                            # (ADR-0026) resolves to EXACTLY it; multibyte filler in the other turns
+                            # keeps byte≠char offsets genuine
         records.append(rec(f"{sid}a{i}", parent, "assistant", message=amsg(f"{sid}M{i}", body)))
         parent = f"{sid}a{i}"
     blob = "\n".join(json.dumps(r) for r in records) + "\n"
@@ -71,14 +73,25 @@ def make_session(sid, line):
 
 
 class GleanFake:
-    """Offers the given line(s) as candidates for every chunk; glean's trust anchor keeps only the one
-    that is a real substring — so each session yields exactly its own durable line as a verified event."""
+    """Offers the given line(s) as candidates, POINTING at the numbered prompt line that carries each
+    (ADR-0026: the model selects lines, the system copies their bytes). A line is found only by the chunk
+    that contains it — so each session yields exactly its own durable line as a verified event."""
     def __init__(self, lines, *, markers=None, confidence=0.85):
         self.lines, self.markers, self.confidence = lines, markers or MARKERS, confidence
 
     def __call__(self, system, user):
-        cands = [{"quote": ln, "summary": f"machine summary of: {ln[:24]}",
-                  "markers": self.markers, "confidence": self.confidence} for ln in self.lines]
+        line_of = {}
+        for row in user.splitlines():
+            num, sep, body = row.partition("| ")
+            if sep and num.strip().isdigit():
+                line_of[int(num)] = body
+        cands = []
+        for ln in self.lines:
+            hit = next((n for n, body in line_of.items() if ln in body), None)
+            if hit is not None:
+                cands.append({"lines": {"from": hit, "to": hit},
+                              "summary": f"machine summary of: {ln[:24]}",
+                              "markers": self.markers, "confidence": self.confidence})
         return Completion(text=json.dumps({"events": cands}), model="fake", cost_usd=0.001)
 
 

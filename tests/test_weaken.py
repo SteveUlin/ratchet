@@ -61,7 +61,8 @@ def make_session(sid, line):
     for i in range(4):
         body = f"step {i}: " + ("λ wörk ✓ " * 20)
         if i == 2:
-            body = f"step 2: {line} — " + ("λ wörk ✓ " * 20)
+            body = line     # the durable line stands ALONE on its rendered line, so a line-selection
+                            # (ADR-0026) resolves to EXACTLY it
         records.append(rec(f"{sid}a{i}", parent, "assistant", message=amsg(f"{sid}M{i}", body)))
         parent = f"{sid}a{i}"
     blob = "\n".join(json.dumps(r) for r in records) + "\n"
@@ -75,8 +76,18 @@ class GleanFake:
         self.lines, self.markers, self.confidence = lines, markers or {}, confidence
 
     def __call__(self, system, user):
-        cands = [{"quote": ln, "summary": f"machine summary of: {ln[:24]}",
-                  "markers": self.markers.get(ln, M_MID), "confidence": self.confidence} for ln in self.lines]
+        # point at the numbered prompt line carrying each durable line (ADR-0026: select lines, copy bytes)
+        line_of = {}
+        for row in user.splitlines():
+            num, sep, body = row.partition("| ")
+            if sep and num.strip().isdigit():
+                line_of[int(num)] = body
+        cands = []
+        for ln in self.lines:
+            hit = next((n for n, body in line_of.items() if ln in body), None)
+            if hit is not None:
+                cands.append({"lines": {"from": hit, "to": hit}, "summary": f"machine summary of: {ln[:24]}",
+                              "markers": self.markers.get(ln, M_MID), "confidence": self.confidence})
         return Completion(text=json.dumps({"events": cands}), model="fake", cost_usd=0.001)
 
 

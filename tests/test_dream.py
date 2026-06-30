@@ -66,7 +66,9 @@ def make_session(sid, line):
     for i in range(4):
         body = f"step {i}: " + ("λ wörk ✓ " * 20)
         if i == 2:
-            body = f"step 2: {line} — " + ("λ wörk ✓ " * 20)
+            body = line     # the durable line stands ALONE on its rendered line, so a line-selection
+                            # (ADR-0026) resolves to EXACTLY it; the multibyte filler in the OTHER turns
+                            # still pushes its byte offset past its char offset (byte≠char under test)
         records.append(rec(f"{sid}a{i}", parent, "assistant", message=amsg(f"{sid}M{i}", body)))
         parent = f"{sid}a{i}"
     blob = "\n".join(json.dumps(r) for r in records) + "\n"
@@ -76,18 +78,28 @@ def make_session(sid, line):
 
 
 class GleanFake:
-    """Returns the given candidate lines (with per-line markers + confidence) for every chunk; glean's
-    trust anchor keeps only the one that is a real substring of each chunk — so each session yields
-    exactly its own durable line as an event, with the salience signal we asked for."""
+    """Returns a candidate per given line, POINTING at the numbered prompt line that carries it (ADR-0026:
+    the model selects lines, the system copies their bytes). A line is 'found' only by the chunk that
+    actually contains it — so each session yields exactly its own durable line as an event, with the
+    salience signal we asked for. (Each durable line stands alone in its turn, so the selected line's
+    bytes ARE the line — see make_session.)"""
     def __init__(self, lines, *, markers=None, confidence=0.85, relevance=None):
         self.lines, self.markers, self.confidence, self.calls = lines, markers or {}, confidence, 0
         self.relevance = relevance   # the per-event novelty verdict (4b); None → field omitted (→ novel)
 
     def __call__(self, system, user):
         self.calls += 1
+        line_of = {}
+        for row in user.splitlines():
+            num, sep, body = row.partition("| ")
+            if sep and num.strip().isdigit():
+                line_of[int(num)] = body
         cands = []
         for ln in self.lines:
-            c = {"quote": ln, "summary": f"machine summary of: {ln[:24]}",
+            hit = next((n for n, body in line_of.items() if ln in body), None)
+            if hit is None:
+                continue                     # this line is not in this chunk → nothing to point at
+            c = {"lines": {"from": hit, "to": hit}, "summary": f"machine summary of: {ln[:24]}",
                  "markers": self.markers.get(ln, M_MID), "confidence": self.confidence}
             if self.relevance is not None:
                 c["relevance"] = self.relevance

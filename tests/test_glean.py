@@ -1,6 +1,7 @@
 """glean tests: the LLM stage is exercised offline with a FAKE Completer (no network, no API key),
-so the suite is deterministic. The load-bearing checks are the trust anchor — a fabricated quote is
-rejected, a real quote yields a byte span that resolves back to exactly the quote — plus the
+so the suite is deterministic. The load-bearing checks are the trust anchor — the model POINTS at
+numbered lines and the system copies their bytes (ADR-0026), so the stored span resolves to real
+transcript bytes containing the learning, and an un-resolvable line selection is rejected — plus the
 filter, the event schema/id, the append-only store + lineage, and idempotent re-runs.
 
 glean is now a PER-CHUNK block (ADR-0009): the unit of work, persistence, and idempotency is the
@@ -34,9 +35,8 @@ def amsg(mid, text):
 
 # A transcript whose turn 3 carries a memorable, unique durable line; multibyte filler in every turn
 # forces byte≠char offsets, so the byte-based span math is actually under test.
-REAL_QUOTE = "always commit with jj, never git"          # a real substring of turn 3
-FAKE_QUOTE = "this phrase never appears in the transcript at all"  # hallucination → must be rejected
-SHORT_QUOTE = "jj"                                        # a real substring, but < MIN_QUOTE_BYTES
+REAL_QUOTE = "always commit with jj, never git"          # a real substring of turn 3 (its owning chunk finds it)
+FAKE_QUOTE = "this phrase never appears in the transcript at all"  # no line carries it → dropped (no event)
 
 records = [rec("u0", None, "user", message={"role": "user", "content": "kick off the work please"})]
 parent = "u0"
@@ -64,16 +64,37 @@ assert SIGNAL_CHUNKS >= 2, "several chunks pass the filter (per-chunk verificati
 
 
 class FakeCompleter:
-    """Records every call and returns canned candidates — the network seam, replaced. Returning the
-    same REAL+FAKE pair for every chunk proves verification is per-chunk: REAL is accepted only by
-    the chunk that actually contains it; FAKE never."""
+    """Records every call and returns canned candidates — the network seam, replaced. In the line era
+    (ADR-0026) the model points at NUMBERED lines, so a canned candidate naming a `quote` is translated
+    into a {"from":N,"to":N} line selection by FINDING that text in THIS chunk's numbered prompt: it is
+    'found' (and yields an event) ONLY by the chunk that actually contains it — the per-chunk trust
+    property, preserved. A `quote` absent from this chunk is dropped (the analogue of the old
+    hallucination reject — there is no line to point at). A candidate that already carries `lines` (or
+    neither field) passes through verbatim — used to exercise the un-resolvable reject path."""
     def __init__(self, candidates):
         self.candidates = candidates
         self.calls = 0
 
     def __call__(self, system, user):
         self.calls += 1
-        return Completion(text=json.dumps({"events": self.candidates}), model="fake", cost_usd=0.002)
+        line_of = {}
+        for line in user.splitlines():
+            num, sep, body = line.partition("| ")
+            if sep and num.strip().isdigit():
+                line_of[int(num)] = body
+        out = []
+        for cand in self.candidates:
+            cand = dict(cand)
+            if "quote" not in cand:
+                out.append(cand)                                   # pass-through (already `lines`, or un-resolvable)
+                continue
+            q = cand.pop("quote")
+            hit = next((n for n, body in line_of.items() if q in body), None)
+            if hit is not None:
+                cand["lines"] = {"from": hit, "to": hit}
+                out.append(cand)                                   # found in THIS chunk → a real line selection
+            # else: quote not on any line of this chunk → omit (nothing to point at)
+        return Completion(text=json.dumps({"events": out}), model="fake", cost_usd=0.002)
 
 
 class Probe:
@@ -116,41 +137,77 @@ assert not glean.structural_cues("[assistant]\nhere is a tidy summary of the wor
 
 # --- 2. parse: tolerate the ```json fence the CLI wraps results in --------------------------
 
-fenced = '```json\n{"events": [{"quote": "x", "summary": "y", "markers": {"insight": 1}, "confidence": 1}]}\n```'
-assert glean.parse_candidates(fenced) == [{"quote": "x", "summary": "y", "markers": {"insight": 1}, "confidence": 1}]
+fenced = '```json\n{"events": [{"lines": {"from": 1, "to": 1}, "summary": "y", "markers": {"insight": 1}, "confidence": 1}]}\n```'
+assert glean.parse_candidates(fenced) == [{"lines": {"from": 1, "to": 1}, "summary": "y", "markers": {"insight": 1}, "confidence": 1}]
 assert glean.parse_candidates("not json at all") == [], "malformed output → no candidates, no crash"
 assert glean.parse_candidates('{"events": []}') == [], "explicit empty → no candidates"
 
-# --- 3. the trust anchor: real quote accepted with an exact span, fabricated quote rejected --
-#     ... and the unit of work is now ONE CHUNK = ONE LLM call (ADR-0009).
+# --- 3. the trust anchor (ADR-0026): the model POINTS at numbered lines; the system copies their bytes,
+#     so evidence is verbatim by construction and cannot be fabricated. Unit of work = ONE CHUNK (ADR-0009).
 
+cleaned_bytes = cleaned.encode("utf-8")
+owner = [c for c in chunks if REAL_QUOTE in chunk.resolve(c)][0]
+
+# number_lines: a 1-based numbered presentation + a parallel line→cleaned-blob byte-span map.
+numbered, line_spans = glean.number_lines(cleaned_bytes, owner)
+disp = numbered.split("\n")
+assert disp[0].startswith("1| "), "lines are 1-based, prefixed `N| `"
+assert len(line_spans) == len(disp), "one span per displayed line"
+for (s, e), shown in zip(line_spans, disp):
+    assert cleaned_bytes[s:e].decode("utf-8", "replace") == shown.split("| ", 1)[1], \
+        "each line's span copies back to exactly its displayed bytes"
+
+# the line carrying the learning resolves to bytes that CONTAIN it (line-granular: ⊇ the phrase, ADR-0026).
+qline = next(i + 1 for i, (s, e) in enumerate(line_spans)
+             if REAL_QUOTE in cleaned_bytes[s:e].decode("utf-8", "replace"))
+span = glean.resolve_lines({"lines": {"from": qline, "to": qline}}, line_spans, cleaned_bytes)
+assert span is not None and REAL_QUOTE in cleaned_bytes[span[0]:span[1]].decode(), "pointed line's bytes carry the learning"
+assert span[0] != cleaned.find(REAL_QUOTE), "offsets are BYTES, not chars (multibyte content present)"
+
+# tolerance (recall-first): bare int / [i,j] accepted; a reversed range swaps; out-of-range CLAMPS into the chunk.
+assert glean.resolve_lines({"lines": qline}, line_spans, cleaned_bytes) == span, "a bare int == that single line"
+assert glean.resolve_lines({"lines": [1, qline]}, line_spans, cleaned_bytes) == (line_spans[0][0], line_spans[qline - 1][1])
+assert glean.resolve_lines({"lines": {"from": qline, "to": 1}}, line_spans, cleaned_bytes) \
+    == (line_spans[0][0], line_spans[qline - 1][1]), "a reversed range is swapped, not dropped"
+assert glean.resolve_lines({"lines": {"from": 1, "to": 10**9}}, line_spans, cleaned_bytes) \
+    == (line_spans[0][0], line_spans[-1][1]), "an over-range end clamps to the last line (a near-miss still yields evidence)"
+
+# only a TRULY unreadable selection is rejected — no fabricated evidence, but a slip is never punished.
+assert glean.resolve_lines({"lines": "nope"}, line_spans, cleaned_bytes) is None, "non-numeric selection → None"
+assert glean.resolve_lines({}, line_spans, cleaned_bytes) is None, "no line selection → None"
+assert glean.resolve_lines({"lines": {"from": 1, "to": 1}}, [], cleaned_bytes) is None, "empty chunk → None"
+assert glean.resolve_lines({"lines": {"from": 1, "to": 1}}, [(2, 2)], b"abcd") is None, "empty span → None"
+assert glean.resolve_lines({"lines": {"from": 1, "to": 1}}, [(0, 3)], b"   x") is None, "whitespace-only selection → None"
+
+
+# the REAL quote is found ONLY in its owning chunk (→ one event); the second candidate carries an
+# un-resolvable `lines` selection in EVERY chunk (→ a deterministic reject), exercising both paths.
 fake = FakeCompleter([
     {"quote": REAL_QUOTE, "summary": "Commit with jj, never git.",
      "markers": {"insight": 0.8, "surprise": 0.1}, "confidence": 0.9},
-    {"quote": FAKE_QUOTE, "summary": "A hallucinated claim.", "markers": {"insight": 0.9}, "confidence": 0.9},
+    {"lines": "not-a-line-ref", "summary": "ungrounded",
+     "markers": {"insight": 0.5}, "confidence": 0.5},
 ])
 probe = Probe()
 blk = glean.GleanBlock(fake, model="fake", targets=[cs_hash])
 report = block.run(blk, progress=probe)
 
-# per-chunk granularity: one call per SURVIVING chunk; events accrue on the block instance + Report.outputs
+# per-chunk granularity: one call per SURVIVING chunk; only the owning chunk finds the needle → one event.
 assert fake.calls == SIGNAL_CHUNKS, "one LLM call per signal-bearing chunk (the chunk is the unit now)"
-assert report.outputs == 1 == blk.events, "only the real quote, in its one owning chunk, becomes an event"
+assert report.outputs == 1 == blk.events, "only the chunk whose lines carry the learning becomes an event"
 assert report.processed == ALL_CHUNKS, "EVERY chunk processed (filter-skips included, as 0-output items)"
-# every non-owning signal chunk rejects REAL+FAKE (2); the owning chunk rejects only FAKE (1)
-assert blk.rejected == 2 * (SIGNAL_CHUNKS - 1) + 1, "every unverifiable quote is rejected, deterministically"
+assert blk.rejected == SIGNAL_CHUNKS, "the un-resolvable candidate in every signal chunk is rejected, deterministically"
 
-# streaming progress landed ONE line per processed chunk (no skips this fresh run); the owning chunk's
-# line carries n_out==1, the rest n_out==0 (filter-skips + signal chunks with no surviving quote)
+# streaming progress landed ONE line per processed chunk; only the owning chunk's line reports an event.
 assert len(probe.lines) == ALL_CHUNKS and all(not l["errored"] for l in probe.lines), "a live line per chunk"
 assert sum(l["n_out"] for l in probe.lines) == 1, "exactly the owning chunk's line reports an event"
 
 ev = glean.load_events()[0]
-span = ev["evidence"][0]
-resolved = blobstore.get(cleaned_hash).encode("utf-8")[span["byte_start"]:span["byte_end"]].decode()
-assert resolved == REAL_QUOTE, "the stored span resolves to EXACTLY the quote (the trust check)"
-assert span["byte_start"] != cleaned.find(REAL_QUOTE), "offsets are bytes, not chars (multibyte content present)"
-assert ev["id"] == glean.event_id(cleaned_hash, span["byte_start"], span["byte_end"]), "id = sha256(cleaned+span)[:12]"
+sp = ev["evidence"][0]
+resolved = cleaned_bytes[sp["byte_start"]:sp["byte_end"]].decode()
+assert REAL_QUOTE in resolved, "the stored span resolves to real bytes that contain the learning (line-granular)"
+assert sp["byte_start"] != cleaned.find(REAL_QUOTE), "offsets are bytes, not chars (multibyte content present)"
+assert ev["id"] == glean.event_id(cleaned_hash, sp["byte_start"], sp["byte_end"]), "id = sha256(cleaned+span)[:12]"
 assert ev["cleaned_hash"] == cleaned_hash and "quote" not in ev, "event points into the cleaned blob; never copies its text"
 assert set(ev["markers"]) == set(glean.MARKER_KINDS) and ev["markers"]["insight"] == 0.8, "markers scored per kind"
 assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record status field"
@@ -158,30 +215,22 @@ assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record 
 assert ev["relevance"] == "novel", "an event with no model relevance defaults to novel (recall-safe, 4b)"
 assert glean.event_content(ev)["relevance"] == "novel", "relevance is part of the stored content projection"
 
-# the trust check (verify) returns a span; record assembly (build_event) is a separate step
-owner = [c for c in chunks if REAL_QUOTE in chunk.resolve(c)][0]
-ok_span = glean.verify({"quote": REAL_QUOTE}, owner, cleaned.encode("utf-8"))
-assert ok_span is not None and isinstance(ok_span, tuple), "verify yields a span, not an event"
-
 # untrusted-field hygiene (build_event): marker scores clamp to [0,1], unknown keys drop, missing → 0
-dirty = glean.build_event({"quote": REAL_QUOTE, "summary": "x", "markers": {"insight": 9, "bogus": 1},
-                           "confidence": 9}, owner, ok_span, model="fake", run_id="r")
+dirty = glean.build_event({"summary": "x", "markers": {"insight": 9, "bogus": 1}, "confidence": 9},
+                          owner, span, model="fake", run_id="r")
 assert dirty["markers"] == {"surprise": 0.0, "insight": 1.0, "research": 0.0}, "markers coerced/clamped, unknowns dropped"
 assert dirty["confidence"] == 1.0, "confidence clamped to [0,1]"
 assert dirty["producer"]["stage"] == "glean" and dirty["producer"]["prompt_version"] == glean.PROMPT_VERSION
 
-# the RELEVANCE marker coercion (4b/ADR-0019): a known verdict is kept; an unknown/missing one coerces to
-# `novel` (the recall-safe default — never silently sink a learning by calling it `known`)
+# the RELEVANCE marker coercion (4b/ADR-0019): a known verdict is kept; an unknown/missing one coerces to `novel`
 assert glean.clean_relevance("contradicts") == "contradicts" and glean.clean_relevance("known") == "known"
 assert glean.clean_relevance("wat") == "novel" and glean.clean_relevance(None) == "novel", "unknown/missing → novel"
 assert dirty["relevance"] == "novel", "a candidate with no relevance field defaults to novel (recall-safe)"
-assert glean.build_event({"quote": REAL_QUOTE, "relevance": "contradicts"}, owner, ok_span,
+assert glean.build_event({"relevance": "contradicts"}, owner, span,
                          model="fake", run_id="r")["relevance"] == "contradicts", "a valid verdict is kept verbatim"
 
-# a quote that IS a real substring but too short to be useful evidence is rejected (no span)
-assert glean.verify({"quote": SHORT_QUOTE}, owner, cleaned.encode("utf-8")) is None, "too-short quote rejected"
-
-print("OK — trust anchor: real quote → exact byte span that resolves back; fabricated/short quotes")
+print("OK — trust anchor (lines): the model points at numbered lines, the system copies their bytes; "
+      "spans resolve to real evidence, un-resolvable selections rejected")
 print("     rejected deterministically; one LLM call PER CHUNK; event is a pointer (no copied text).")
 
 # --- 4. a processed marker PER CHUNK (signal-bearing AND filter-skipped 0-output) ------------
@@ -364,12 +413,11 @@ print("OK — budget ceiling stops a run cleanly between chunks, before overspen
 assert glean._clean_score(float("nan")) == 0.0 and glean._clean_score(float("inf")) == 0.0
 assert glean._clean_score("NaN") == 0.0 and glean._clean_score(1e400) == 0.0
 assert glean._clean_score(float("nan"), 0.5) == 0.5, "non-finite falls back to the default, not 1.0"
-nanev = glean.build_event({"quote": REAL_QUOTE, "summary": "x", "markers": {"surprise": float("nan")},
-                           "confidence": float("inf")}, owner, ok_span, model="fake", run_id="r")
+nanev = glean.build_event({"summary": "x", "markers": {"surprise": float("nan")},
+                           "confidence": float("inf")}, owner, span, model="fake", run_id="r")
 assert nanev["markers"]["surprise"] == 0.0 and nanev["confidence"] == 0.5, "NaN/inf scrubbed from the event"
 
-# a long but all-whitespace quote is real text yet zero signal → rejected (no span)
-assert glean.verify({"quote": " " * 20}, owner, cleaned.encode("utf-8")) is None, "whitespace quote rejected"
+# (whitespace-only / empty / un-resolvable line selections → rejected: covered by §3's resolve_lines checks)
 
 # a completer that raises on EVERY call: each signal chunk errors INDEPENDENTLY; the run completes and
 # NO marker is written for any failed chunk — every signal chunk is retried next run (no silent loss).

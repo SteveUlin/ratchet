@@ -5,10 +5,11 @@
                                                           (extract, LLM)
 
 An event is a THIN POINTER into the cleaned blob, not a copy of its text: a byte span
-(`evidence`) whose verbatim quote is `get(cleaned_hash)[span]` — TRUSTED — plus a one-sentence
-model `summary` — UNTRUSTED. The trust anchor (the whole point): the model returns a quote, and
-glean accepts the event only if that quote is a real substring of `resolve(chunk)`; a hallucinated
-or paraphrased quote dies deterministically, before any event is written.
+(`evidence`) whose verbatim text is `get(cleaned_hash)[span]` — TRUSTED — plus a one-sentence
+model `summary` — UNTRUSTED. The trust anchor (the whole point, ADR-0026): the chunk is shown to
+the model with NUMBERED lines, and the model returns the line numbers its evidence lives on; glean
+copies those lines' bytes from the immutable blob. The model never reproduces transcript text, so
+evidence cannot be hallucinated — it is verbatim by construction, not by checking a retyped quote.
 
 Events ARE blobs now (ADR-0007): a logical event is a RAW blob whose `source_id` is the
 span-derived, deterministic `event_id`, and each extraction is an immutable VERSION (content =
@@ -41,9 +42,9 @@ from pathlib import Path
 from . import blobstore, block, chunk, completer, config, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
-PROMPT_VERSION = "glean/3"     # bump to re-extract over the same frozen chunks (idempotency key);
-                               # glean/3 adds the RELEVANCE marker judged vs the concept digest (4b/ADR-0019)
-MIN_QUOTE_BYTES = 12           # a shorter "quote" is ambiguous (matches anywhere) → low-value evidence
+PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks (idempotency key);
+                               # glean/4: the model POINTS at numbered lines, it no longer retypes a quote
+                               # (ADR-0026) — evidence is copy-pasted from the blob, never transcribed
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
 OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
 
@@ -75,12 +76,16 @@ SYSTEM_PROMPT = (
     "You extract durable, reusable learnings from a single excerpt of a Claude Code session "
     "transcript, for a system that mines transcripts to improve a developer's future sessions.\n\n"
     "A learning is anything a FUTURE session would be better for knowing. Most excerpts contain "
-    "nothing durable — that is expected; return an empty list rather than inventing signal.\n\n"
+    "nothing durable — that is expected; an empty list is the right answer far more often than not, "
+    "so prefer it over inventing signal.\n\n"
+    "The excerpt is shown with a line number on every line (`12| ...`). You do NOT retype the "
+    "transcript — you POINT at it by line number, and the system copies those exact bytes as the "
+    "evidence. This is deliberate: copied bytes are always faithful, whereas anything you retype could "
+    "drift. So your task is to pick the tightest line range that carries each learning, and describe it.\n\n"
     "For each learning, return:\n"
-    "- \"quote\": the EXACT span of transcript text that is the evidence, copied VERBATIM — "
-    "character for character, including punctuation and casing. Do not paraphrase, summarize, "
-    "translate, trim, or join across gaps with \"...\". A quote that is not a literal substring of "
-    "the excerpt is discarded.\n"
+    "- \"lines\": {\"from\": N, \"to\": M} — the inclusive line numbers (read from the `N|` prefixes) "
+    "whose text IS the evidence. A single line is {\"from\": N, \"to\": N}. Choose the smallest range "
+    "that still stands on its own as evidence for the learning.\n"
     "- \"summary\": one imperative sentence (<= 200 chars) a future session could act on.\n"
     "- \"markers\": an object scoring 0-1 how strongly this learning is each of:\n"
     "    surprise — something broke an expectation: a command or test failed, an assumption was "
@@ -96,8 +101,9 @@ SYSTEM_PROMPT = (
     "    known — a known concept already states this; it is not new.\n"
     "    contradicts — this OVERTURNS or corrects something a known concept asserts (a belief change — "
     "the most important to surface).\n"
-    "  When the catalog is empty or you are unsure, answer \"novel\": never suppress a learning by "
-    "calling it known.\n\n"
+    "  When the catalog is empty or you are unsure, answer \"novel\". The reason is a cost asymmetry: a "
+    "real learning wrongly marked \"known\" sinks out of sight, while a duplicate marked \"novel\" is "
+    "cheaply de-duplicated later — so doubt should resolve toward \"novel\".\n\n"
     "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
     "holds nothing durable, output {\"events\": []}."
 )
@@ -142,14 +148,15 @@ def structural_cues(text: str) -> list[str]:
     return cues
 
 
-def _user_prompt(chunk_text: str, cues: list[str], known: str | None = None) -> str:
+def _user_prompt(numbered_excerpt: str, cues: list[str], known: str | None = None) -> str:
     hint = ("\n\nStructural cues (weigh, do not over-trust): " + "; ".join(cues)) if cues else ""
     # The concept digest ("what we already know") rides BELOW the excerpt so the model judges each event's
     # `relevance` against it (4b/ADR-0019). It is PROVENANCE-RELEVANT to this chunk (ordered by facet
     # overlap), so the concepts most likely to already cover it survive the digest's budget cut.
     known_block = (f"\n\nWHAT WE ALREADY KNOW (judge each learning's relevance against this):\n{known}"
                    if known else "")
-    return f"Excerpt:\n{chunk_text}{hint}{known_block}"
+    # The excerpt arrives already line-numbered (number_lines): the model selects line ranges, never text.
+    return f"Excerpt (each line is numbered — cite lines, do not copy text):\n{numbered_excerpt}{hint}{known_block}"
 
 
 def parse_candidates(text: str) -> list[dict]:
@@ -175,24 +182,61 @@ def _clean_markers(v) -> dict:
     return {k: _clean_score(v.get(k)) for k in MARKER_KINDS}
 
 
-def verify(candidate: dict, ch: chunk.Chunk, cleaned_bytes: bytes) -> tuple[int, int] | None:
-    """The trust anchor — and nothing else. Accept a candidate's quote iff it is a real substring of
-    the chunk's OWN bytes, and return its `[start, end)` span IN THE CLEANED BLOB (never the quote
-    text). A hallucinated, paraphrased, all-whitespace, or too-short quote returns None — rejected
-    deterministically, before any event exists."""
-    quote = candidate.get("quote")
-    if not isinstance(quote, str) or not quote.strip():   # all-whitespace is real text but zero signal
+def number_lines(cleaned_bytes: bytes, ch: chunk.Chunk) -> tuple[str, list[tuple[int, int]]]:
+    """Present the chunk as 1-based numbered lines for the model to POINT at, and return the parallel
+    map (line N → `(byte_start, byte_end)` IN THE CLEANED BLOB). The model selects line ranges and the
+    system copies those exact bytes, so the model never reproduces transcript text — evidence is
+    verbatim by construction, not by a trust check on a retyped quote (ADR-0026).
+
+    Lines split on `\\n`; a line's span EXCLUDES its trailing newline (so adjacent lines don't overlap
+    and a single-line selection is exactly that line's text). Offsets are absolute in the cleaned blob,
+    computed in BYTES (a multibyte char makes byte≠char offsets), so the returned span resolves with a
+    plain `cleaned_bytes[start:end]`. Decoding for DISPLAY tolerates a split multibyte char at a chunk
+    edge (`errors="replace"`); the stored span is the real bytes regardless."""
+    parts: list[str] = []
+    spans: list[tuple[int, int]] = []
+    pos = ch.byte_start
+    for i, raw in enumerate(cleaned_bytes[ch.byte_start:ch.byte_end].split(b"\n"), start=1):
+        start, end = pos, pos + len(raw)
+        spans.append((start, end))
+        parts.append(f"{i}| " + raw.decode("utf-8", "replace"))
+        pos = end + 1                                   # +1 for the '\n' that split consumed
+    return "\n".join(parts), spans
+
+
+def resolve_lines(candidate: dict, line_spans: list[tuple[int, int]],
+                  cleaned_bytes: bytes) -> tuple[int, int] | None:
+    """The trust anchor, reshaped (ADR-0026): map a candidate's LINE selection to a `[start, end)` byte
+    span in the cleaned blob. The model points; we copy. Tolerant by design (recall-first) — the model
+    slipping a line number should cost coarseness, never the whole learning:
+      - accept `{"from": N, "to": M}`, a bare int, or a `[i, j]` list; a missing `to` means a single line;
+      - swap a reversed range; CLAMP out-of-range numbers into the chunk (a near-miss still yields real,
+        nearby evidence);
+      - only a selection we cannot read AT ALL (no `lines`, non-numeric, empty chunk) returns None.
+    A resolved span that is empty or all-whitespace also returns None — zero-signal evidence, the line-era
+    analogue of the old too-short-quote reject."""
+    if not line_spans:
         return None
-    qb = quote.encode("utf-8")
-    if len(qb) < MIN_QUOTE_BYTES:
+    sel = candidate.get("lines")
+    if isinstance(sel, dict):
+        lo, hi = sel.get("from"), sel.get("to", sel.get("from"))
+    elif isinstance(sel, int):
+        lo = hi = sel
+    elif isinstance(sel, (list, tuple)) and sel:
+        lo, hi = sel[0], sel[-1]
+    else:
         return None
-    off = cleaned_bytes[ch.byte_start:ch.byte_end].find(qb)   # within this chunk's bytes only
-    if off < 0:
+    try:
+        lo, hi = int(lo), int(hi)
+    except (TypeError, ValueError):
         return None
-    bstart = ch.byte_start + off
-    bend = bstart + len(qb)
-    if cleaned_bytes[bstart:bend] != qb:        # invariant (holds by construction); guards offset regressions
-        return None
+    if lo > hi:
+        lo, hi = hi, lo
+    n = len(line_spans)
+    lo, hi = max(1, min(lo, n)), max(1, min(hi, n))     # clamp into the chunk's line range
+    bstart, bend = line_spans[lo - 1][0], line_spans[hi - 1][1]
+    if bend <= bstart or not cleaned_bytes[bstart:bend].strip():
+        return None                                     # empty / whitespace-only selection → no signal
     return bstart, bend
 
 
@@ -443,9 +487,10 @@ class GleanBlock:
     def process(self, item: ChunkItem, *, root: Path, run_id: str) -> tuple[int, float]:
         """Extract one chunk → ingest its event blobs → return (n_events, call_cost). A filter-skipped
         chunk returns (0, 0.0) immediately — the driver still writes its 0-output marker, so the
-        done-set stays exact and next run skips it with no LLM call (ADR-0009). The trust anchor is
-        unchanged: every returned quote is verified against THIS chunk's own bytes before any event
-        exists. A raised completer (or an absent cleaned blob) propagates — the driver isolates it as
+        done-set stays exact and next run skips it with no LLM call (ADR-0009). The trust anchor: the
+        model returns LINE NUMBERS into this chunk and the system copies those lines' bytes (ADR-0026),
+        so evidence is verbatim by construction — the model never reproduces transcript text. A raised
+        completer (or an absent cleaned blob) propagates — the driver isolates it as
         `errored`, writes no marker, and the chunk is retried next run (per-chunk retry, ADR-0009)."""
         ch = item.chunk
         cleaned_bytes = blobstore.get(ch.cleaned_hash, root).encode("utf-8")   # FileNotFoundError → errored
@@ -457,7 +502,8 @@ class GleanBlock:
         known = self._relevant_digest(ch.cleaned_hash, root)   # "what we already know", relevant to THIS chunk;
         # the per-chunk digest build is glean's DELIBERATE advisory exception — a bug there is ISOLATED +
         # recall-first (swallowed → empty sentinel, latched off; see `_relevant_digest`), NOT surfaced.
-        prompt = _user_prompt(text, structural_cues(text), known)  # our code; a bug HERE surfaces (driver errored)
+        numbered, line_spans = number_lines(cleaned_bytes, ch)  # the model points at these lines; we copy bytes
+        prompt = _user_prompt(numbered, structural_cues(text), known)  # our code; a bug HERE surfaces (driver errored)
         comp = self.complete(SYSTEM_PROMPT, prompt)           # the sole LLM call; raising → driver errored
         self.calls += 1
         call_cost = completer.cost_of(comp)
@@ -466,7 +512,7 @@ class GleanBlock:
         seen: set[str] = set()
         rejected = 0
         for cand in parse_candidates(comp.text):
-            span = verify(cand, ch, cleaned_bytes)            # trust check first ...
+            span = resolve_lines(cand, line_spans, cleaned_bytes)   # line selection → cleaned-blob byte span
             if span is None:
                 rejected += 1
                 continue
