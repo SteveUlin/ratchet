@@ -216,5 +216,45 @@ assert rep_cost.processed >= 1, f"a positive budget did not block ingestion: {re
 assert blobstore.latest_version("costless") is not None, "a positive budget did not block ingestion"
 
 
+# §9. discover() scoping: --exclude drops matching project dirs, and skip_self drops the dir ratchet's
+#     OWN completer runs land in (cwd=data_root) so tap never eats its own generated `claude -p` runs
+#     (ADR-0025). Tested directly on discover() (a pure enumerator) over a purpose-built datastore.
+ds2 = Path(tempfile.mkdtemp(prefix="ratchet-test-ds2-"))
+fake_root = Path("/home/sulin/.local/share/ratchet")          # a data_root to encode + skip
+self_proj = ds2 / tap.encode_project(fake_root)               # -home-sulin--local-share-ratchet
+self_child = ds2 / (tap.encode_project(fake_root) + "-runs")  # a nested-cwd child of data_root
+real_proj = ds2 / "-home-sulin-ratchet"                       # a REAL interactive project (keep!)
+tmp_proj = ds2 / "-tmp-ratchet-itest-data"                    # a test-fixture project (--exclude)
+for d in (self_proj, self_child, real_proj, tmp_proj):
+    d.mkdir()
+    (d / "s.jsonl").write_text('{"cwd":"/x"}\n', encoding="utf-8")
+
+# encode_project reproduces Claude Code's cwd→dir-name convention exactly.
+assert tap.encode_project(fake_root) == "-home-sulin--local-share-ratchet", \
+    f"encode_project must match the CC convention: {tap.encode_project(fake_root)!r}"
+
+names = lambda paths: {p.parent.name for p in paths}
+
+# no skip → everything is discoverable.
+assert names(tap.discover(ds2)) == {self_proj.name, self_child.name, real_proj.name, tmp_proj.name}, \
+    "bare discover sees all project dirs"
+
+# skip_self drops the data-dir project AND its nested-cwd children, but never a real interactive project.
+got = names(tap.discover(ds2, skip_self=fake_root))
+assert self_proj.name not in got, "skip_self drops ratchet's own data-dir project"
+assert self_child.name not in got, "skip_self drops nested-cwd children of data_root"
+assert real_proj.name in got, "skip_self must NOT drop a real interactive project that merely shares a prefix word"
+assert tmp_proj.name in got, "skip_self only targets the data-dir project, not test fixtures"
+
+# --exclude is an independent substring filter (here: the -tmp- test fixtures).
+got_excl = names(tap.discover(ds2, exclude=("-tmp-",), skip_self=fake_root))
+assert tmp_proj.name not in got_excl and real_proj.name in got_excl, \
+    "--exclude drops only the matching (fixture) dirs"
+
+# --include-self (skip_self=None) lifts the auto-skip — an escape hatch, not a hard wall.
+assert self_proj.name in names(tap.discover(ds2, skip_self=None)), \
+    "skip_self=None (--include-self) re-includes the data-dir project"
+
+
 print("OK — tap on block.py: error isolation, idempotent re-tap, touched-once, marker shape, "
-      "dry-run, source-id scoping, limit, inert budget")
+      "dry-run, source-id scoping, limit, inert budget, self+exclude discover scoping")

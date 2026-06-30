@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -31,14 +32,37 @@ DEFAULT_DATASTORE = Path.home() / ".claude" / "projects"
 OUT_NOUN = "raw"   # the per-item output noun the Progress bar/line shows (tap copies raw transcript blobs)
 
 
-def discover(datastore: Path, project: str | None = None) -> Iterator[Path]:
-    """Yield transcript `.jsonl` paths under the datastore, optionally filtered by project dir."""
+def encode_project(path: Path) -> str:
+    """The project-dir name Claude Code derives from a session's cwd: every '/' and '.' becomes '-'
+    (so `/home/sulin/.local/share/ratchet` → `-home-sulin--local-share-ratchet`). Reproduced here for
+    ONE purpose — recognizing the dir ratchet's OWN `claude -p` completer calls land in. The completer
+    runs with `cwd=data_root` (completer.py), so Claude Code logs each extract/route call as a session
+    under `encode_project(data_root)`; without skipping it, the next `tap` re-ingests ratchet's own
+    generated runs as if they were learnings. This couples to a Claude Code naming convention — a
+    pragmatic read-side heuristic, not a contract; the `--include-self` escape hatch exists for when it
+    is wrong, and `--exclude` covers anything else (e.g. `-tmp-*` test fixtures)."""
+    return re.sub(r"[/.]", "-", str(path))
+
+
+def discover(datastore: Path, project: str | None = None, *,
+             exclude: tuple[str, ...] = (), skip_self: Path | None = None) -> Iterator[Path]:
+    """Yield transcript `.jsonl` paths under the datastore. `project` keeps only dirs whose name CONTAINS
+    it; `exclude` drops any dir whose name contains any listed substring; `skip_self` (a path, normally
+    `data_root`) drops the dir ratchet's own completer runs land in — that dir and any nested-cwd
+    children (`encode_project(skip_self)` and `…-`-prefixed names). The skip is a default the operator
+    can lift; it is NOT a silent hard rule."""
     if not datastore.exists():
         return
+    self_name = encode_project(skip_self) if skip_self is not None else None
     for proj_dir in sorted(datastore.iterdir()):
         if not proj_dir.is_dir():
             continue
-        if project and project not in proj_dir.name:
+        name = proj_dir.name
+        if project and project not in name:
+            continue
+        if self_name is not None and (name == self_name or name.startswith(self_name + "-")):
+            continue  # ratchet's own claude -p runs (cwd inside data_root) — don't eat our own tail
+        if any(x in name for x in exclude):
             continue
         yield from sorted(proj_dir.glob("*.jsonl"))
 
@@ -158,7 +182,8 @@ class TapBlock:
     params: tuple[tuple[str, str], ...] = ()
 
     def __init__(self, datastore: Path = DEFAULT_DATASTORE, project: str | None = None,
-                 last: int | None = None, since: str | None = None) -> None:
+                 last: int | None = None, since: str | None = None,
+                 exclude: tuple[str, ...] = (), skip_self: Path | None = None) -> None:
         # datastore/project/last/since scope the enumeration (tap-specific FETCH SELECTION, not block.run
         # knobs — selection is per-source, owned by the fetcher; ADR-0022). `--last`/`--since` SELECT which
         # to-ingest candidates exist; the driver's `--limit` caps how many are EXAMINED — distinct levers,
@@ -169,6 +194,8 @@ class TapBlock:
         self.project = project
         self.last = last
         self.since = since
+        self.exclude = exclude
+        self.skip_self = skip_self
         self._state: dict[str, list] = {}
         self._latest: dict[str, tuple[str, str]] = {}
         self._dirty = False
@@ -193,7 +220,8 @@ class TapBlock:
         # byte-identical to before (same items, same inline order — incl. an unstatable file's position).
         selecting = self.last is not None or since_dt is not None
         buf: list[tuple[Path, list, float]] = []     # (path, fingerprint, raw mtime) survivors to select over
-        for path in discover(self.datastore, self.project):
+        for path in discover(self.datastore, self.project,
+                             exclude=self.exclude, skip_self=self.skip_self):
             if source_id is not None and path.stem != source_id:
                 continue
             try:
@@ -272,6 +300,11 @@ def main(argv=None) -> None:
     ap.add_argument("--datastore", type=Path, default=DEFAULT_DATASTORE,
                     help=f"transcript root (default: {DEFAULT_DATASTORE})")
     ap.add_argument("--project", help="only project dirs whose name contains this string")
+    ap.add_argument("--exclude", action="append", default=[], metavar="SUBSTR",
+                    help="skip project dirs whose name contains this substring (repeatable; e.g. -tmp- test fixtures)")
+    ap.add_argument("--include-self", action="store_true",
+                    help="DON'T auto-skip ratchet's own data-dir project (its claude -p completer runs); "
+                         "by default tap skips it so it never re-ingests its own generated transcripts")
     # FETCH SELECTION (ADR-0022) — owned by the fetcher (selection is per-source), distinct from the
     # driver's --limit (which caps items EXAMINED): --last/--since SELECT which to-ingest candidates exist.
     ap.add_argument("--last", type=int, metavar="N",
@@ -296,7 +329,11 @@ def main(argv=None) -> None:
         except ValueError:
             ap.error(f"--since {args.since!r} is not an ISO date/datetime (e.g. 2026-06-01)")
 
-    blk = TapBlock(datastore=args.datastore, project=args.project, last=args.last, since=args.since)
+    # By default skip the project dir ratchet's OWN completer runs land in (cwd=data_root) so tap never
+    # re-ingests its generated `claude -p` transcripts; `--include-self` lifts it. (ADR-0025)
+    skip_self = None if args.include_self else config.data_root()
+    blk = TapBlock(datastore=args.datastore, project=args.project, last=args.last, since=args.since,
+                   exclude=tuple(args.exclude), skip_self=skip_self)
     # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
     # else built from this stage's args + OUT_NOUN. tap has params=() and no LLM cost (cap omitted).
     progress = None if (args.quiet or args.dry_run) else block.Progress(
