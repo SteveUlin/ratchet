@@ -147,31 +147,56 @@ def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> b
     return False
 
 
+def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
+               now: str | None = None, root: Path | None = None) -> dict:
+    """Make the maturity gate TRANSPARENT (ADR-0027): a takeaway's recency-weighted entrenchment SCORE, the
+    operator's BAR, whether it clears, and a one-line plain reason. Corroboration is EVIDENCE of durability,
+    not a quota — so this EXPLAINS the standing rather than hiding a count behind a constant. The score is
+    `dream.net_entrenchment` (the very signal the gate graduates on); the bar is the reviewer's knob, shown
+    next to the score so the call is legible. A takeaway can sit below the bar two ways — too few sessions
+    yet, or enough sessions whose evidence has AGED below the recency-weighted line — and the note says which,
+    because the remedy differs (wait for recurrence vs. needs RECENT corroboration)."""
+    score = dream.net_entrenchment(tk, now, valid_times=valid_times, root=root)
+    raw = dream.net_sessions(tk)
+    mature = score >= bar
+    if mature:
+        why = f"corroborated across {raw} distinct session(s); weighted {score:.2f} ≥ bar {bar:.2f}"
+    elif raw < dream.MATURITY_SESSIONS:
+        why = (f"seen in {raw} session(s) so far (weighted {score:.2f} < bar {bar:.2f}) — "
+               f"a learning earns the queue by RECURRING, so it waits for corroboration in another session")
+    else:
+        why = (f"seen in {raw} session(s) but the evidence has AGED (weighted {score:.2f} < bar {bar:.2f}) — "
+               f"needs RECENT corroboration to cross the line")
+    return {"entrenchment": round(score, 2), "bar": round(bar, 2), "mature": mature, "rationale": why}
+
+
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
-            limit: int | None = None, topic: str | None = None) -> list[dict]:
-    """The review queue: every MATURE takeaway with no terminal decision and no live snooze, ORDERED by
-    IMPORTANCE descending and presented with its verified evidence. Derived from references — stores
-    nothing (ADR-0007).
+            limit: int | None = None, topic: str | None = None,
+            maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
+    """The review queue: every takeaway AT/ABOVE the maturity bar with no terminal decision and no live
+    snooze, ORDERED by IMPORTANCE descending and presented with its verified evidence + its bar standing.
+    Derived from references — stores nothing (ADR-0007).
 
-    The MATURITY GATE is `dream.current_takeaways`: it returns only takeaways whose NET distinct-session
-    entrenchment (support sessions MINUS contradicting sessions, ADR-0012) crosses `dream.MATURITY_SESSIONS`
-    (default 2). An incubating takeaway (a single net session so far) is deliberately kept OUT of the human
-    gate — a one-off lesson costs review attention and risks promoting a false belief from a single moment
-    — but it stays LIVE in the routing catalog so a later session can strengthen it across the bar; a once-
-    mature takeaway that gets CONTESTED un-graduates back out of the queue (never deleted) and re-graduates
-    if corroboration returns (see `incubating`).
+    The MATURITY GATE is `dream.current_takeaways(min_weight=maturity)`: it returns takeaways whose
+    RECENCY-WEIGHTED net entrenchment (support sessions MINUS contradicting ones, each weighted by valid-time
+    — ADR-0012/0023) crosses the bar. WHY a bar at all: a one-off lesson costs review attention and risks
+    promoting a belief from a single moment, so a learning earns the queue by RECURRING across distinct,
+    recent sessions. But the bar is the REVIEWER'S KNOB, not a hidden constant (ADR-0027): `maturity` lowers
+    it to review more or raises it for only the most-corroborated, every item carries its score-vs-bar
+    `rationale`, and what sits below is never hidden — `incubating` lists it with the same reasoning. A
+    once-mature takeaway that is CONTESTED un-graduates (never deleted) and re-graduates if corroboration
+    returns.
 
-    ORDERING + the operator knobs (ADR-0022): the queue surfaces in no order otherwise, so `importance`
-    (net entrenchment × confidence) sorts it DESCENDING — highest-leverage first. `--topic` filters to a
-    PROJECT (substring match over cited evidence); `--limit N` returns the top-N for a one-sitting review.
-    Filter + sort run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`) is paid
-    only for the survivors the human will actually see."""
+    ORDERING + the operator knobs (ADR-0022): `importance` (net entrenchment × confidence) sorts DESCENDING —
+    highest-leverage first. `--topic` filters to a PROJECT (substring over cited evidence); `--limit N` returns
+    the top-N. Filter + sort run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`)
+    is paid only for the survivors the human will see."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
     valid_times = dream._session_valid_times(root) # session → valid-time, scanned ONCE for the gate + the sort
     cache: dict = {}
     tks: list[dict] = []
-    for tk in dream.current_takeaways(root, valid_times=valid_times):   # the recency-weighted maturity gate
+    for tk in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times):  # bar is the knob
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
@@ -181,24 +206,24 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     tks.sort(key=lambda t: importance(t, valid_times=valid_times), reverse=True)   # IMPORTANCE desc; stable ties
     if limit is not None:
         tks = tks[:limit]                          # the top-N for a one-sitting review (after the ordering)
-    return [_present(tk, root, context_bytes=context_bytes) for tk in tks]
+    return [{**_present(tk, root, context_bytes=context_bytes),
+             **bar_status(tk, maturity, valid_times=valid_times)} for tk in tks]
 
 
-def incubating(root: Path | None = None) -> list[dict]:
+def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
-    them), but not yet shown to the human gate. The counterpart to `pending`: `catalog` minus the mature
-    set, minus anything already terminally decided. The bar is the recency-WEIGHTED net entrenchment
-    (`dream.current_takeaways`/`net_entrenchment`, ADR-0023) — the SAME gate `pending` graduates on, so a
-    CONTESTED takeaway that un-graduated re-appears here (not silently lost). Surfaced so the reviewer can
-    SEE what is accruing toward review (and decide to act early) without it crowding — or pre-biasing — the
-    queue. A light projection (no evidence resolution); `needs` is the count of further distinct sessions to
-    cross the bar, the human-legible RAW count (`MATURITY_SESSIONS - net_sessions`) — an integer shortfall,
-    not the float weight (a takeaway held below the bar only by AGED evidence can read `needs 0` yet
-    incubate; the honest signal there is "needs RECENT corroboration", surfaced by the weighted gate itself)."""
+    them), but not yet at the human gate. The counterpart to `pending`: `catalog` minus the mature set
+    (at the SAME `maturity` bar, so lowering the bar moves takeaways from here into the queue), minus
+    anything already terminally decided. A CONTESTED takeaway that un-graduated re-appears here (not
+    silently lost). Surfaced — with each takeaway's score-vs-bar `rationale` (ADR-0027) — so the reviewer
+    SEES what is accruing and WHY, and can act early, without it crowding or pre-biasing the queue. A light
+    projection (no evidence resolution); `needs` is the human-legible RAW distinct-session shortfall
+    (`MATURITY_SESSIONS - net_sessions`), complemented by `needs_recent` for the AGED case (enough sessions,
+    but their evidence decayed below the weighted bar — the honest signal is "needs RECENT corroboration")."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     valid_times = dream._session_valid_times(root)
-    mature = {t["id"] for t in dream.current_takeaways(root, valid_times=valid_times)}
+    mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times)}
     out: list[dict] = []
     for tk in dream.catalog(root):
         if tk["id"] in mature:
@@ -208,7 +233,9 @@ def incubating(root: Path | None = None) -> list[dict]:
             continue
         sup = tk.get("support") or {"events": 0, "sessions": 0}
         raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
+        st = bar_status(tk, maturity, valid_times=valid_times)
         out.append({"takeaway_id": tk["id"], "title": tk.get("title", ""), "support": sup,
+                    "entrenchment": st["entrenchment"], "bar": st["bar"], "rationale": st["rationale"],
                     "needs": raw_needs,                    # distinct-session shortfall on the RAW count, but …
                     "needs_recent": raw_needs == 0})       # … if 0 yet incubating, it's held below the bar by
                     # AGED evidence (recency-weighted gate, ADR-0023) — it needs RECENT corroboration, not more
@@ -551,6 +578,12 @@ def main(argv=None) -> None:
     ap.add_argument("--limit", type=int, metavar="N",
                     help="review the top-N only (by importance for takeaways, stakes for proposals)")
     ap.add_argument("--topic", help="filter the queue to a PROJECT whose name contains this substring")
+    ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT, metavar="BAR",
+                    help=f"the maturity BAR a takeaway's recency-weighted corroboration must cross to surface "
+                         f"in --pending (default {dream.MATURITY_WEIGHT} ≈ {dream.MATURITY_SESSIONS} recent "
+                         f"sessions). LOWER it to review more, RAISE it for only the most-corroborated — the "
+                         f"bar is yours, nothing is hidden: --incubating lists what sits below, with the "
+                         f"reason. Applies to --pending and --incubating.")
     ap.add_argument("--split-parts",
                     help="a split accept's per-part EVIDENCE PARTITION: JSON [{title,statement,evidence}] "
                          "(the human's to choose — a queued split carries only title/statement)")
@@ -567,13 +600,13 @@ def main(argv=None) -> None:
 
     if args.pending:
         q = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
-                    limit=args.limit, topic=args.topic)
+                    limit=args.limit, topic=args.topic, maturity=args.maturity)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
-            _print_queue(q, incubating_count=len(incubating()))
+            _print_queue(q, incubating_count=len(incubating(maturity=args.maturity)), bar=args.maturity)
     elif args.incubating:
-        inc = incubating()
+        inc = incubating(maturity=args.maturity)
         if args.json:
             print(json.dumps(inc, ensure_ascii=False, indent=2))
         else:
@@ -626,28 +659,32 @@ def main(argv=None) -> None:
               else f"rejected proposal {res['proposal_id']} ({res['op']}) — not applied, won't re-surface")
 
 
-def _incubating_tail(incubating_count: int) -> str:
+def _incubating_tail(incubating_count: int, *, bar: float | None = None) -> str:
     """A one-line footer noting how many takeaways are still accruing below the maturity bar — so an
-    empty/short queue does not read as 'dream learned nothing' when lessons are in fact incubating."""
+    empty/short queue does not read as 'dream learned nothing' when lessons are in fact incubating. The bar
+    is the reviewer's knob, so the footer says how to move it (ADR-0027), not just that things are hidden."""
     if not incubating_count:
         return ""
-    return (f"\n({incubating_count} takeaway(s) incubating below the maturity bar — "
-            f"see `--incubating`)")
+    knob = f" — lower the bar (--maturity, now {bar:g}) to review more, or" if bar is not None else " —"
+    return (f"\n({incubating_count} takeaway(s) below the maturity bar{knob} see `--incubating` "
+            f"for each with its score and why)")
 
 
-def _print_queue(q: list[dict], *, incubating_count: int = 0) -> None:
+def _print_queue(q: list[dict], *, incubating_count: int = 0, bar: float | None = None) -> None:
     if not q:
-        print("review queue empty — nothing to review." + _incubating_tail(incubating_count))
+        print("review queue empty — nothing over the maturity bar yet." + _incubating_tail(incubating_count, bar=bar))
         return
     print(f"{len(q)} takeaway(s) to review:\n")
     for i, t in enumerate(q, 1):
         sup, rel = t["support"], t["relation"]["kind"]
         print(f"{i}/{len(q)} · {t['title']}  [{rel} · {sup['events']}ev/{sup['sessions']}sess]")
+        if "rationale" in t:                       # the gate, made transparent (ADR-0027)
+            print(f"  MATURITY: {t['rationale']}")
         print(f"  WHY: {t['why']}")
         for ev in t["evidence"]:
             print(f"    ✓ {ev['quote'][:100]!r}")
         print()
-    tail = _incubating_tail(incubating_count)
+    tail = _incubating_tail(incubating_count, bar=bar)
     if tail:
         print(tail.lstrip("\n"))
 
@@ -677,10 +714,15 @@ def _print_incubating(inc: list[dict]) -> None:
     if not inc:
         print("nothing incubating — every live takeaway has reached the maturity bar.")
         return
-    print(f"{len(inc)} takeaway(s) incubating (below the maturity bar):\n")
+    print(f"{len(inc)} takeaway(s) below the maturity bar (accruing toward review):\n")
     for t in inc:
         sup = t["support"]
-        print(f"  {t['title']}  [{sup['events']}ev/{sup['sessions']}sess · needs {t['needs']} more session(s)]")
+        score = t.get("entrenchment")
+        head = f"  {t['title']}  [{sup['events']}ev/{sup['sessions']}sess"
+        head += f" · {score:g}/{t['bar']:g}]" if score is not None else "]"
+        print(head)
+        if "rationale" in t:                       # WHY it is below the bar (ADR-0027) — the remedy differs
+            print(f"      {t['rationale']}")
 
 
 if __name__ == "__main__":

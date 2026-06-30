@@ -187,6 +187,28 @@ assert inc_nix["needs"] == dream.MATURITY_SESSIONS - 1 == 1, "`needs` = further 
 print("OK 1 — maturity gate: only the 2-session takeaway is reviewable; the 1-session one incubates "
       "(live, out of the queue) and shows in `--incubating` with its shortfall.")
 
+# --- 1b. THE BAR IS THE REVIEWER'S KNOB, and TRANSPARENT (ADR-0027): not a hidden constant -----------
+# Every surfaced takeaway carries its score-vs-bar rationale — pending AND incubating.
+jj_view = [t for t in review.pending(ROOT) if t["takeaway_id"] == jj_tk["id"]][0]
+assert jj_view["bar"] == dream.MATURITY_WEIGHT and jj_view["entrenchment"] >= jj_view["bar"], \
+    "a pending takeaway shows its entrenchment >= the bar"
+assert jj_view["mature"] and "≥ bar" in jj_view["rationale"], "pending carries a plain why it cleared the bar"
+assert "rationale" in inc_nix and inc_nix["entrenchment"] < inc_nix["bar"], \
+    "an incubating takeaway shows its score < bar + the reason"
+assert "RECURRING" in inc_nix["rationale"] or "RECENT" in inc_nix["rationale"], \
+    "the incubating reason explains corroboration-as-durability, not a bare count"
+
+# LOWERING the bar (the operator's call) graduates the once-incubating NIX into the queue — no re-mining,
+# no hidden rule: the same score, a bar the reviewer moved.
+low = {t["takeaway_id"] for t in review.pending(ROOT, maturity=0.5)}
+assert nix_tk["id"] in low and jj_tk["id"] in low, "lowering --maturity surfaces the incubating takeaway too"
+assert nix_tk["id"] not in {t["takeaway_id"] for t in review.incubating(ROOT, maturity=0.5)}, \
+    "and it leaves the incubating view at the lowered bar (the two views stay complementary at any bar)"
+# RAISING the bar withholds even the 2-session one — the reviewer can demand more corroboration.
+assert review.pending(ROOT, maturity=99.0) == [], "raising the bar above all scores empties the queue"
+print("OK 1b — the maturity bar is an explained, --maturity-adjustable knob; every takeaway shows its "
+      "score vs the bar and why; lowering it graduates incubating ones with no re-mining.")
+
 
 # --- 2. THE LOOP IN: strengthening an incubating takeaway ACROSS the bar makes it reviewable ---------
 

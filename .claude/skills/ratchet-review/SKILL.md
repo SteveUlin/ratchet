@@ -12,7 +12,7 @@ ratchet mines sulin's Claude Code sessions into **takeaways** (a synthesized "wh
 
 Both tiers share one shape: **approving a false belief is costly**, so your job is to make sulin's yes/no *informed*, never to decide for him.
 
-The trust chain guarantees each evidence quote is a *real substring of an immutable blob* — so the quote is never in question. What is **untrusted** is the LLM-written justification — a takeaway's `title`/`why`, or a proposal's `rationale`: it cites real events but can over-generalize past them. Checking that is your job.
+The trust chain guarantees each evidence quote is *copied verbatim from an immutable blob* — glean selects transcript LINES and the system copies their bytes (the model never retypes them, so a quote cannot be hallucinated). The quote is never in question. What is **untrusted** is the LLM-written justification — a takeaway's `title`/`why`, or a proposal's `rationale`: it cites real events but can over-generalize past them. Checking that is your job.
 
 ## The loop
 
@@ -22,7 +22,9 @@ Run everything from the ratchet repo (`~/ratchet`). Fetch the queue:
 nix run .#review -- --pending --json
 ```
 
-If empty, tell sulin there's nothing to review and stop. Otherwise, take the takeaways **one at a time**, and for each:
+Each takeaway carries its **maturity standing**: `entrenchment` (recency-weighted corroboration score), the `bar` it cleared, `mature`, and a plain `rationale`. The bar is sulin's knob, not a fixed rule — pass `--maturity <N>` to lower it (review more) or raise it (only the most-corroborated). A takeaway earns the queue by *recurring* across distinct, recent sessions; that is evidence of durability, not a quota.
+
+If the queue is empty, **don't just say "nothing to review."** Run `nix run .#review -- --incubating` to show what's accruing and *why* it's below the bar (each with its score), and offer sulin the choice to lower `--maturity` for this sitting if something looks durable enough already. Otherwise, take the takeaways **one at a time**, and for each:
 
 ### 1. Assess before you present (this decides fast vs deep)
 
@@ -39,7 +41,7 @@ Read the `why` against the resolved `evidence` quotes and the metadata. Decide w
 
 ### 2. Present with zero-click evidence
 
-Always show the verbatim quotes inline, marked verified (✓) — sulin judges *interpretation*, never whether a quote is real. Show the title, the why, support (events/sessions), the relation, and your own one-line faithfulness read.
+Always show the verbatim quotes inline, marked verified (✓) — sulin judges *interpretation*, never whether a quote is real. Show the title, the why, support (events/sessions), the relation, the maturity `rationale` (score vs bar), and your own one-line faithfulness read.
 
 ### 3. Record sulin's call (pass your assessment as provenance)
 
