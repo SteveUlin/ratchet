@@ -7,3 +7,6 @@ __pycache__/
 # Events live in $RATCHET_DATA_DIR (outside this repo). Guard against an accidental
 # data dir landing inside the tree — events are never version-controlled.
 /data/
+# Cloned reference projects + prior-art notes for design work (dream v3 etc.).
+# Reference only — never tracked; regenerate by re-running the research workflow.
+/research/
