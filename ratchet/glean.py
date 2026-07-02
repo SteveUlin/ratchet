@@ -39,7 +39,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import blobstore, block, chunk, completer, config, weave
+from . import blobstore, block, chunk, completer, config, sig, subject, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
 PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks (idempotency key);
@@ -241,7 +241,8 @@ def resolve_lines(candidate: dict, line_spans: list[tuple[int, int]],
 
 
 def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
-                model: str, run_id: str) -> dict:
+                model: str, run_id: str, root: Path | None = None,
+                subject_cache: dict | None = None) -> dict:
     """Assemble the event record for a verified span — the event FORMAT lives here (ADR-0004/0005). An
     event is a thin pointer (the span, never the quote text) + the untrusted, hygiene-cleaned model
     fields (summary, markers, confidence) + intrinsic provenance. It stays a plain dict, deliberately:
@@ -251,13 +252,24 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
     ADR-0007 reshapes the record: `id` is now the blob's `source_id` (authoritative in meta), kept
     here only as a convenience content mirror; `status` is DROPPED (state is a decision, never an
     in-record field). `producer` stays in content (the cost-amortization target) and is mirrored into
-    `origin_ref` at ingest so "who/when/how produced this version" is answerable from meta alone."""
+    `origin_ref` at ingest so "who/when/how produced this version" is answerable from meta alone.
+
+    dream-v3 §2.1 (S1) stamps two DETERMINISTIC identity features here — no extra LLM call:
+    `subject_key` (WHERE the lesson lives: repo + files co-located with the FIRST evidence span,
+    `subject.subject_key`) and `stmt_sig` (the char-shingle signature of the STORED summary,
+    `sig.stmt_sig`). resolve reads them off the blob; a pre-stamp event lacks them and resolve
+    computes-on-read instead. `subject_cache` shares the per-cleaned-blob subject parse across a
+    batch (the GleanBlock instance owns one, the `_facet_cache` idiom)."""
     bstart, bend = span
+    summary = str(candidate.get("summary", "")).strip()[:SUMMARY_MAX]
     return {
         "id": event_id(ch.cleaned_hash, bstart, bend),
         "cleaned_hash": ch.cleaned_hash,
         "evidence": [{"byte_start": bstart, "byte_end": bend}],
-        "summary": str(candidate.get("summary", "")).strip()[:SUMMARY_MAX],
+        "summary": summary,
+        "subject_key": subject.subject_key(root or config.data_root(), ch.cleaned_hash,
+                                           (bstart, bend), subject_cache),
+        "stmt_sig": sig.stmt_sig(summary),
         "markers": _clean_markers(candidate.get("markers")),
         "relevance": clean_relevance(candidate.get("relevance")),   # novelty vs the store (unknown → novel)
         "confidence": _clean_score(candidate.get("confidence"), 0.5),
@@ -298,6 +310,11 @@ def event_content(ev: dict) -> dict:
         "relevance": clean_relevance(ev.get("relevance")),
         "confidence": ev["confidence"],
         "supersedes": ev.get("supersedes"),
+        # The dream-v3 §2.1 stamps (S1) ride the projection ONLY when present: a pre-stamp blob lacks
+        # them and must re-hash BYTE-IDENTICALLY (no spurious version on a fold or no-op re-ingest) —
+        # resolve computes-on-read for those. Stamped events keep them verbatim; both are deterministic
+        # functions of span + summary, so they never perturb re-extraction idempotency.
+        **{k: ev[k] for k in ("subject_key", "stmt_sig") if k in ev},
     }
 
 
@@ -384,6 +401,10 @@ class GleanBlock:
         # each. Only the Aging strategy calls age() — Greedy ignores it, so a non-aging run touches neither.
         self._root: Path | None = None
         self._age_cache: dict[str, str | None] = {}
+        # The subject-stamp seam (dream-v3 §2.1, S1): `subject_key` derivation parses the cleaned blob
+        # once (meta hop + write-line scan, maybe a raw re-parse) — shared across the many events of one
+        # session's chunks, keyed by cleaned_hash. The `_facet_cache`/`_age_cache` idiom.
+        self._subject_cache: dict = {}
 
     # -- enumeration: target chunksets → their chunks ----------------------------------------
 
@@ -516,7 +537,8 @@ class GleanBlock:
             if span is None:
                 rejected += 1
                 continue
-            ev = build_event(cand, ch, span, model=self.model, run_id=run_id)   # ... then the record
+            ev = build_event(cand, ch, span, model=self.model, run_id=run_id,   # ... then the record
+                             root=root, subject_cache=self._subject_cache)      # (stamps ride along, §2.1)
             if ev["id"] not in seen:              # same span twice in this chunk → one event
                 seen.add(ev["id"])
                 accepted.append(ev)

@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-glean-")
 
-from ratchet import blobstore, block, chunk, completer, config, glean, weave  # noqa: E402
+from ratchet import blobstore, block, chunk, completer, config, glean, sig, weave  # noqa: E402
 from ratchet.completer import Completion  # the LLM seam now lives in `completer`  # noqa: E402
 
 config.ensure_layout()
@@ -214,6 +214,22 @@ assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record 
 # the RELEVANCE marker (4b/ADR-0019): the fake gave no verdict → coerced to `novel` (recall-safe) and stored
 assert ev["relevance"] == "novel", "an event with no model relevance defaults to novel (recall-safe, 4b)"
 assert glean.event_content(ev)["relevance"] == "novel", "relevance is part of the stored content projection"
+
+# the dream-v3 §2.1 stamps (S1): every NEW event carries subject_key + stmt_sig, both deterministic
+# (no extra LLM call) — resolve reads identity features off the blob instead of recomputing.
+sk = ev["subject_key"]
+assert set(sk) == {"repo", "files"} and isinstance(sk["files"], list), "subject_key = {repo, files}"
+ss = ev["stmt_sig"]
+assert set(ss) == {"simhash", "shingles", "entropy"}, "stmt_sig = {simhash, shingles, entropy}"
+assert ss == sig.stmt_sig(ev["summary"]), "stmt_sig signs the STORED summary (recomputable on read)"
+assert ss["shingles"] == sorted(ss["shingles"]), "shingles persist sorted (stable canonical-json)"
+proj = glean.event_content(ev)
+assert proj["subject_key"] == sk and proj["stmt_sig"] == ss, "the stamps ride the stored projection when present"
+# an OLD-shape event (pre-stamp blob) still folds fine and projects BYTE-IDENTICALLY — no spurious version
+old = {k: v for k, v in ev.items() if k not in ("subject_key", "stmt_sig")}
+old_proj = glean.event_content(old)
+assert "subject_key" not in old_proj and "stmt_sig" not in old_proj, "absent stamps stay absent (compute-on-read)"
+assert blobstore.canonical_json(old_proj) == blobstore.canonical_json(old), "old blobs project unchanged (byte-compatible)"
 
 # untrusted-field hygiene (build_event): marker scores clamp to [0,1], unknown keys drop, missing → 0
 dirty = glean.build_event({"summary": "x", "markers": {"insight": 9, "bogus": 1}, "confidence": 9},
