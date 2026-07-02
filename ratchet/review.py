@@ -12,13 +12,26 @@ where Claude is an active faithfulness-checker (the takeaway's `why` is untruste
 against the verified evidence and escalates to investigate when a risk signal fires) and the human
 makes the call. This module just serves the materials and records the verdict, all on the blob model:
 
-- the **queue** is a derived query, not a stored list (ADR-0007): `dream.current_takeaways` minus
-  anything with a terminal decision (accepted/rejected) or a live snooze — references only.
+- the **queue** is a derived query, not a stored list (ADR-0007): the UNION of dream-v3 CLAIMS
+  (`resolve.claim_pool` over the maturity bar — claims preferred when an id exists in both feeds) and
+  the legacy v2 takeaways (`dream.current_takeaways`), minus anything with a terminal decision
+  (accepted/rejected) or a live snooze — references only. After `resolve --reset-v2` retires every
+  v2 takeaway the legacy arm naturally empties; until then both queue side by side.
 - **evidence** is re-resolved from the immutable blobs and re-validated (the trust chain reaches the
   reviewer: "verified real"), with an optional surrounding-context window for deep investigation.
 - a **decision** (accept / reject / snooze / retire) is an append-only decision blob referencing its
   target; an **accept** also ingests the concept it mints and records Claude's assessment + the human's
   call as provenance. State is never a flipped field — it is the latest decision referencing the target.
+
+The v3 claim surfaces (design §6, ADR-0028) ride the same fold: the LLM-merge AUDIT CARD renders every
+corroboration's verified quote next to the match key the resolver persisted (the v2-failure detector —
+the reviewer audits the acceptance layer with the same evidence the model saw); a "why pending" badge
+keeps a matured-but-unsynthesized claim VISIBLE (review never blocks on synthesize's cadence);
+CONTESTED claims near the bar surface via `--contested`; merge SUGGESTIONS are a derived render-time
+query over residue-band claim pairs (§2.2 — zero stored state, nothing can harden); the human "not the
+same" verdict is the ONE compound `reject-merge` decision (`resolve.reject_merge` — review-only by
+policy), and a confirmed suggestion is `merge_claims` (edge re-pointing, dream.merge's union adapted
+to the edge model).
 """
 from __future__ import annotations
 
@@ -28,11 +41,24 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import blobstore, config, dream
+from . import blobstore, config, dream, resolve, sig, subject
 
 CONCEPT_ID_PREFIX = "c-"
 ASSESSMENT_MAX = 2000
 CONTEXT_BYTES = 240        # default surrounding-context window for the queue presentation
+
+# --- the v3 claim-surface knobs: named, explained, CLI-overridable (ADR-0025/0026/0027) -----------
+SUGGEST_MAX = 3            # UNTUNED — merge suggestions shown PER CARD (§6.5): they ride existing
+                           # cards instead of adding queue items, and a card buried under suggestions
+                           # stops being reviewable; overflow pairs simply wait for their own card.
+SUGGEST_TTL_DAYS = 30.0    # UNTUNED — a suggested pair folds out after this long WITHOUT new evidence
+                           # on either side (§2.2): a derived query cannot harden into a de-facto merge
+                           # (Wikidata's P460 failure), and a stale suggestion re-shown forever is how
+                           # review queues die. Must sit under resolve.ACTIVE_DAYS or the active view
+                           # expires the pair first.
+CONTESTED_WINDOW = 1.0     # one fresh session's weight — a claim carrying a live contradicts edge
+                           # within this of the bar is CONTESTED-near-bar (§6.6): a wrong llm
+                           # CONTRADICTS verdict must not silently suppress an almost-mature claim.
 
 
 # --- resolve evidence: the trust chain reaches the reviewer ("verified real") --------------------
@@ -170,6 +196,327 @@ def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
     return {"entrenchment": round(score, 2), "bar": round(bar, 2), "mature": mature, "rationale": why}
 
 
+# --- the v3 claim surfaces: audit card, corroboration story, suggestions, contested (§6) ----------
+#
+# Everything here is a DERIVED render-time view over resolve's fold — claim_pool, _live_edges,
+# _reject_merge_facts — computed when the reviewer looks and stored nowhere (ADR-0013). The claim id
+# space is dream's `t-…` (mint_takeaway_id), so claims ride the same decision folds as takeaways; the
+# one v3 wrinkle is `resolve._decision_binds`: after --reset-v2 a claim can be re-minted under a
+# RETIRED takeaway's id, and a decision older than the claim's birth targeted that predecessor, never
+# the live claim — so every claim-side decision read carries the binds guard.
+
+
+def _claim_materials(root: Path) -> dict:
+    """The shared per-render fold the claim surfaces read: reject-merge facts (the pair-block +
+    retraction reads), live edges by claim, and the event-blob caches the audit card resolves
+    subjects/quotes through. Built once per pending/context render, threaded everywhere."""
+    rm = resolve._reject_merge_facts(root)
+    return {"rm": rm, "edges": resolve._live_edges(root, rm),
+            "ev_hashes": blobstore.latest_by_kind("event", root),
+            "ev_cache": {}, "subj_cache": {}}
+
+
+def _claim_view(claim_id: str, root: Path) -> dict | None:
+    """One claim's folded view (live edges + event blobs), or None if the id is not a live claim —
+    the claim-side sibling of `_load_takeaway`. The stored claim blob is seed identity ONLY (§2.1),
+    so every consumer (accept, context) must read the FOLD, never the blob."""
+    for c in resolve.claim_pool(root):
+        if c["id"] == claim_id:
+            return c
+    return None
+
+
+def _subjects_disjoint(key: dict, others: list[dict]) -> bool:
+    """Does this evidence's subject share NOTHING (no repo, no file) with the claim's OTHER evidence?
+    The audit card's ⚠ condition (§6.3): a disjoint-subject merge is exactly the shape of the v2
+    failure (Zig+JAX+NEP-50 shared no scope). An EMPTY key on either side cannot DEMONSTRATE
+    disjointness (the §3.1 empty-subject discipline, mirrored) — unknown reads as not-disjoint, so
+    the ⚠ marks only evidence whose scopes are POSITIVELY apart."""
+    if subject.is_empty(key):
+        return False
+    known = [o for o in others if not subject.is_empty(o)]
+    if not known:
+        return False
+    for o in known:
+        if key.get("repo") and key.get("repo") == o.get("repo"):
+            return False
+        if set(key.get("files") or ()) & set(o.get("files") or ()):
+            return False
+    return True
+
+
+def _corroboration_story(corro: list[dict], subj_by_event: dict, valid_times: dict) -> list[str]:
+    """The recurrence NARRATIVE (§6.2): one line per corroborating session, ordered by valid-time —
+    where the lesson was seen (repo/file from its subject key) and, from the second sighting on, the
+    gap since the first ("recurred after N days"). Recurrence-across-time is WHY the claim earned the
+    queue, so the card says it in sulin's terms — the pattern in his work, not a bare count. An
+    undated session reads as "undated" and skips the gap (never a fabricated number)."""
+    rows = sorted((str(valid_times.get(e.get("session_id")) or ""), e.get("session_id") or "?",
+                   subj_by_event.get(e.get("event_id")) or {}) for e in corro)
+    out: list[str] = []
+    first_vt: str | None = None
+    first_key: dict = {}
+    for vt, s, k in rows:
+        if first_vt is None:
+            where = ", ".join(([f"repo {k['repo']}"] if k.get("repo") else [])
+                              + [f"file {f}" for f in (k.get("files") or ())[:2]]) or "no recorded subject"
+            first_vt, first_key = vt, k
+            out.append(f"seen in session {s} ({vt[:10] or 'undated'}, {where})")
+            continue
+        bits = []
+        if k.get("repo"):
+            bits.append("same repo" if k.get("repo") == first_key.get("repo") else f"repo {k['repo']}")
+        shared = set(k.get("files") or ()) & set(first_key.get("files") or ())
+        bits += ["same file"] if shared else [f"file {f}" for f in (k.get("files") or ())[:2]]
+        where = ", ".join(bits) or "no recorded subject"
+        line = f"again in session {s} ({vt[:10] or 'undated'}, {where})"
+        if first_vt and vt:
+            line += f" — recurred after {config.age_days(first_vt, now=vt):.0f} day(s)"
+        out.append(line)
+    return out
+
+
+def claim_audit(claim: dict, root: Path, *, mats: dict, valid_times: dict,
+                resolved_evidence: list[dict] | None = None) -> dict | None:
+    """The LLM-MERGE AUDIT CARD (§6.3) — the v2-failure detector, rendered for any claim whose support
+    rests on a `by:"llm"` corroborates edge (on the shipped two-band cascade, every merged claim).
+    Each corroboration renders its VERIFIED quote (the ground truth) next to the match key the
+    resolver persisted — stmt_sim, how many candidates the model saw, which model — so the reviewer
+    audits the acceptance layer with exactly what the model saw; a per-edge ⚠ (`disjoint`) marks
+    evidence whose subject shares nothing with the claim's other evidence. This replaces the old
+    disjoint-AND-llm banner predicate, which missed the dominant same-subject case. Un-merged claims
+    (seed-only support) return None — nothing to audit. Legacy blobs carry no match keys — moot: the
+    v2 reset retires every v2 takeaway, so every claim here is v3-minted."""
+    edges = mats["edges"].get(claim["id"], [])
+    corro = sorted((e for e in edges if e.get("verb") == "corroborates"), key=lambda e: e["event_id"])
+    if not any((e.get("match") or {}).get("by") == "llm" for e in corro):
+        return None
+    if resolved_evidence is None:
+        resolved_evidence = resolve_evidence(claim, root)
+    quotes = {ev["event_id"]: ev["quote"] for ev in resolved_evidence}
+    subj_by_event: dict[str, dict] = {}
+    for e in corro:
+        ev = resolve._load_event(e["event_id"], mats["ev_hashes"], mats["ev_cache"], root)
+        subj_by_event[e["event_id"]] = (resolve._event_subject(ev, root, mats["subj_cache"])
+                                        if ev else {"repo": None, "files": []})
+    rows: list[dict] = []
+    for e in corro:
+        m = e.get("match") or {}
+        others = [subj_by_event[o["event_id"]] for o in corro if o["event_id"] != e["event_id"]]
+        rows.append({
+            "event_id": e["event_id"],
+            "edge_id": resolve.edge_id(e["event_id"], "corroborates", claim["id"]),   # --reject-merge's handle
+            "session_id": e.get("session_id"),
+            "quote": quotes.get(e["event_id"]),          # verified via resolve_evidence, or None (blob gone)
+            "by": m.get("by"),
+            "match": ({"stmt_sim": m.get("stmt_sim"),
+                       "candidates_shown": len(m.get("candidates_shown") or ()),
+                       "model": m.get("model")} if m.get("by") == "llm" else None),
+            "subject": subj_by_event[e["event_id"]],
+            "disjoint": _subjects_disjoint(subj_by_event[e["event_id"]], others),
+        })
+    return {"corroborations": rows,
+            "disjoint": any(r["disjoint"] for r in rows if r["by"] == "llm"),   # the card-level ⚠
+            "story": _corroboration_story(corro, subj_by_event, valid_times)}
+
+
+def _present_claim(c: dict, root: Path, *, context_bytes: int, mats: dict, valid_times: dict) -> dict:
+    """The reviewer's view of one CLAIM: same card shape as `_present` (the skill iterates one queue)
+    plus the v3 surfaces — kind, scope/subject, the why-pending badge (§6: a matured-but-unsynthesized
+    claim APPEARS with its provisional title, never withheld — synthesize fills prose on demand), the
+    why-stale flag (§7.3), the contested flag, and the audit card."""
+    evidence = resolve_evidence(c, root, context_bytes=context_bytes)
+    return {
+        "takeaway_id": c["id"],                        # claims share dream's t-… id space; one queue key
+        "kind": "claim",
+        "title": c.get("title", ""),
+        "why": c.get("why"),
+        "why_pending": not c.get("why"),               # the badge: provisional title, prose not yet minted
+        "why_stale": bool(c.get("why_stale")),
+        "relation": c.get("relation") or {"kind": "new", "concept_id": None},
+        "support": c.get("support") or {"events": 0, "sessions": 0},
+        "markers": c.get("markers") or {},
+        "confidence": c.get("confidence"),
+        "scope": c.get("scope"),                       # shown, never wired to a second bar (§3.4)
+        "subject": c.get("subject") or {"repos": [], "files": []},
+        "contested": bool(c.get("contradicted_by")),   # a mature claim carrying a live contradiction
+        "evidence": evidence,
+        "audit": claim_audit(c, root, mats=mats, valid_times=valid_times, resolved_evidence=evidence),
+    }
+
+
+def merge_suggestions(root: Path | None = None, *, j_maybe: float | None = None,
+                      j_high: float | None = None, h_min: float | None = None,
+                      ttl_days: float = SUGGEST_TTL_DAYS, now: str | None = None,
+                      pool: list[dict] | None = None, valid_times: dict | None = None,
+                      rm: dict | None = None) -> list[dict]:
+    """The DERIVED merge-suggestion query (§2.2/§6.5) — a pure function computed at render time,
+    stored nowhere: pairs of live ACTIVE claims whose statement similarity lands in the residue band
+    [J_MAYBE, J_HIGH) — the zone the $0 layer cannot separate and the residue call happened not to
+    fuse — MINUS reject-merge'd pairs (never asked again), MINUS pairs where either side is trivial
+    (min entropy < H_MIN — low-signal similarity is not evidence of one lesson, the cascade's own
+    gate), and folded out after `ttl_days` without new evidence on either side. Each suggestion
+    renders both claims' titles + ONE verified quote each — NEVER the stmt_sim number, which is noise
+    at 0.2–0.35 (§6.5): the human judges the words, not a score. Confirm → `merge_claims`; dismiss →
+    `reject_merge` on the pair."""
+    root = root or config.data_root()
+    j_maybe = sig.J_MAYBE if j_maybe is None else j_maybe
+    j_high = sig.J_HIGH if j_high is None else j_high
+    h_min = sig.H_MIN if h_min is None else h_min
+    now = now or config.now()
+    if valid_times is None:
+        valid_times = dream._session_valid_times(root)
+    if rm is None:
+        rm = resolve._reject_merge_facts(root)
+    if pool is None:
+        pool = resolve.claim_pool(root)
+    active = [c for c in pool if resolve.is_active(c, now=now, valid_times=valid_times)]
+
+    def freshest_age(c: dict) -> float:
+        ss = [s for s in (c.get("sessions_seen") or []) if s]
+        return min((config.age_days(valid_times.get(s), now=now) for s in ss), default=float("inf"))
+
+    quotes: dict[str, str | None] = {}
+
+    def quote_of(c: dict) -> str | None:
+        if c["id"] not in quotes:
+            ev = resolve_evidence(c, root)
+            quotes[c["id"]] = ev[0]["quote"] if ev else None
+        return quotes[c["id"]]
+
+    out: list[dict] = []
+    for i in range(len(active)):
+        for j in range(i + 1, len(active)):
+            a, b = active[i], active[j]
+            if frozenset((a["id"], b["id"])) in rm["pairs"]:
+                continue                               # the human said "not the same" — never re-ask
+            if min(a["stmt_entropy"], b["stmt_entropy"]) < h_min:
+                continue                               # triviality: degenerate overlap suggests nothing
+            s = sig.jaccard(a["stmt_shingles"], b["stmt_shingles"])
+            if not (j_maybe <= s < j_high):
+                continue
+            if min(freshest_age(a), freshest_age(b)) > ttl_days:
+                continue                               # folded out: no new evidence within the TTL
+            out.append({"pair": sorted((a["id"], b["id"])),
+                        "claims": [{"claim_id": c["id"], "title": c.get("title", ""),
+                                    "quote": quote_of(c)} for c in (a, b)]})
+    out.sort(key=lambda r: r["pair"])
+    return out
+
+
+def _suggestions_by_claim(suggestions: list[dict]) -> dict[str, list[dict]]:
+    """Suggestions folded onto the cards they ride (§6.5): claim id → its pairs, capped at SUGGEST_MAX
+    per card so a well-connected claim's card stays reviewable (overflow pairs surface on the OTHER
+    claim's card, or wait)."""
+    by: dict[str, list[dict]] = {}
+    for sg in suggestions:
+        for cid in sg["pair"]:
+            lst = by.setdefault(cid, [])
+            if len(lst) < SUGGEST_MAX:
+                lst.append(sg)
+    return by
+
+
+def contested(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
+              window: float = CONTESTED_WINDOW) -> list[dict]:
+    """CONTESTED-NEAR-BAR visibility (§6.6, v2's `contradicted_takeaways` carried forward): live claims
+    carrying a live contradicts edge whose net entrenchment sits within `window` of the bar — above OR
+    below. Above, the claim is in `pending` anyway (flagged `contested`); below, the contradiction is
+    exactly what pushed it under, and a wrong llm CONTRADICTS verdict must not silently suppress an
+    almost-mature claim — so the reviewer sees it here, with the contradicting quotes as ground truth
+    (re-validated, like all evidence). Ordered by entrenchment descending — nearest the bar first."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    valid_times = dream._session_valid_times(root)
+    now = config.now()
+    out: list[dict] = []
+    for c in resolve.claim_pool(root):
+        if not c.get("contradicted_by"):
+            continue
+        d = decisions.get(c["id"])
+        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+            continue                                   # already decided — no longer the gate's business
+        if dream.net_entrenchment(c, now, valid_times=valid_times) < maturity - window:
+            continue
+        st = bar_status(c, maturity, valid_times=valid_times, now=now)
+        out.append({"claim_id": c["id"], "kind": "claim", "title": c.get("title", ""),
+                    "support": c.get("support"), "contradictions": c.get("contradictions"),
+                    "entrenchment": st["entrenchment"], "bar": st["bar"], "mature": st["mature"],
+                    "rationale": st["rationale"],
+                    "contradicting": [r["quote"] for r in resolve_evidence(
+                        {"evidence": c.get("contradiction_evidence") or []}, root)]})
+    out.sort(key=lambda r: -r["entrenchment"])
+    return out
+
+
+def reject_merge(spec: str, *, reason: str = "", reviewer: str = "sulin",
+                 root: Path | None = None) -> dict:
+    """The human "not the same" verdict, parsed and handed to the ONE compound decision writer
+    (`resolve.reject_merge`, §2.2 — review-only by policy, ADR-0008). Two spec forms:
+
+      an EDGE id (`event|corroborates|claim`, the audit card's handle) — retraction + reopen +
+        pair-block: the merge is torn out, the event re-enters the pool (epoch-keyed past its done
+        marker) and seeds its own claim next tick, and the pair never re-forms;
+      a claim PAIR (`A,B`, a dismissed merge suggestion) — pair-block only: no edge exists, nothing
+        reopens, the suggestion query simply never asks again."""
+    root = root or config.data_root()
+    spec = spec.strip()
+    if resolve.EDGE_SEP in spec:
+        parts = spec.split(resolve.EDGE_SEP)
+        if len(parts) != 3 or parts[1] not in resolve.EDGE_VERBS or not (parts[0] and parts[2]):
+            raise ValueError(f"--reject-merge edge form is event{resolve.EDGE_SEP}verb"
+                             f"{resolve.EDGE_SEP}claim (verbs: {resolve.EDGE_VERBS}); got {spec!r}")
+        return resolve.reject_merge(edge_id=spec, reason=reason, reviewer=reviewer, root=root)
+    if "," in spec:
+        a, _, b = (s.strip() for s in spec.partition(","))
+        if not a or not b or a == b:
+            raise ValueError(f"--reject-merge pair form is A,B (two distinct ids); got {spec!r}")
+        return resolve.reject_merge(pair=[a, b], reason=reason, reviewer=reviewer, root=root)
+    raise ValueError(f"--reject-merge takes an edge id (event{resolve.EDGE_SEP}verb"
+                     f"{resolve.EDGE_SEP}claim) or a claim pair (A,B); got {spec!r}")
+
+
+def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, reason: str = "",
+                 reviewer: str = "sulin") -> dict:
+    """CONFIRM a merge suggestion (§6.5) — dream.merge's evidence-union, restated in v3's edge model:
+    under recompute-on-read there is no takeaway version to union, so the merge IS edge re-pointing.
+    Every live edge on the loser (corroborates AND contradicts — a contradiction is never silently
+    lost in a merge, ADR-0012) is re-written onto the winner with its match key preserved (plus
+    `repointed_from`, so the audit trail says where it came from) and retracted from the loser; an
+    edge the winner already holds for the same (event, verb) is only retracted from the loser (the
+    winner's own audit key wins). Then ONE `merge` decision on the loser — `claim_pool` folds it out
+    (invalidate-don't-delete; blob, edges, history stay). Commit order winner-gains → loser-retracts
+    → decision LAST: a crash mid-way double-counts nothing permanent and a re-run completes the
+    remainder. A reject-merge'd pair is REFUSED — the standing human verdict says "not the same", and
+    decisions are append-only; overturning it is a deliberate new call, not a merge side-effect."""
+    root = root or config.data_root()
+    if loser_id == winner_id:
+        raise ValueError("merge_claims needs two distinct claims")
+    rm = resolve._reject_merge_facts(root)
+    if frozenset((loser_id, winner_id)) in rm["pairs"]:
+        raise ValueError(f"pair ({loser_id}, {winner_id}) carries a reject-merge verdict — "
+                         f"the standing call is 'not the same'")
+    pool = {c["id"]: c for c in resolve.claim_pool(root)}
+    for cid in (winner_id, loser_id):
+        if cid not in pool:
+            raise ValueError(f"no live claim {cid!r}")
+    edges_by_claim = resolve._live_edges(root, rm)
+    have = {(e["event_id"], e["verb"]) for e in edges_by_claim.get(winner_id, [])}
+    run_id = config.run_id()
+    moved = 0
+    for e in sorted(edges_by_claim.get(loser_id, []), key=lambda e: (e["event_id"], e["verb"])):
+        if (e["event_id"], e["verb"]) not in have:
+            match = dict(e.get("match") or {})
+            match["repointed_from"] = loser_id
+            resolve.write_edge(e["event_id"], e["verb"], winner_id, session_id=e.get("session_id"),
+                               match=match, root=root, run_id=run_id)     # winner gains FIRST
+            moved += 1
+        resolve.retract_edge(e["event_id"], e["verb"], loser_id, root=root, run_id=run_id)
+    _record("merge", loser_id, root, into=winner_id, reviewer=reviewer,
+            note=str(reason)[:ASSESSMENT_MAX], moved_edges=moved)         # the decision LAST
+    return {"loser": loser_id, "winner": winner_id, "moved_edges": moved}
+
+
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             limit: int | None = None, topic: str | None = None,
             maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
@@ -190,24 +537,58 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     ORDERING + the operator knobs (ADR-0022): `importance` (net entrenchment × confidence) sorts DESCENDING —
     highest-leverage first. `--topic` filters to a PROJECT (substring over cited evidence); `--limit N` returns
     the top-N. Filter + sort run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`)
-    is paid only for the survivors the human will see."""
+    is paid only for the survivors the human will see.
+
+    THE FEED IS A UNION (dream v3, §6/ADR-0028): v3 CLAIMS over the same bar queue beside the legacy v2
+    takeaways — claims PREFERRED when an id exists in both feeds (the id space is shared:
+    `mint_takeaway_id`), one importance order over both. After `--reset-v2` retires every v2 takeaway
+    the legacy arm empties by itself. A claim card additionally carries the audit card, scope, the
+    why-pending badge, the contested flag, and its merge suggestions (`_present_claim`)."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
     valid_times = dream._session_valid_times(root) # session → valid-time, scanned ONCE for the gate + the sort
+    now = config.now()
     cache: dict = {}
-    tks: list[dict] = []
+    rows: list[tuple[dict, str]] = []              # (view, kind) — one queue, two sources
+    pool = resolve.claim_pool(root)
+    claim_ids = {c["id"] for c in pool}
+    for c in pool:
+        if dream.net_entrenchment(c, now, valid_times=valid_times) < maturity:   # the same bar, same knob
+            continue
+        d = decisions.get(c["id"])
+        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+            continue                               # pre-birth decisions targeted the retired v2 predecessor
+        if topic is not None and not _evidence_in_topic(c.get("evidence"), topic, root, cache):
+            continue
+        rows.append((c, "claim"))
     for tk in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times):  # bar is the knob
+        if tk["id"] in claim_ids:
+            continue                               # the claim view is preferred — one id, one card
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
         if topic is not None and not _evidence_in_topic(tk.get("evidence"), topic, root, cache):
             continue                               # FOCUS: drop takeaways with no evidence from the topic project
-        tks.append(tk)
-    tks.sort(key=lambda t: importance(t, valid_times=valid_times), reverse=True)   # IMPORTANCE desc; stable ties
+        rows.append((tk, "takeaway"))
+    rows.sort(key=lambda r: importance(r[0], valid_times=valid_times), reverse=True)  # IMPORTANCE desc; stable
     if limit is not None:
-        tks = tks[:limit]                          # the top-N for a one-sitting review (after the ordering)
-    return [{**_present(tk, root, context_bytes=context_bytes),
-             **bar_status(tk, maturity, valid_times=valid_times)} for tk in tks]
+        rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering)
+    mats = _claim_materials(root) if any(k == "claim" for _, k in rows) else None
+    sugg = (_suggestions_by_claim(merge_suggestions(root, now=now, pool=pool,
+                                                    valid_times=valid_times, rm=mats["rm"]))
+            if mats is not None else {})
+    out: list[dict] = []
+    for view, kind in rows:
+        if kind == "claim":
+            card = {**_present_claim(view, root, context_bytes=context_bytes, mats=mats,
+                                     valid_times=valid_times),
+                    **bar_status(view, maturity, valid_times=valid_times, now=now)}
+            card["merge_suggestions"] = sugg.get(view["id"], [])
+        else:
+            card = {**_present(view, root, context_bytes=context_bytes),
+                    **bar_status(view, maturity, valid_times=valid_times)}
+        out.append(card)
+    return out
 
 
 def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
@@ -219,27 +600,42 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     SEES what is accruing and WHY, and can act early, without it crowding or pre-biasing the queue. A light
     projection (no evidence resolution); `needs` is the human-legible RAW distinct-session shortfall
     (`MATURITY_SESSIONS - net_sessions`), complemented by `needs_recent` for the AGED case (enough sessions,
-    but their evidence decayed below the weighted bar — the honest signal is "needs RECENT corroboration")."""
+    but their evidence decayed below the weighted bar — the honest signal is "needs RECENT corroboration").
+    The same UNION as `pending` (v3 claims beside legacy takeaways, claims preferred), tagged by `kind`."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     valid_times = dream._session_valid_times(root)
-    mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times)}
+    now = config.now()
+
+    def row(tk: dict, kind: str) -> dict:
+        raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
+        st = bar_status(tk, maturity, valid_times=valid_times)
+        return {"takeaway_id": tk["id"], "kind": kind, "title": tk.get("title", ""),
+                "support": tk.get("support") or {"events": 0, "sessions": 0},
+                "entrenchment": st["entrenchment"], "bar": st["bar"], "rationale": st["rationale"],
+                "needs": raw_needs,                    # distinct-session shortfall on the RAW count, but …
+                "needs_recent": raw_needs == 0}        # … if 0 yet incubating, it's held below the bar by
+                # AGED evidence (recency-weighted gate, ADR-0023) — it needs RECENT corroboration, not more
+                # old sessions; the flag stops the queue reading a misleading "needs 0".
+
     out: list[dict] = []
+    pool = resolve.claim_pool(root)
+    claim_ids = {c["id"] for c in pool}
+    for c in pool:
+        if dream.net_entrenchment(c, now, valid_times=valid_times) >= maturity:
+            continue
+        d = decisions.get(c["id"])
+        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+            continue
+        out.append(row(c, "claim"))
+    mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times)}
     for tk in dream.catalog(root):
-        if tk["id"] in mature:
+        if tk["id"] in mature or tk["id"] in claim_ids:
             continue
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):              # accepted/rejected/etc. directly — no longer accruing
             continue
-        sup = tk.get("support") or {"events": 0, "sessions": 0}
-        raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
-        st = bar_status(tk, maturity, valid_times=valid_times)
-        out.append({"takeaway_id": tk["id"], "title": tk.get("title", ""), "support": sup,
-                    "entrenchment": st["entrenchment"], "bar": st["bar"], "rationale": st["rationale"],
-                    "needs": raw_needs,                    # distinct-session shortfall on the RAW count, but …
-                    "needs_recent": raw_needs == 0})       # … if 0 yet incubating, it's held below the bar by
-                    # AGED evidence (recency-weighted gate, ADR-0023) — it needs RECENT corroboration, not more
-                    # old sessions; the flag stops the queue reading a misleading "needs 0".
+        out.append(row(tk, "takeaway"))
     return out
 
 
@@ -247,6 +643,7 @@ def _present(takeaway: dict, root: Path, *, context_bytes: int) -> dict:
     """The reviewer's view of one takeaway: the synthesis (untrusted) + its verified evidence."""
     return {
         "takeaway_id": takeaway["id"],
+        "kind": "takeaway",
         "title": takeaway.get("title", ""),
         "why": takeaway.get("why", ""),
         "relation": takeaway.get("relation") or {"kind": "new", "concept_id": None},
@@ -258,10 +655,15 @@ def _present(takeaway: dict, root: Path, *, context_bytes: int) -> dict:
 
 
 def context_for(takeaway_id: str, root: Path | None = None, *, context_bytes: int = 1200) -> dict | None:
-    """One takeaway with a WIDE evidence window — the deep path: when Claude escalates to investigate
-    (thin support, a `why` that overreaches its quotes, a contradiction), it reads the surrounding
-    transcript here rather than trusting the one-line synthesis."""
+    """One takeaway OR claim with a WIDE evidence window — the deep path: when Claude escalates to
+    investigate (thin support, a `why` that overreaches its quotes, a contradiction), it reads the
+    surrounding transcript here rather than trusting the one-line synthesis. Claims preferred (the
+    queue's own precedence), and the claim's deep view carries its audit card too."""
     root = root or config.data_root()
+    c = _claim_view(takeaway_id, root)
+    if c is not None:
+        return _present_claim(c, root, context_bytes=context_bytes, mats=_claim_materials(root),
+                              valid_times=dream._session_valid_times(root))
     tk = _load_takeaway(takeaway_id, root)
     return _present(tk, root, context_bytes=context_bytes) if tk else None
 
@@ -312,9 +714,15 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     anchor would feed dream/generate) unless `allow_no_evidence` overrides. Identity comes from the
     takeaway's `relation`: `strengthens`/`refines` an EXISTING concept → a new version of it; otherwise
     (incl. a stale/unknown concept_id) mint fresh. `edited` ({title?, why?}) corrects the synthesis
-    before it becomes a concept, captured before/after. Returns the concept id."""
+    before it becomes a concept, captured before/after. Returns the concept id.
+
+    A v3 CLAIM accepts through the same door (§5 — review appends a decision FACET, nothing forks):
+    the id resolves to the claim's LIVE-EDGE FOLD first (`_claim_view` — the stored blob is seed
+    identity only, so evidence exists ONLY in the fold), and the same `_verified_pointers` filter
+    re-validates every span. A why-pending claim (why=null) accepts with statement '' unless the
+    reviewer edits one in — never withheld waiting on synthesize (§6)."""
     root = root or config.data_root()
-    tk = _load_takeaway(takeaway_id, root)
+    tk = _claim_view(takeaway_id, root) or _load_takeaway(takeaway_id, root)
     if tk is None:
         raise ValueError(f"no takeaway {takeaway_id!r}")
     evidence = _verified_pointers(tk, root)         # only spans that re-validate (the reviewer's filter)
@@ -323,7 +731,7 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
                          f"concept with no verifiable backing (override with allow_no_evidence=True)")
     edited = edited or {}
     title = edited.get("title", tk.get("title", ""))
-    statement = edited.get("why", tk.get("why", ""))
+    statement = edited.get("why", tk.get("why") or "")   # a claim's why is null until synthesize (§7.3)
     rel = tk.get("relation") or {}
     known = dream.valid_concept_ids(root)
     concept_id = (rel["concept_id"] if rel.get("kind") in ("strengthens", "refines")
@@ -561,6 +969,16 @@ def main(argv=None) -> None:
     g.add_argument("--pending", action="store_true", help="the review queue (mature takeaways + verified evidence)")
     g.add_argument("--incubating", action="store_true",
                    help="takeaways still below the maturity bar (accruing toward review, not yet shown)")
+    g.add_argument("--contested", action="store_true",
+                   help="claims carrying a live contradicts edge within one session of the bar — a wrong "
+                        "llm CONTRADICTS verdict must not silently suppress an almost-mature claim (§6.6)")
+    g.add_argument("--reject-merge", metavar="EDGE|A,B",
+                   help="the compound 'not the same' verdict (§2.2): an edge id (event|corroborates|claim, "
+                        "the audit card's handle) retracts + reopens + pair-blocks; a claim pair A,B "
+                        "dismisses a merge suggestion (pair-block only, never asked again)")
+    g.add_argument("--merge-claims", nargs=2, metavar=("LOSER", "WINNER"),
+                   help="confirm a merge suggestion: re-point the loser's live edges onto the winner "
+                        "(match keys preserved) and fold the loser out via a merge decision")
     g.add_argument("--context", metavar="TAKEAWAY", help="one takeaway with a WIDE evidence window (deep path)")
     g.add_argument("--accept", metavar="TAKEAWAY", help="promote a takeaway to a concept")
     g.add_argument("--reject", metavar="TAKEAWAY", help="reject a takeaway")
@@ -594,7 +1012,7 @@ def main(argv=None) -> None:
                     help="accept a takeaway with no resolvable evidence (a deliberate, recorded override)")
     ap.add_argument("--assessment", default="", help="Claude's faithfulness assessment (recorded as provenance)")
     ap.add_argument("--note", default="", help="a reviewer note")
-    ap.add_argument("--reason", default="", help="reason for reject/snooze/retire")
+    ap.add_argument("--reason", default="", help="reason for reject/snooze/retire/reject-merge/merge-claims")
     ap.add_argument("--until", help="snooze re-surface time (ISO)")
     args = ap.parse_args(argv)
 
@@ -611,6 +1029,26 @@ def main(argv=None) -> None:
             print(json.dumps(inc, ensure_ascii=False, indent=2))
         else:
             _print_incubating(inc)
+    elif args.contested:
+        rows = contested(maturity=args.maturity)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            _print_contested(rows)
+    elif args.reject_merge:
+        body = reject_merge(args.reject_merge, reason=args.reason)
+        if args.json:
+            print(json.dumps(body, ensure_ascii=False, indent=2))
+        elif body.get("edge_id"):
+            print(f"reject-merge recorded: edge {body['edge_id']} retracted, event {body['target']} "
+                  f"reopened, pair blocked")
+        else:
+            print(f"reject-merge recorded: pair {tuple(body['pair'])} blocked — never suggested again")
+    elif args.merge_claims:
+        res = merge_claims(args.merge_claims[0], args.merge_claims[1], reason=args.reason)
+        print(json.dumps(res, ensure_ascii=False) if args.json
+              else f"merged claim {res['loser']} into {res['winner']} "
+                   f"({res['moved_edges']} edge(s) re-pointed)")
     elif args.context:
         c = context_for(args.context, context_bytes=args.bytes if args.bytes is not None else 1200)
         if c is None:
@@ -674,19 +1112,87 @@ def _print_queue(q: list[dict], *, incubating_count: int = 0, bar: float | None 
     if not q:
         print("review queue empty — nothing over the maturity bar yet." + _incubating_tail(incubating_count, bar=bar))
         return
-    print(f"{len(q)} takeaway(s) to review:\n")
+    print(f"{len(q)} item(s) to review:\n")
     for i, t in enumerate(q, 1):
         sup, rel = t["support"], t["relation"]["kind"]
-        print(f"{i}/{len(q)} · {t['title']}  [{rel} · {sup['events']}ev/{sup['sessions']}sess]")
+        head = f"{i}/{len(q)} · {t['title']}  [{rel} · {sup['events']}ev/{sup['sessions']}sess"
+        if t.get("kind") == "claim":
+            head += f" · claim · {t.get('scope')}"
+        print(head + "]")
         if "rationale" in t:                       # the gate, made transparent (ADR-0027)
             print(f"  MATURITY: {t['rationale']}")
-        print(f"  WHY: {t['why']}")
+        if t.get("why_pending"):                   # never withheld waiting on synthesize (§6)
+            print("  WHY: (pending — synthesize hasn't run yet; the title is the seed event's summary. "
+                  "Run `python -m ratchet.synthesize` to fill it, or accept with --edit-why.)")
+        else:
+            print(f"  WHY: {t['why']}"
+                  + ("  [⚠ why-stale: the live evidence diverged since this prose was written]"
+                     if t.get("why_stale") else ""))
+        if t.get("contested"):
+            print("  ⚡ CONTESTED: carries a live contradiction — `--contested` shows the other side")
         for ev in t["evidence"]:
             print(f"    ✓ {ev['quote'][:100]!r}")
+        _print_audit(t.get("audit"))
+        _print_suggestions(t.get("merge_suggestions"))
         print()
     tail = _incubating_tail(incubating_count, bar=bar)
     if tail:
         print(tail.lstrip("\n"))
+
+
+def _print_audit(audit: dict | None) -> None:
+    """The audit card (§6.3): every corroboration's verified quote beside the match key the resolver
+    persisted — the reviewer sees exactly what the model saw; ⚠ marks disjoint-subject evidence."""
+    if not audit:
+        return
+    print("  AUDIT — every corroboration, with what the matcher saw:")
+    for r in audit["corroborations"]:
+        quote = (r.get("quote") or "(blob gone — span no longer resolves)")[:90]
+        if r.get("match"):
+            m = r["match"]
+            print(f"    llm   ✓ {quote!r}")
+            print(f"          [stmt_sim {m['stmt_sim']} · {m['candidates_shown']} candidate(s) shown "
+                  f"· model {m['model']} · edge {r['edge_id']}]")
+        else:
+            print(f"    {str(r.get('by') or '?'):5} ✓ {quote!r}")
+        if r.get("disjoint"):
+            subj = r.get("subject") or {}
+            where = subj.get("repo") or ", ".join((subj.get("files") or ())[:2]) or "?"
+            print(f"          ⚠ disjoint subject: {where} shares no repo/file with the other evidence")
+    print("  STORY: " + "; ".join(audit["story"]))
+
+
+def _print_suggestions(suggs: list[dict] | None) -> None:
+    """Derived merge suggestions (§6.5): both claims' titles + a verified quote each — the words, never
+    the stmt_sim number (noise in the residue band)."""
+    if not suggs:
+        return
+    print("  MERGE? residue-similar live claim(s) — the same lesson twice?")
+    for sg in suggs:
+        a, b = sg["claims"]
+        for tag, side in (("·", a), ("~", b)):
+            print(f"    {tag} {side['claim_id']}  {side['title'][:70]}")
+            print(f"        {(side.get('quote') or '(no resolvable quote)')[:90]!r}")
+        print(f"      confirm: --merge-claims LOSER WINNER · not the same: "
+              f"--reject-merge {','.join(sg['pair'])}")
+
+
+def _print_contested(rows: list[dict]) -> None:
+    """Contested-near-bar claims (§6.6), each with its bar standing and the contradicting quotes as
+    ground truth — a wrong llm CONTRADICTS verdict is caught here, not silently suppressed."""
+    if not rows:
+        print("no contested claims near the bar — no live contradiction is holding anything back.")
+        return
+    print(f"{len(rows)} contested claim(s) within {CONTESTED_WINDOW:g} of the bar:\n")
+    for r in rows:
+        sup = r["support"]
+        standing = "MATURE — also in --pending" if r["mature"] else "held under the bar by the contradiction"
+        print(f"  {r['claim_id']}  {r['title'][:70]}  [{sup['events']}ev/{sup['sessions']}sess · "
+              f"{r['entrenchment']:g}/{r['bar']:g} · {standing}]")
+        print(f"      {r['rationale']}")
+        for quote in r["contradicting"]:
+            print(f"      ✗ {quote[:100]!r}")
+        print()
 
 
 def _print_proposals(q: list[dict]) -> None:
