@@ -1,0 +1,10 @@
+{
+ "_comment": "G5 — the compound reject-merge decision (design §2.2): ONE append that three folds read — the edge fold as retraction (support 2→1), the working-set fold as reopen, resolve's candidate filter as a permanent pair-block — and the done-marker key gains an epoch suffix so the Block driver re-admits the reopened event. Re-resolve finds its only candidate blocked, so the event seeds its OWN claim at $0; the torn-out pair never re-forms.",
+ "support_after_reject": 1,
+ "reopened": true,
+ "epoch_key_suffix": true,
+ "reprocessed": 1,
+ "claims_after": 2,
+ "rerun_llm_calls": 0,
+ "pair_reformed": false
+}

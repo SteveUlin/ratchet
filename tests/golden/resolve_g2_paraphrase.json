@@ -1,0 +1,12 @@
+{
+ "_comment": "G2 — the jj-not-git lesson told twice, PARAPHRASED (stmt_sim 0.202 — the measured zone where real same-lesson paraphrases live; a verbatim fixture would pass via near-dup collision and prove nothing), across 2 sessions from 2 repos. The rare-shingle channel surfaces the candidate, the residue call merges it (by:llm, audit-keyed), scope derives cross-cutting, and 2 fresh distinct sessions mature it at the single bar (design §3.1/§3.4).",
+ "claims": 1,
+ "support_events": 2,
+ "support_sessions": 2,
+ "scope": "cross-cutting",
+ "repos": ["alpha", "beta"],
+ "matured": 1,
+ "llm_calls": 1,
+ "stmt_sim": 0.202,
+ "by": "llm"
+}

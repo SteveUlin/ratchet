@@ -1,0 +1,10 @@
+{
+ "_comment": "G1 — the motivating v2 over-merge trio (Zig struct naming / JAX autodiff / NumPy NEP-50): three DISTINCT lessons whose pairwise stmt_sims sit below J_MAYBE, so the $0 rejection layer settles every pair. Three separate claims, none matured (one session each), and the residue completer is NEVER called — the spurious '2 sessions' cannot form (design §3.2).",
+ "claims": 3,
+ "matured": 0,
+ "llm_calls": 0,
+ "minted": 3,
+ "corroborated": 0,
+ "contradicted": 0,
+ "residue_calls": 0
+}

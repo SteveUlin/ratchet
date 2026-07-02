@@ -1,0 +1,10 @@
+{
+ "_comment": "G3 — retraction IS the split (design §2.2, Senzing 'unresolve'): the claim blob stores seed identity only, so retracting the corroborates edge makes the fold byte-exactly the fold of a claim the event never matched — support decrements, scope and signature shrink, the claim un-matures. No rewrite, no migration, no residue on the blob.",
+ "support_before": 2,
+ "support_after": 1,
+ "matured_before": 1,
+ "matured_after": 0,
+ "scope_before": "cross-cutting",
+ "scope_after": "local",
+ "fold_equals_never_matched": true
+}

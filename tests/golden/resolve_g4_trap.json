@@ -1,0 +1,11 @@
+{
+ "_comment": "G4 — the measured trap: two DIFFERENT lessons sharing vocabulary at stmt_sim 0.3516 (the corpus's real 0.311 top pair is exactly this shape — char-shingles cannot separate same from different in the 0.2-0.35 band, so the LLM owns the call). An honest NONE keeps 2 claims; a WRONG same-as fuses them — and the edge carries by:llm + candidates_shown + stmt_sim, so the review audit card sees exactly what the model saw (design §0/§6.3).",
+ "stmt_sim": 0.3516,
+ "honest_claims": 2,
+ "honest_llm_calls": 1,
+ "honest_minted": 2,
+ "wrong_claims": 1,
+ "wrong_by": "llm",
+ "wrong_candidates_shown": 1,
+ "wrong_stmt_sim": 0.3516
+}
