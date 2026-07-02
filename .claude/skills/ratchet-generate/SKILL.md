@@ -29,14 +29,14 @@ The mechanical render is faithful BY CONSTRUCTION: verbatim statement + a traili
 
 ## The flow
 
-Run everything from `~/ratchet`.
+Every command runs from anywhere — `nix run ~/ratchet#generate -- …` needs no cwd.
 
 ### 1. Show the proposal
 
 ```
-nix run .#generate -- --diff --target <his CLAUDE.md>   # the mechanical region vs the target's current one
-nix run .#generate                                      # (or --dry-run) the projected region alone
-nix run .#generate -- --concepts                        # each rule's statement + verified evidence (faithfulness substrate)
+nix run ~/ratchet#generate -- --diff --target <his CLAUDE.md>   # the mechanical region vs the target's current one
+nix run ~/ratchet#generate                                      # (or --dry-run) the projected region alone
+nix run ~/ratchet#generate -- --concepts                        # each rule's statement + verified evidence (faithfulness substrate)
 ```
 
 Show him what would land and how it changes his file. The `--diff` is the second gate (review decided what's TRUE; this decides what lands HERE). Read `--concepts` alongside so each rule's source statement + quotes are in view.
@@ -51,7 +51,7 @@ Show him what would land and how it changes his file. The `--diff` is the second
 
 ### 3. Land it
 
-- **Mechanical** (traceable baseline / fallback): `nix run .#generate -- --apply --target <his CLAUDE.md>` — writes ONLY the marked region; content above and below is byte-preserved. He reviews the final diff.
+- **Mechanical** (traceable baseline / fallback): `nix run ~/ratchet#generate -- --apply --target <his CLAUDE.md>` — writes ONLY the marked region; content above and below is byte-preserved. He reviews the final diff.
 - **Crafted**: write the polished region (markers + every `<!-- c-id -->` intact) into the target; he reviews the diff. Remind him honestly — it's a snapshot; a later `--apply` reverts it to verbatim, so re-craft when concepts change.
 - The default `--target` is a SAFE staged path under the data root — it never clobbers a real CLAUDE.md. He points `--target` at one deliberately.
 
