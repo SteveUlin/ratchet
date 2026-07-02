@@ -690,6 +690,8 @@ def reset_v2(root: Path | None = None, *, dry_run: bool = False,
     """`--reset-v2`: retire every LIVE v2 takeaway (a `retire` decision, review's own verb — the blob
     + history stay) and REOPEN every event whose latest decision is `consolidated` (a `reopen`
     decision, so `dream.working_set`'s fold re-admits it and resolve re-consolidates it into claims).
+    Only DREAM-consolidated events qualify (producer.stage — a resolve-consolidated event is v3's own
+    verdict, not v2 damage; without the guard a re-run AFTER the drain would reopen the whole store).
     Append-only and IDEMPOTENT: `dream.catalog` already excludes retired takeaways, and a reopened
     event's latest decision is no longer `consolidated` — a second run finds nothing to do. Run the
     drain with `--no-forget` until pending hits 0 (§7.3): a freshly reopened backlog is all
@@ -708,7 +710,8 @@ def reset_v2(root: Path | None = None, *, dry_run: bool = False,
     decisions = blobstore.latest_decisions(root)
     for sid in sorted(blobstore.latest_by_kind("event", root)):
         d = decisions.get(sid)
-        if d and d.get("verb") == "consolidated":
+        if (d and d.get("verb") == "consolidated"
+                and d.get("producer", {}).get("stage") == "dream"):
             reopened.append(sid)
             if not dry_run:
                 at = config.now()

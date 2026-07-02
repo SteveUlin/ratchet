@@ -474,8 +474,12 @@ assert resolve.reset_v2(R7) == ([], []), "a second reset finds nothing to do (id
 rep7 = resolve.run(NeverCalled(), model="fake", forget=False, root=R7)
 assert rep7.n_minted == 2 and working_set(R7) == [], "resolve drains the reopened backlog into claims"
 assert len(claim_pool(R7)) == 2 and dream.catalog(R7) == []
+assert resolve.reset_v2(R7, dry_run=True) == ([], []), \
+    "a reset AFTER the drain reopens nothing — resolve-consolidated events are v3's own verdicts, " \
+    "not v2 damage (producer.stage guard)"
 print("OK §7 — reset-v2: dry-run previews, the real pass retires 2 takeaways (reason cites ADR-0028)")
-print("        + reopens 2 events, a second pass no-ops, and resolve re-consolidates them into claims.")
+print("        + reopens 2 events, a second pass no-ops, and resolve re-consolidates them into claims;")
+print("        a reset after the drain reopens nothing (producer.stage guard).")
 
 
 # === 8. FORGET (§7.3): resolve-stage residency, restarted by reopen, wall-clock-bounded ==============
