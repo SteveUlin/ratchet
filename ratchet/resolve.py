@@ -46,6 +46,7 @@ event, idempotent. The LLM seam is one injected `Completer` (Haiku), offline-tes
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections import Counter
@@ -211,7 +212,8 @@ def retract_edge(event_id: str, verb: str, claim_id: str, *, root: Path | None =
                       match=obj.get("match") or {}, active=False, root=root, run_id=run_id)
 
 
-def reject_merge(event_id: str, *, edge_id: str | None = None, pair: list[str] | None = None,
+def reject_merge(event_id: str | None = None, *, edge_id: str | None = None,
+                 pair: list[str] | None = None,
                  reason: str = "", reviewer: str = "sulin", root: Path | None = None,
                  run_id: str | None = None) -> dict:
     """The ONE compound human "not the same" verdict (§2.2) — a single append-only decision blob,
@@ -220,9 +222,17 @@ def reject_merge(event_id: str, *, edge_id: str | None = None, pair: list[str] |
     and/or the claim pair to block; THREE folds read this one blob: `_live_edges` as retraction,
     the working set as reopen, and the candidate filter as a permanent pair-block. One append, atomic —
     no crash window can strand the event or let the next tick re-form the torn-out merge. REVIEW-only
-    by policy (ADR-0008): a permanent negative constraint is a trust-boundary artifact."""
+    by policy (ADR-0008): a permanent negative constraint is a trust-boundary artifact.
+
+    Two forms: with an `edge_id` the event is implied (derived when `event_id` is omitted) and all
+    three folds fire; PAIR-ONLY (a dismissed merge SUGGESTION between two live claims, §6.5) carries
+    no event — target is None, nothing retracts or reopens, and only the pair-block fold reads it
+    (the suggestion query stops asking, resolve never pairs them)."""
     if not edge_id and not pair:
         raise ValueError("reject_merge needs an edge_id and/or a pair to block")
+    if event_id is None and edge_id:
+        parts = edge_id.split(EDGE_SEP)
+        event_id = parts[0] if len(parts) == 3 else None
     root = root or config.data_root()
     at = config.now()
     body = {"verb": VERB_REJECT_MERGE, "target": event_id, "event_id": event_id,
@@ -294,6 +304,18 @@ def _live_edges(root: Path, rm: dict) -> dict[str, list[dict]]:
 
 
 # --- the claim fold: every evidential attribute derives from live edges + event blobs (§2.1) -------
+
+def corro_fingerprint(claim_id: str, event_ids) -> str:
+    """The live corroborates-edge-set fingerprint (§7.3): sha256 over the SORTED edge source_ids
+    (`event|corroborates|claim`) of the claim's live corroborating events, first 16 hex. `synthesize`
+    stamps it on the claim version it mints — the exact edge set the prose consumed — and `_fold_claim`
+    recomputes it from the live fold to flag `why_stale` on divergence. The `why` is the ONE stored
+    non-derived field, so a retraction after synthesis would otherwise leave fused prose latched:
+    staleness must be DETECTED here, not recomputed away."""
+    ids = sorted(edge_id(e, "corroborates", claim_id) for e in set(event_ids))
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
+
+
 
 def _load_event(eid: str, ev_hashes: dict, cache: dict, root: Path) -> dict | None:
     if eid in cache:
@@ -391,6 +413,13 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         "id": content["id"],
         "title": title,
         "why": content.get("why"),
+        # the why-staleness derivation (§7.3): synthesize stamped the edge-set fingerprint its prose
+        # consumed; if the LIVE corroborates set has since diverged (a retraction, a new merge), the
+        # prose no longer describes the evidence — flag it for the review surface. why=null claims and
+        # pre-stamp blobs read as fresh (False): nothing synthesized, nothing to be stale.
+        "why_fingerprint": content.get("why_fingerprint"),
+        "why_stale": bool(content.get("why") is not None and content.get("why_fingerprint")
+                          and content["why_fingerprint"] != corro_fingerprint(content["id"], cites)),
         "relation": content.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
         "seed_event": content.get("seed_event"),
         "born": content.get("born"),
@@ -880,6 +909,7 @@ class ResolveBlock:
                    root=root, run_id=run_id)                                        # edge SECOND
         view = {
             "id": cid, "title": summary, "why": None,
+            "why_fingerprint": None, "why_stale": False,   # nothing synthesized yet (shape parity with the fold)
             "relation": content["relation"], "seed_event": rv.id, "born": content["born"],
             "cites": [rv.id], "evidence": [dream.evidence_entry(rv)],
             "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
