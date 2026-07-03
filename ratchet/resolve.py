@@ -56,7 +56,7 @@ from . import blobstore, block, completer, config, dream, sig, subject
 from .completer import Completer
 from .glean import MARKER_KINDS
 
-PROMPT_VERSION = "resolve/1"   # bump to re-adjudicate NOT-yet-consolidated events with a sharper prompt
+PROMPT_VERSION = "resolve/2"   # bump to re-adjudicate NOT-yet-consolidated events with a sharper prompt
 RESOLVE_MODEL = "haiku"        # the residue adjudicator is cheap + bounded → the small model
 OUT_NOUN = "claims"
 
@@ -107,7 +107,14 @@ FORGET_MIN_DAYS = 7.0          # UNTUNED — the wall-clock minimum an event mus
                                # count alone would accelerate eviction; a week of real time keeps
                                # "aged" honest.
 
-TITLE_MAX = dream.TITLE_MAX
+# The replay audit (2026-07-02, 54 gold pairs, live haiku: recall 71%, false-accept 36%) traced BOTH
+# failure directions to candidate INVISIBILITY: dream's TITLE_MAX=80 cut every candidate mid-sentence
+# (claim titles are event summaries, measured 92–240 chars) and candidate EVIDENCE never entered the
+# prompt — the model judged a claim by half a title while the observation got a full verbatim quote.
+# The candidate side now renders at the summary scale, with its own evidence.
+RESIDUE_TITLE_MAX = 240        # candidate-title clip in the residue prompt — the summary scale, not 80
+SEED_QUOTE_MAX = 400           # candidate seed-quote clip — enough that a noise anchor ("[assistant]",
+                               # frontmatter fragments) is visibly noise, without flooding the call
 
 
 # --- the residue adjudication prompt: comparative, explicit none, none the stated default (§3.1) ---
@@ -123,6 +130,8 @@ RESOLVE_SYSTEM = (
     "FOR it).\n"
     "  - contradicts-N: the observation is evidence that candidate N is WRONG or no longer holds.\n"
     "The observation's verbatim QUOTE is ground truth; its one-line summary is only a hint.\n"
+    "Each candidate carries its own verbatim quote — the evidence it was learned from; a candidate "
+    "whose quote does not evidence its title deserves no match.\n"
     "Return ONLY a JSON object, no prose, no code fences:\n"
     '{"verdict": "none" | "same-as-N" | "contradicts-N"}   (N = a candidate number)'
 )
@@ -131,11 +140,19 @@ _VERDICT_RE = re.compile(r"^(same-as|contradicts)-(\d+)$")
 
 
 def _residue_user(rv: dream.ResolvedEvent, shown: list[dict]) -> str:
+    """The residue prompt body (prompt v2). Each candidate renders with the SAME evidential standing
+    as the observation — full-width title, synthesized `why` when present, and its seed event's
+    re-validated verbatim quote (`seed_quote`, resolved at candidate construction; `adjudicate` stays
+    store-free) — so a noise-anchored candidate is VISIBLY noise. A missing/unresolvable quote says
+    so explicitly rather than rendering as silent absence."""
     lines = []
     for i, c in enumerate(shown, 1):
-        stmt = str(c.get("title", "")).strip()[:TITLE_MAX]
+        stmt = str(c.get("title", "")).strip()[:RESIDUE_TITLE_MAX]
         why = str(c.get("why") or "").strip()[:dream.WHY_MAX]
         lines.append(f"[{i}] id={c.get('id')}: {stmt}" + (f" — {why}" if why else ""))
+        quote = str(c.get("seed_quote") or "").strip()
+        lines.append(f'    quote (verbatim): """{quote[:SEED_QUOTE_MAX]}"""' if quote
+                     else "    quote: (no verbatim evidence resolvable)")
     return (f'OBSERVATION\nquote: """{rv.quote}"""\n'
             f'summary: {str(rv.event.get("summary", "")).strip()!r}\n\n'
             f'CANDIDATES\n' + "\n".join(lines))
@@ -357,7 +374,8 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
                 sessions: dict, subj_cache: dict, root: Path) -> dict:
     """One claim's DERIVED view (§2.1): the stored blob is seed identity only; support, sessions,
     evidence (shaped exactly like dream's, so `review.resolve_evidence` reads it unchanged), the
-    contradiction side, subject, scope, and stmt_sig all fold from LIVE edges + event blobs here.
+    contradiction side, subject, scope, stmt_sig, and the seed event's verbatim quote (`seed_quote`,
+    the residue prompt's candidate-side evidence) all fold from LIVE edges + event blobs here.
 
     The signature signs the SEED summary (= the stored title) ∪ the LIVE corroborating events'
     summaries — NEVER synthesized why/title prose (§2.1: prose jumps register and signing it chains
@@ -422,6 +440,11 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
                           and content["why_fingerprint"] != corro_fingerprint(content["id"], cites)),
         "relation": content.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
         "seed_event": content.get("seed_event"),
+        # the seed event's re-validated verbatim quote — the residue prompt's candidate-side evidence
+        # (prompt v2). Derived from the fold's own evidence entries (already validate_span-anchored);
+        # None when the seed edge is retracted or the blob/span no longer resolves.
+        "seed_quote": next((e.get("quote") for e in evidence
+                            if e.get("event_id") == content.get("seed_event")), None),
         "born": content.get("born"),
         "cites": cites,
         "evidence": evidence,
@@ -913,7 +936,9 @@ class ResolveBlock:
         view = {
             "id": cid, "title": summary, "why": None,
             "why_fingerprint": None, "why_stale": False,   # nothing synthesized yet (shape parity with the fold)
-            "relation": content["relation"], "seed_event": rv.id, "born": content["born"],
+            "relation": content["relation"], "seed_event": rv.id,
+            "seed_quote": rv.quote,                    # the candidate-side evidence, already validated
+            "born": content["born"],
             "cites": [rv.id], "evidence": [dream.evidence_entry(rv)],
             "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
             "sessions_seen": [rv.session_id] if rv.session_id else [],

@@ -217,8 +217,27 @@ got = candidate_ids(_only, frozenset(), {"repo": "mono", "files": []})
 assert got == {"c-a"}, f"a df=1 facet is kept even at 100% of a 1-claim pool: {got}"
 got = candidate_ids(_only, frozenset(), {"repo": None, "files": []})
 assert got == set(), "an EMPTY subject key contributes nothing via subject (seed-only, §3.1 step 0)"
+
+# _residue_user (prompt v2): candidates carry their OWN verbatim evidence — the replay audit traced
+# recall AND false-accept to candidate invisibility (80-char titles, no candidate quote). A noise
+# seed_quote renders VERBATIM (visibly noise); a missing one renders the explicit absence marker;
+# titles render at the summary scale (RESIDUE_TITLE_MAX), past dream's 80-char clip.
+_rv0 = dream.ResolvedEvent(event={"id": "e-obs", "summary": "an observation"},
+                           quote="the observation's verbatim quote", span=(0, 32), session_id="s-obs")
+_long_title = ("a lesson whose full statement runs well past the old eighty-character clip because "
+               "claim titles are event summaries and the measured corpus runs 92-240 characters")
+_noise_q = "[assistant]\n---\ntitle: a frontmatter fragment"
+_u0 = resolve._residue_user(_rv0, [
+    {"id": "c-noise", "title": _long_title, "why": None, "seed_quote": _noise_q},
+    {"id": "c-bare", "title": "a candidate with no resolvable evidence", "why": "a synthesized why"},
+])
+assert f'"""{_noise_q}"""' in _u0, "a noise seed_quote renders VERBATIM — visibly noise to the matcher"
+assert "(no verbatim evidence resolvable)" in _u0, "a missing seed_quote renders the explicit absence marker"
+assert _long_title in _u0, "candidate titles render at the summary scale (80 cut every candidate mid-sentence)"
+assert "a synthesized why" in _u0, "a synthesized why still rides the candidate line"
 print("OK §0 — verdict coercion is strict-to-none; facet devaluation (df>=2 over the fraction) with the")
-print("        df=1 guard; rare shingles recall the paraphrase; empty subject is seed-only.")
+print("        df=1 guard; rare shingles recall the paraphrase; empty subject is seed-only; the residue")
+print("        prompt shows candidate evidence verbatim (or its explicit absence).")
 
 
 # === G1. the Zig/JAX/NEP-50 trio: 3 claims, 0 matured, 0 LLM calls ==================================
@@ -269,6 +288,10 @@ system2, user2 = fake2.prompts[0]
 assert "NONE is the expected answer" in system2 and "same-as-N" in system2, \
     "the residue prompt states the abstention default"
 assert f"[1] id={claim2['id']}" in user2, "candidates render as a numbered list with their statements"
+assert f'quote (verbatim): """{claim2["title"]}"""' in user2, \
+    "the candidate's seed quote rides the residue prompt — evidence on BOTH sides (prompt v2)"
+assert claim2["seed_quote"] == claim2["title"], \
+    "the fold derives seed_quote from the seed event's re-validated bytes (title == summary == line here)"
 # the evidence entries fold in dream's shape — review.resolve_evidence reads them unchanged.
 from ratchet import review  # noqa: E402
 resolved = review.resolve_evidence(claim2, R2)
