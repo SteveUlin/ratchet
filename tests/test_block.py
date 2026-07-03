@@ -12,6 +12,10 @@ substrate's cross-cutting guarantees are pinned independent of any stage. The lo
     probe satisfying that protocol records the stream; the driver computes total/todo/already itself.
   DREAM'S finalize EXCEPTION — commits_per_item=False writes NO per-item marker; finalize sees the
     block's own pending state (no driver-passed list) and does the commit itself.
+  PARALLEL (opt-in) — `run(parallel=N)` pools process() calls for a `parallel_safe = True` block:
+    the end-state is IDENTICAL to serial (completion order invisible), the budget gate's overshoot is
+    bounded (cap + up to `parallel` calls' cost — the leash), a block that hasn't opted in clamps to
+    serial with a stderr note, and a raising item stays isolated mid-pool.
 
 Run: `python tests/test_block.py`."""
 import os
@@ -404,5 +408,117 @@ assert pd.processed_keys == ["a", "b", "c", "d"], \
 print("OK §10 — priority(): descending priority queue, --limit takes the top slice, default is a stable no-op")
 
 
+# === 11. parallel: a pooled run lands the IDENTICAL end-state serial does (order is invisible) ========
+# The pooled lane changes WHEN a call runs, never WHAT lands: same blob set, same markers, same Report
+# counts. Content-addressing makes completion order invisible, so a serial root and a parallel root must
+# be indistinguishable. The block sleeps unevenly so the pool genuinely scrambles completion order.
+import time
+from contextlib import redirect_stderr
+
+
+class ParallelBlock(FakeBlock):
+    """A FakeBlock that OPTS IN (`parallel_safe = True`) and sleeps unevenly in process(), so a pooled
+    run finishes out of dispatch order — proving end-state identity is completion-order-free.
+    processed_keys keeps recording (list.append is atomic); order-sensitive asserts use sets."""
+    name = "par"
+    parallel_safe = True
+
+    def __init__(self, items, *, naps=None, **kw):
+        super().__init__(items, **kw)
+        self.naps = naps or {}
+
+    def process(self, item, *, root, run_id):
+        time.sleep(self.naps.get(item, 0.0))
+        return super().process(item, root=root, run_id=run_id)
+
+
+ITEMS11 = ["s1", "s2", "s3", "s4", "s5", "s6"]
+NAPS11 = {"s1": 0.05, "s2": 0.0, "s3": 0.03, "s4": 0.01, "s5": 0.04, "s6": 0.0}
+
+r11s = fresh_root("par-serial")
+b11s = ParallelBlock(ITEMS11, naps=NAPS11)
+rep11s = block.run(b11s, root=r11s, progress=None)              # parallel defaults to 1: the serial lane
+
+r11p = fresh_root("par-pool")
+b11p = ParallelBlock(ITEMS11, naps=NAPS11)
+probe_par = ProbeProgress()
+rep11p = block.run(b11p, root=r11p, parallel=3, progress=probe_par)
+
+for f in ("examined", "processed", "skipped", "errored", "outputs", "pending"):
+    assert getattr(rep11s, f) == getattr(rep11p, f), \
+        f"Report.{f} diverged: serial {getattr(rep11s, f)} vs parallel {getattr(rep11p, f)}"
+assert abs(rep11s.cost_usd - rep11p.cost_usd) < 1e-9, "identical spend"
+for it in ITEMS11:                                              # identical blob set, both roots
+    assert blobstore.has(blobstore.blob_hash(f"payload::{it}"), r11s), f"serial blob for {it}"
+    assert blobstore.has(blobstore.blob_hash(f"payload::{it}"), r11p), f"parallel blob for {it}"
+assert block.done_index("par", r11p) == block.done_index("par", r11s) == \
+    {(it, "v1") for it in ITEMS11}, "identical marker (done) set"
+assert sorted(b11p.processed_keys) == sorted(ITEMS11), "each item processed exactly once (order scrambles)"
+assert probe_par.started == (6, 6, 0) and probe_par.stopped, "the pool still drives start/stop"
+assert sorted(t["key"] for t in probe_par.ticks) == sorted(ITEMS11) and \
+    all(t["outcome"] == "done" for t in probe_par.ticks), "one done tick per item, order-free"
+# the markers written at collection are real 0007 markers: a pooled re-run skips everything.
+b11r = ParallelBlock(ITEMS11)
+rep11r = block.run(b11r, root=r11p, parallel=3, progress=None)
+assert rep11r.skipped == 6 and rep11r.processed == 0, f"pooled re-run skips via the done-set: {rep11r}"
+print("OK §11 — parallel: pooled end-state (blobs, markers, Report) identical to serial; re-run skips")
+
+
+# === 12. parallel budget: the gate checks COLLECTED spend at dispatch — a bounded overshoot ===========
+# Per-call cost $1, cap $2, parallel=3, 8 items. The serial gate would land 2 (it trips at $2 collected);
+# the pool may add up to (parallel-1)=2 calls already in flight when the gate trips. Assert the
+# DOCUMENTED bound, never an exact count — the budget is a leash, not a contract.
+r12 = fresh_root("par-budget")
+b12 = ParallelBlock([f"b{i}" for i in range(8)], cost=1.0)
+rep12 = block.run(b12, root=r12, max_usd=2.0, parallel=3, progress=None)
+assert rep12.stopped_on_budget, f"budget stop flagged: {rep12}"
+assert 2 <= rep12.processed <= 4, \
+    f"bound: at least the serial gate's 2, at most 2 + (parallel-1) = 4 landed: {rep12}"
+assert rep12.cost_usd <= 4.0 + 1e-9, f"spend bounded by cap + parallel calls' cost: {rep12}"
+assert len(block.done_index("par", r12)) == rep12.processed, "everything that landed is marked (drained, not orphaned)"
+assert rep12.pending == 8 - rep12.processed, f"the un-dispatched remainder is pending for the next tick: {rep12}"
+print(f"OK §12 — parallel budget: clean stop, {rep12.processed} landed (documented bound 2..4), remainder pending")
+
+
+# === 13. clamps: a parallel_safe=False block runs SERIAL under parallel=N; N caps at PARALLEL_MAX =====
+# Opt-in is per Block: the default False protects stages whose serial order is load-bearing (resolve's
+# read-your-writes fold). Both clamps are LOUD (one stderr line saying why) and the run still completes.
+r13 = fresh_root("par-clamp")
+b13 = FakeBlock(["a", "b", "c"])                    # FakeBlock does NOT declare parallel_safe → False
+err13 = io.StringIO()
+with redirect_stderr(err13):
+    rep13 = block.run(b13, root=r13, parallel=3, progress=None)
+assert rep13.processed == 3, f"clamped run still completes: {rep13}"
+assert b13.processed_keys == ["a", "b", "c"], "serial lane: dispatch order preserved exactly"
+assert "parallel" in err13.getvalue().lower() and "serial" in err13.getvalue().lower(), \
+    f"the clamp says why on stderr: {err13.getvalue()!r}"
+
+r13b = fresh_root("par-cap")                        # a request past PARALLEL_MAX clamps down, loudly
+b13b = ParallelBlock(["x", "y"])
+err13b = io.StringIO()
+with redirect_stderr(err13b):
+    rep13b = block.run(b13b, root=r13b, parallel=99, progress=None)
+assert rep13b.processed == 2 and "clamp" in err13b.getvalue().lower(), \
+    f"over-cap request clamped to PARALLEL_MAX with a note: {err13b.getvalue()!r}"
+print("OK §13 — clamps: non-opted-in block runs serial (why on stderr); N caps at PARALLEL_MAX")
+
+
+# === 14. parallel error isolation: one raising item doesn't kill the tick or its siblings =============
+r14 = fresh_root("par-boom")
+b14 = ParallelBlock(["g1", "BOOM", "g2", "g3"], boom_on=["BOOM"],
+                    naps={"g1": 0.03, "g2": 0.02})
+probe14 = ProbeProgress()
+rep14 = block.run(b14, root=r14, parallel=3, progress=probe14)
+assert rep14.processed == 3 and rep14.errored == 1, f"BOOM isolated mid-pool; siblings landed: {rep14}"
+assert sorted(b14.processed_keys) == ["g1", "g2", "g3"], "every non-booming sibling committed"
+assert block.done_index("par", r14) == {("g1", "v1"), ("g2", "v1"), ("g3", "v1")}, \
+    "no marker for the failer — it retries next run, exactly the serial contract"
+outcomes14 = {t["key"]: t["outcome"] for t in probe14.ticks}
+assert outcomes14["BOOM"] == "errored" and all(outcomes14[k] == "done" for k in ("g1", "g2", "g3"))
+assert rep14.pending == 1, f"the errored item stays pending: {rep14}"
+print("OK §14 — parallel isolation: a mid-pool raise ticks errored, writes no marker, siblings commit")
+
+
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
-      "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol structure")
+      "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol "
+      "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps)")

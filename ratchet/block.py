@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
@@ -49,6 +50,13 @@ class Block(Protocol):
     params: tuple[tuple[str, str], ...]         # ordered (key, value) idempotency-param pairs; the
                                                 # done-key suffix, stored verbatim in the marker body
     commits_per_item: bool                      # default True; dream sets False (commits in finalize)
+    # parallel_safe — an OPTIONAL class attribute (the driver reads it via getattr, default False; NOT
+    # a Protocol member, so existing structural Blocks stay Blocks): a block declares
+    # `parallel_safe = True` iff its process() calls are mutually INDEPENDENT — nothing one item
+    # writes changes what a concurrent item reads. The default is False because serial order can be
+    # silently load-bearing: resolve's in-batch read-your-writes fold (each event reads the claims the
+    # PREVIOUS event just minted) means two events in flight re-open the duplicate-seed race the fold
+    # exists to close. glean opts in (each chunk is independent); everything else clamps to serial.
 
     def items(self, root: Path, *, source_id: str | None = None) -> Iterable[Item]:
         """Enumerate inputs. source_id=None → the whole store (--all); set → just that source's."""
@@ -488,9 +496,19 @@ class Progress:
 
 # --- the driver: one loop, identical for every stage ------------------------------------------------
 
+# The parallel-worker CAP (the leash on `run(parallel=N)`). Every `claude -p` worker drains the SAME
+# account-level token bucket the interactive session uses — the 5-hour-window quota is per account,
+# not per process — so parallelism buys LATENCY (overlapping subprocess waits), never capacity.
+# Community reports and our own runs agree: >=4 concurrent workers mostly manufacture 429 backoff (the
+# completer's ride-out sleeps), not throughput. 3 keeps the pipe full while leaving bucket headroom
+# for the interactive session sharing it. A principle-driven, adjustable default (one edit here),
+# enforced as a clamp with a stderr note — never a silent hard rule.
+PARALLEL_MAX = 3
+
+
 def run(block: Block, *, source_id: str | None = None, max_usd: float | None = None,
         limit: int | None = None, dry_run: bool = False, priority: PriorityStrategy | None = None,
-        progress: Progress | None = None, root: Path | None = None) -> Report:
+        progress: Progress | None = None, root: Path | None = None, parallel: int = 1) -> Report:
     """Drive a block over its items, IDENTICALLY for every stage. The per-item contract:
 
       1. enumerate (eager, so the bar knows the total) → 1b. ORDER by the `priority` POLICY (default
@@ -521,9 +539,33 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     driver owns enumeration, so IT computes `total`/`todo`/`already` and hands them to `start`; per item
     it passes the ONE outcome to `tick`. dream opts out of per-item commit (`commits_per_item=False`):
     process() ingests nothing durable and returns (0, cost) for the budget gate; the driver writes NO
-    per-item marker; `finalize` does every blob+marker commit off the block's own `_pending`. All-or-nothing."""
+    per-item marker; `finalize` does every blob+marker commit off the block's own `_pending`. All-or-nothing.
+
+    PARALLEL (opt-in, ADR-0009's "multithreading-ready" cashed in): `parallel=N>1` overlaps up to N
+    process() calls in a thread pool — the LLM call is a subprocess (the GIL releases), so threads give
+    true I/O parallelism. Everything else is UNCHANGED: dispatch follows the same priority order, the
+    done-skip and budget gate stay at dispatch, each item's marker still lands AFTER its process(), and
+    a raising item is isolated exactly as serially (see `_run_pool`). Two clamps guard it: a block that
+    has not declared `parallel_safe = True` runs serial (its serial order may be load-bearing — see the
+    Protocol note), and N caps at PARALLEL_MAX (a shared token bucket makes more workers backoff, not
+    throughput). BUDGET under parallelism is a LEASH, not a contract: the gate checks COLLECTED spend
+    at dispatch, so in-flight calls can overshoot --max-usd by up to `parallel` calls' cost — the
+    serial gate's own single-call overshoot plus up to (parallel-1) calls already in flight when the
+    gate trips. parallel=1 (the default) takes the EXISTING serial loop, byte-identical."""
     root = config.ensure_layout(root)
     run_id = config.run_id()
+    parallel = max(1, parallel)
+    if parallel > PARALLEL_MAX:
+        print(f"{block.name}: --parallel {parallel} clamped to {PARALLEL_MAX} — every worker drains "
+              f"the same account token bucket, so more workers buy 429 backoff, not throughput "
+              f"(PARALLEL_MAX, one edit in block.py)", file=sys.stderr)
+        parallel = PARALLEL_MAX
+    if parallel > 1 and not getattr(block, "parallel_safe", False):
+        print(f"{block.name}: not parallel-safe (parallel_safe is False — its serial order may be "
+              f"load-bearing, e.g. resolve's read-your-writes fold); running serially", file=sys.stderr)
+        parallel = 1
+    if dry_run:
+        parallel = 1                               # a dry run makes no calls — nothing to overlap
     priority = priority or Greedy()                # resolve the default HERE, not as a shared default-arg
                                                    # instance, so every run gets a FRESH strategy (a future
                                                    # seeded/stateful policy must not leak state across runs).
@@ -547,38 +589,42 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
         todo = sum(1 for it in items if (block.key(it), *pvals) not in done)
         progress.start(total=len(items), todo=todo, already=len(items) - todo, backlog=backlog)
 
-    for item in items:
-        report.examined += 1
-        k = block.key(item)
-        if (k, *pvals) in done:
-            report.skipped += 1
+    if parallel > 1:                               # the pooled lane — same contract, N calls in flight
+        _run_pool(block, items, done=done, pvals=pvals, params=params, report=report,
+                  progress=progress, max_usd=max_usd, root=root, run_id=run_id, workers=parallel)
+    else:
+        for item in items:                         # the serial lane — the original loop, untouched
+            report.examined += 1
+            k = block.key(item)
+            if (k, *pvals) in done:
+                report.skipped += 1
+                if progress:
+                    progress.tick(k, "skipped")
+                continue
+            if max_usd is not None and report.cost_usd >= max_usd:
+                report.stopped_on_budget = True
+                break                              # clean exit; committed-so-far persists
+            if dry_run:
+                report.would_process += 1          # list-only; NO process, NO LLM, NO marker
+                if progress:
+                    progress.tick(k, "dry_run")
+                continue
+            try:
+                n_out, cost = block.process(item, root=root, run_id=run_id)  # blobs committed inside
+            except Exception:
+                report.errored += 1                # per-item isolation; run continues, item retried
+                if progress:
+                    progress.tick(k, "errored")
+                continue
+            report.processed += 1
+            report.outputs += n_out
+            report.cost_usd += cost
+            if block.commits_per_item:             # default True; dream commits in finalize instead
+                write_processed(block.name, k, params, n_outputs=n_out, cost_usd=cost,
+                                run_id=run_id, extra=block.marker_extra(item), root=root)  # marker LAST
+                done.add((k, *pvals))              # so a duplicate key later this run also skips
             if progress:
-                progress.tick(k, "skipped")
-            continue
-        if max_usd is not None and report.cost_usd >= max_usd:
-            report.stopped_on_budget = True
-            break                                  # clean exit; committed-so-far persists
-        if dry_run:
-            report.would_process += 1              # list-only; NO process, NO LLM, NO marker
-            if progress:
-                progress.tick(k, "dry_run")
-            continue
-        try:
-            n_out, cost = block.process(item, root=root, run_id=run_id)   # blobs committed inside
-        except Exception:
-            report.errored += 1                    # per-item isolation; run continues, item retried
-            if progress:
-                progress.tick(k, "errored")
-            continue
-        report.processed += 1
-        report.outputs += n_out
-        report.cost_usd += cost
-        if block.commits_per_item:                 # default True; dream commits in finalize instead
-            write_processed(block.name, k, params, n_outputs=n_out, cost_usd=cost,
-                            run_id=run_id, extra=block.marker_extra(item), root=root)  # marker LAST
-            done.add((k, *pvals))                  # so a duplicate key later this run also skips
-        if progress:
-            progress.tick(k, "done", outputs=n_out, cost=cost)
+                progress.tick(k, "done", outputs=n_out, cost=cost)
 
     report.pending = backlog - report.processed    # what's STILL un-done after this run: a capped/budgeted
                                                    # tick leaves >0 (errored items stay pending — no marker);
@@ -588,3 +634,70 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     if not dry_run:
         block.finalize(root=root, run_id=run_id)   # no-op default; dream/tap act on their own state
     return report
+
+
+# --- the pooled lane: same per-item contract, up to N process() calls in flight (opt-in) ------------
+
+def _run_pool(blk: Block, items: list[Item], *, done: set[tuple], pvals: tuple,
+              params: tuple[tuple[str, str], ...], report: Report, progress: Progress | None,
+              max_usd: float | None, root: Path, run_id: str, workers: int) -> None:
+    """`run`'s parallel lane — the same per-item contract with up to `workers` process() calls in
+    flight (the LLM call is a subprocess: the GIL releases, so threads overlap the real wait). The
+    division of labor keeps every shared mutation SINGLE-THREADED, so no lock beyond Progress's own:
+    WORKERS run only `process` + `marker_extra` (read in the worker, right after ITS process, so a
+    stage's per-item audit state stays owned by the thread that made it — glean keeps `_last`
+    thread-local for exactly this); the MAIN thread owns dispatch (priority order, done-skip, budget
+    gate) and collection (Report tallies, the marker, progress.tick).
+
+    Dispatch is a BOUNDED WINDOW: at most `workers` futures in flight; a full window lands at least
+    one finished item before the next dispatch, so collected spend stays fresh. The budget gate checks
+    COLLECTED spend, so the run can overshoot --max-usd by up to `workers` calls' cost — the serial
+    gate's one, plus up to (workers-1) already in flight when it trips (the run() docstring's leash).
+    On a budget stop the window DRAINS rather than cancels: an in-flight call is paid work whose blobs
+    process() already committed, so it lands normally (marker + Report), never orphans. Per-item
+    semantics are otherwise the serial lane's: blobs inside process(), the marker AFTER (per-item
+    commit), a raising item isolated as `errored` with no marker (retried next run)."""
+    def work(item: Item) -> tuple[int, float, dict]:
+        n_out, cost = blk.process(item, root=root, run_id=run_id)     # blobs committed inside
+        return n_out, cost, blk.marker_extra(item)   # audit fields read in THIS worker (see docstring)
+
+    inflight: dict = {}                            # future → its item key; main-thread-only
+
+    def land(futures) -> None:
+        """Collect finished futures — MAIN thread only, the sole mutator of Report/markers/progress."""
+        for f in futures:
+            k = inflight.pop(f)
+            try:
+                n_out, cost, extra = f.result()    # re-raises whatever process() raised
+            except Exception:
+                report.errored += 1                # per-item isolation, exactly the serial contract
+                if progress:
+                    progress.tick(k, "errored")
+                continue
+            report.processed += 1
+            report.outputs += n_out
+            report.cost_usd += cost
+            if blk.commits_per_item:
+                write_processed(blk.name, k, params, n_outputs=n_out, cost_usd=cost,
+                                run_id=run_id, extra=extra, root=root)   # marker LAST, per item
+                done.add((k, *pvals))
+            if progress:
+                progress.tick(k, "done", outputs=n_out, cost=cost)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for item in items:
+            report.examined += 1
+            k = blk.key(item)
+            if (k, *pvals) in done:
+                report.skipped += 1
+                if progress:
+                    progress.tick(k, "skipped")
+                continue
+            while len(inflight) >= workers:        # window full → land finished work before dispatching
+                finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                land(finished)
+            if max_usd is not None and report.cost_usd >= max_usd:
+                report.stopped_on_budget = True
+                break                              # stop DISPATCH; the drain below lands in-flight work
+            inflight[pool.submit(work, item)] = k
+        land(list(inflight))                       # drain: every in-flight item lands (paid work commits)

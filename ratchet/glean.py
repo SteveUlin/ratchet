@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -368,6 +369,11 @@ class GleanBlock:
 
     name = "glean"
     commits_per_item = True
+    parallel_safe = True      # each chunk is INDEPENDENT — nothing one chunk writes changes what a
+                              # concurrent chunk reads (events are content-addressed per span; no
+                              # read-your-writes, unlike resolve), so `block.run(parallel=N)` may
+                              # overlap this block's LLM calls. The shared instance state is audited
+                              # for that below: tallies take a lock, caches stay lock-free by design.
     finalize = block.no_finalize
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
@@ -378,7 +384,12 @@ class GleanBlock:
         self.topic = topic        # PROCESSING FOCUS: extract only this project's chunks (ADR-0022)
         self.params: tuple[tuple[str, str], ...] = (
             ("prompt_version", PROMPT_VERSION), ("model", model))
-        # run-total tallies (instance-scoped; the Report stays uniform)
+        # run-total tallies (instance-scoped; the Report stays uniform). `_tally_lock` guards them
+        # under `--parallel`: `+=` on a shared int is a read-modify-write, so a thread switch between
+        # the load and the store LOSES an increment — WRONG audit data, hence the lock. (The caches
+        # below are the opposite case and stay lock-free: a race there only duplicates an idempotent,
+        # content-keyed derivation — CPython dict get/set are atomic and the value is deterministic.)
+        self._tally_lock = threading.Lock()
         self.events = 0           # events ingested this run (== block.Report.outputs)
         self.rejected = 0         # candidates whose quote failed verification
         self.calls = 0            # LLM calls made (signal-bearing chunks; filter-skips don't call)
@@ -388,13 +399,21 @@ class GleanBlock:
         # chunks. `None` until built — a glean run with zero signal chunks never touches concepts.
         self._digest_ctx: dict | None = None
         self._facet_cache: dict = {}
+        # LOCK-FREE by design under `--parallel` (this and every cache below: _facet_cache, _age_cache,
+        # _subject_cache, and the lazy _digest_ctx/_digest_failed latch): each memoizes a DETERMINISTIC
+        # derivation keyed by content hash, so the worst a race can do is build the same value twice —
+        # duplicated work, idempotent and content-addressed, never wrong data. A lock would buy nothing.
         # The digest-disable latch (4b/ADR-0019): a persistent build failure (a bug in `digest_context`/
         # `chunk_facets`/`concept_digest`) sets this on the FIRST exception, so every later chunk
         # short-circuits to the empty sentinel WITHOUT re-attempting the expensive build (no retry-storm).
         # Surfaced ONCE in the run summary — a permanent novelty-disable must be detectable, not silent.
         self._digest_failed = False
-        # per-chunk audit recorded for marker_extra (set in process, read by the driver immediately after)
-        self._last: dict = {}
+        # per-chunk audit recorded for marker_extra — THREAD-LOCAL, the one shared slot where a race
+        # would produce WRONG data (not merely duplicated work): under `--parallel` a plain dict here
+        # could hold whichever chunk finished LAST, mis-attributing another chunk's tallies into a
+        # marker. The driver reads marker_extra in the SAME thread that ran process (serial: the main
+        # loop; parallel: the worker, see block._run_pool), so a thread-local is exact in both lanes.
+        self._last = threading.local()
         # the Aging seam (ADR-0021): `age` needs the run's root + a recency read. `_root` is captured in
         # items() (the driver's root, set before ordering calls age); `_age_cache` memoizes each cleaned
         # blob's `fetched_at` so the many chunks SHARING one cleaned_hash pay a single meta read, not one
@@ -517,7 +536,7 @@ class GleanBlock:
         cleaned_bytes = blobstore.get(ch.cleaned_hash, root).encode("utf-8")   # FileNotFoundError → errored
         text = cleaned_bytes[ch.byte_start:ch.byte_end].decode("utf-8")
         if not has_signal_potential(text):
-            self._last = {"n_rejected": 0, "n_calls": 0, "cleaned_hash": ch.cleaned_hash}
+            self._last.d = {"n_rejected": 0, "n_calls": 0, "cleaned_hash": ch.cleaned_hash}
             return (0, 0.0)                       # filter-skip: still marked done (0-output marker)
 
         known = self._relevant_digest(ch.cleaned_hash, root)   # "what we already know", relevant to THIS chunk;
@@ -526,7 +545,8 @@ class GleanBlock:
         numbered, line_spans = number_lines(cleaned_bytes, ch)  # the model points at these lines; we copy bytes
         prompt = _user_prompt(numbered, structural_cues(text), known)  # our code; a bug HERE surfaces (driver errored)
         comp = self.complete(SYSTEM_PROMPT, prompt)           # the sole LLM call; raising → driver errored
-        self.calls += 1
+        with self._tally_lock:                    # shared int += — a lost increment is wrong audit data
+            self.calls += 1
         call_cost = completer.cost_of(comp)
 
         accepted: list[dict] = []
@@ -548,17 +568,19 @@ class GleanBlock:
             _ingest_event(ev, model=self.model, run_id=run_id,
                           chunkset_hash=item.chunkset_hash, root=root)
 
-        self.events += len(accepted)
-        self.rejected += rejected
-        self._last = {"n_events": len(accepted), "n_rejected": rejected, "n_calls": 1,
-                      "cleaned_hash": ch.cleaned_hash}
+        with self._tally_lock:                    # see __init__: the tallies lock, the caches don't
+            self.events += len(accepted)
+            self.rejected += rejected
+        self._last.d = {"n_events": len(accepted), "n_rejected": rejected, "n_calls": 1,
+                        "cleaned_hash": ch.cleaned_hash}
         return (len(accepted), call_cost)
 
     def marker_extra(self, item: ChunkItem) -> dict:
         """The per-chunk audit fields for the marker body (n_rejected/n_calls/cleaned_hash for THIS
-        chunk). The driver calls this right after `process`, so `self._last` is the just-processed
-        chunk's tally."""
-        return dict(self._last)
+        chunk). The driver calls this right after `process` IN THE SAME THREAD (serial: the main loop;
+        parallel: the worker — block._run_pool), so the thread-local `_last` is the just-processed
+        chunk's tally, never a concurrent chunk's."""
+        return dict(getattr(self._last, "d", {}))
 
 
 # --- run: a thin compat shim over the block driver (keeps dream/review setup untouched) -----
@@ -630,6 +652,10 @@ def main(argv=None) -> None:
     ap.add_argument("--limit", type=int,
                     help="cap CHUNKS examined this run, before the done-skip (per-chunk now, ADR-0009)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this (between chunks)")
+    ap.add_argument("--parallel", type=int, default=1, metavar="N",
+                    help=f"concurrent LLM calls, capped at {block.PARALLEL_MAX} (default 1 = serial). "
+                         "2-3 when stepping away from the keyboard; shares your interactive token "
+                         "budget, so it buys latency, not capacity")
     ap.add_argument("--dry-run", action="store_true",
                     help="list chunks that would be processed (skips done); no LLM calls")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
@@ -660,7 +686,8 @@ def main(argv=None) -> None:
     progress = None if (args.quiet or args.dry_run) else block.Progress(
         blk.name, cap=args.max_usd, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
     report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
-                       priority=block.priority_strategy(args.priority), progress=progress)
+                       priority=block.priority_strategy(args.priority), progress=progress,
+                       parallel=args.parallel)
 
     if args.dry_run:
         print(f"\nglean-{report.run_id}: {report.would_process} chunk(s) would process "

@@ -47,6 +47,7 @@ ratchet chunk --all --limit 500   # → windowed chunksets (pointers, not copies
 ```
 ratchet glean --all --limit 1000 --max-usd 5
 ratchet glean --all --topic ratchet --limit 500    # focus one project
+ratchet glean --all --max-usd 5 --parallel 2       # stepping away? overlap 2-3 calls — the token bucket is SHARED with your interactive session, so this buys latency, not capacity
 ```
 
 **4 · Resolve** — match or mint, per event; run it **often**. Statement-first entity resolution (ADR-0028): deterministic signals REJECT at $0 — the non-match mass costs nothing — and acceptance is ONE bounded comparative-with-none Haiku call over an event's residue candidates. No match → the event seeds a new claim on the spot (title = its summary, prose deferred). Every merge persists its match key, so review can audit exactly what the model saw.
