@@ -499,11 +499,14 @@ class Progress:
 # The parallel-worker CAP (the leash on `run(parallel=N)`). Every `claude -p` worker drains the SAME
 # account-level token bucket the interactive session uses — the 5-hour-window quota is per account,
 # not per process — so parallelism buys LATENCY (overlapping subprocess waits), never capacity.
-# Community reports and our own runs agree: >=4 concurrent workers mostly manufacture 429 backoff (the
-# completer's ride-out sleeps), not throughput. 3 keeps the pipe full while leaving bucket headroom
-# for the interactive session sharing it. A principle-driven, adjustable default (one edit here),
-# enforced as a clamp with a stderr note — never a silent hard rule.
-PARALLEL_MAX = 3
+# Past the bucket's refill rate extra workers are INERT, not dangerous: they cycle 429 backoff (the
+# completer's ride-out sleeps) while throughput flatlines — over-parallelizing can't even burn the
+# 5-hour window faster. So the cap is a waste guard, not a safety rail. 10 is a generous leash for
+# small haiku calls (glean); where the knee actually sits on a given plan tier is unpublished — run
+# --parallel high while away from the keyboard, drop to 1-2 while working interactively (workers
+# starve the foreground session's share of the bucket). A principle-driven, adjustable default
+# (one edit here), enforced as a clamp with a stderr note — never a silent hard rule.
+PARALLEL_MAX = 10
 
 
 def run(block: Block, *, source_id: str | None = None, max_usd: float | None = None,
