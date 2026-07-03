@@ -53,15 +53,17 @@ H_MIN = 3.0                   # UNTUNED — the entropy floor (bits/char-distrib
                               # chars — while a real one-sentence lesson sits ~3.8–4.3; matching two
                               # low-signal strings is not evidence of the same lesson. Reviewer's
                               # knob: --h-min.
-J_MAYBE = 0.18                # UNTUNED — the floor of the LLM-residue band. Below it a pair is
-                              # NON-MATCH at $0. Set LOW (recall-first): the costly error is a
+J_MAYBE = 0.12                # TUNED on the 60-pair hand-labeled gold set (2026-07-03,
+                              # --score-gold) — the floor of the LLM-residue band. Below it a pair
+                              # is NON-MATCH at $0. Set LOW (recall-first): the costly error is a
                               # same-lesson pair stranded in non-match — it silently seeds a
                               # duplicate claim nobody adjudicates — while a too-low floor merely
                               # buys visible Haiku calls (the band report projects exactly how
-                              # many). Grounded by the 2026-07-01 band report (284 real events):
-                              # same-lesson paraphrases land at 0.21–0.24 — a 0.25 floor stranded
-                              # every one — and 0.18 buys them plus headroom for ~17 adjudications
-                              # corpus-wide. --j-maybe.
+                              # many). The gold set showed 0.18 stranded 9/21 true matches, ALL
+                              # scoring 0.142–0.170: real paraphrases live at 0.14–0.24, so the
+                              # floor must sit below 0.14. 0.12 captures every labeled match with
+                              # margin at ≤390 adjudications ceiling on the 805-event corpus
+                              # (band report; the blocked real count is far lower). --j-maybe.
 J_HIGH = 0.55                 # UNTUNED — the $0 deterministic MERGE bar when subjects overlap
                               # (subj > 0). High enough that only near-identical wording merges for
                               # free; paraphrase falls to the residue where the LLM decides with a
