@@ -24,7 +24,11 @@ mutated in place (it latched). v3 inverts both:
     to ONE comparative-with-none Haiku call over the top-K_RESIDUE candidates — none the stated
     default, unparseable → none → mint. Zero candidates / none → MINT a claim NOW (deterministic id,
     title = event summary, why = null) + a corroborates(by:"seed") edge, folded in-batch so the next
-    event reads it (read-your-writes, the v2 property kept).
+    event reads it (read-your-writes, the v2 property kept). Three measured structural gates trim
+    the residue before the call (§3.1 gates; replay audit 2026-07-03): a SAME-SESSION candidate is
+    auto non-match (--same-session-adjudicate restores it), shingle identity >= DUP_EXACT
+    corroborates deterministically (by:"det", $0), and a sub-floor verbatim quote (thin_quote) makes
+    an event SEED-ONLY and drops a candidate from adjudication (--audit-thin lists pre-gate seeds).
 
   REJECT-MERGE (§2.2) — the human "not the same" verdict is ONE compound decision (verb
     `reject-merge`, target = the event). Three folds read the same blob: the edge fold as retraction,
@@ -107,6 +111,26 @@ FORGET_MIN_DAYS = 7.0          # UNTUNED — the wall-clock minimum an event mus
                                # count alone would accelerate eviction; a week of real time keeps
                                # "aged" honest.
 
+# The gate audit (2026-07-03, gold set: recall 86% / false-accept 52% pre-gate) traced the surviving
+# false-accepts to two families: SAME-SESSION pairs (two lessons sharing one working session's
+# vocabulary — the dominant family) and NOISE-ANCHORED quotes ("[assistant]", truncated frontmatter).
+# A virtual re-tally of the live verdicts under the two gates below + the same-session gate (in
+# `process`): cross-session recall 4/4, overall false-accept 9%, ~2/3 of residue calls eliminated.
+DUP_EXACT = 0.95               # the exact-duplicate fast path's Jaccard bar (shingle-SET equality always
+                               # passes): at or above it the pair corroborates DETERMINISTICALLY
+                               # (by:"det", $0) — the overlapping-chunk-windows dedup case, and the one
+                               # merge allowed within a single session. Safe from the negation trap that
+                               # keeps J_HIGH dormant: a polarity flip ("always X" → "never X") rewrites
+                               # far more than 5% of the char-4 shingles at these summary lengths, so it
+                               # cannot clear 0.95. --dup-exact.
+QUOTE_MIN_CHARS = 40           # the length arm of the noise floor on a VERBATIM QUOTE (`thin_quote`:
+                               # missing, shorter than this, or entropy < H_MIN): a failing event is
+                               # SEED-ONLY — its claim folds `thin_evidence: true` (derived, never
+                               # stored) — and a failing candidate is dropped from adjudication. The
+                               # measured [16] failure: haiku matched a noise observation to a
+                               # substantive candidate — evidence that cannot support a lesson must not
+                               # buy merges. --quote-min-chars.
+
 # The replay audit (2026-07-02, 54 gold pairs, live haiku: recall 71%, false-accept 36%) traced BOTH
 # failure directions to candidate INVISIBILITY: dream's TITLE_MAX=80 cut every candidate mid-sentence
 # (claim titles are event summaries, measured 92–240 chars) and candidate EVIDENCE never entered the
@@ -115,6 +139,16 @@ FORGET_MIN_DAYS = 7.0          # UNTUNED — the wall-clock minimum an event mus
 RESIDUE_TITLE_MAX = 240        # candidate-title clip in the residue prompt — the summary scale, not 80
 SEED_QUOTE_MAX = 400           # candidate seed-quote clip — enough that a noise anchor ("[assistant]",
                                # frontmatter fragments) is visibly noise, without flooding the call
+
+
+def thin_quote(quote, *, min_chars: int = QUOTE_MIN_CHARS) -> bool:
+    """The noise floor on a verbatim quote (§3.1 gates): missing, shorter than min_chars, or under
+    sig.H_MIN entropy. A quote this thin ("[assistant]", a truncated frontmatter fragment) cannot
+    evidence a lesson, so it buys no merges in EITHER direction: the event is seed-only (mints,
+    flagged `thin_evidence` in the fold) and the candidate leaves adjudication. Entropy shares H_MIN
+    with the summary triviality gate — one instrument, one floor."""
+    q = str(quote or "").strip()
+    return len(q) < min_chars or sig.entropy(q) < sig.H_MIN
 
 
 # --- the residue adjudication prompt: comparative, explicit none, none the stated default (§3.1) ---
@@ -413,6 +447,11 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         rv = dream._resolve_event(ev, blobs, sessions, root)
         if rv is not None:
             evidence.append(dream.evidence_entry(rv))
+    # the seed event's re-validated verbatim quote — the residue prompt's candidate-side evidence
+    # (prompt v2). Derived from the fold's own evidence entries (already validate_span-anchored);
+    # None when the seed edge is retracted or the blob/span no longer resolves.
+    seed_quote = next((e.get("quote") for e in evidence
+                       if e.get("event_id") == content.get("seed_event")), None)
     contradicted_by: list[str] = []
     contradiction_evidence: list[dict] = []
     for e in contra:
@@ -440,11 +479,11 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
                           and content["why_fingerprint"] != corro_fingerprint(content["id"], cites)),
         "relation": content.get("relation") or {"kind": "new", "concept_id": None, "note": ""},
         "seed_event": content.get("seed_event"),
-        # the seed event's re-validated verbatim quote — the residue prompt's candidate-side evidence
-        # (prompt v2). Derived from the fold's own evidence entries (already validate_span-anchored);
-        # None when the seed edge is retracted or the blob/span no longer resolves.
-        "seed_quote": next((e.get("quote") for e in evidence
-                            if e.get("event_id") == content.get("seed_event")), None),
+        "seed_quote": seed_quote,
+        # the noise floor, derived (never stored): a claim whose seed evidence fails `thin_quote` is
+        # badged at review, listed by --audit-thin, and — candidate-side, in `process` — dropped
+        # from adjudication. Evidence that cannot support a lesson must not buy merges.
+        "thin_evidence": thin_quote(seed_quote),
         "born": content.get("born"),
         "cites": cites,
         "evidence": evidence,
@@ -775,7 +814,9 @@ class ResolveBlock:
                  j_maybe: float | None = None, h_min: float | None = None,
                  k_residue: int = K_RESIDUE, k_rare: int = K_RARE, rare_min: int = RARE_MIN,
                  facet_df_max: float = FACET_DF_MAX, active_floor: float = ACTIVE_FLOOR,
-                 active_days: float = ACTIVE_DAYS, max_usd: float | None = None,
+                 active_days: float = ACTIVE_DAYS, dup_exact: float = DUP_EXACT,
+                 quote_min_chars: int = QUOTE_MIN_CHARS, same_session_adjudicate: bool = False,
+                 max_usd: float | None = None,
                  forget: bool = True, forget_tau: int = dream.FORGET_TAU,
                  forget_floor: float = dream.FORGET_SALIENCE_FLOOR,
                  forget_min_days: float = FORGET_MIN_DAYS) -> None:
@@ -792,6 +833,9 @@ class ResolveBlock:
         self.facet_df_max = facet_df_max
         self.active_floor = active_floor
         self.active_days = active_days
+        self.dup_exact = dup_exact
+        self.quote_min_chars = quote_min_chars
+        self.same_session_adjudicate = same_session_adjudicate
         self.max_usd = max_usd                         # the RESIDUE-spend cap (deferral, not break — §7.2)
         self.forget_on = forget
         self.forget_tau = forget_tau
@@ -868,8 +912,18 @@ class ResolveBlock:
         ev_sh = sig.char_shingles(summary)
         ev_ent = sig.entropy(summary)
         ev_subj = subject.subject_key(root, rv.event.get("cleaned_hash"), rv.span, self._subj_cache)
+        if thin_quote(rv.quote, min_chars=self.quote_min_chars):
+            # NOISE-QUOTE GATE, event side (§3.1 gates): a quote below the floor cannot evidence a
+            # lesson, so the event is SEED-ONLY — it mints its own claim (the fold flags it
+            # `thin_evidence`) and never corroborates, not even the deterministic dup path. The
+            # measured [16] failure: haiku matched a noise observation ("[assistant]", truncated
+            # frontmatter) to a substantive candidate. A thin duplicate just sits flagged until
+            # --audit-thin surfaces it for bulk review.
+            self._mint(rv, summary, ev_sh, ev_ent, ev_subj, root=root, run_id=run_id)
+            return 1, 0.0
         cands = candidate_ids(self._idx, ev_sh, ev_subj, k_rare=self.k_rare, rare_min=self.rare_min,
                               facet_df_max=self.facet_df_max)
+        dup: tuple[float, dict] | None = None
         scored: list[tuple[float, str]] = []
         for cid in cands:
             if frozenset((rv.id, cid)) in self._blocked:
@@ -880,8 +934,50 @@ class ResolveBlock:
             if min(ev_ent, c["stmt_entropy"]) < self.h_min:
                 continue                               # triviality gate: may SEED, never MERGE (§3.1 step 0)
             s = sig.jaccard(ev_sh, c["stmt_shingles"])
-            if s >= self.j_maybe:
-                scored.append((s, cid))
+            if ev_sh == c["stmt_shingles"] or s >= self.dup_exact:
+                # EXACT-DUPLICATE FAST PATH (§3.1 gates): shingle-set identity (or Jaccard >=
+                # DUP_EXACT) settles the pair deterministically — by:"det", no LLM — and works
+                # same-session too: this is the overlapping-chunk-windows dedup case, where the same
+                # summary re-arrives and must fold into its claim, not mint a twin. At 0.95 a
+                # polarity flip cannot pass — a negation rewrites far more than 5% of the char-4
+                # shingles on these summary lengths. Best-s wins, ties on id (deterministic).
+                if dup is None or s > dup[0] or (s == dup[0] and c["id"] < dup[1]["id"]):
+                    dup = (s, c)
+                continue
+            if s < self.j_maybe:
+                continue                               # $0 NON-MATCH — the free mass (§3.1 step 2)
+            if thin_quote(c.get("seed_quote"), min_chars=self.quote_min_chars):
+                continue                               # noise-quote gate, candidate side: a candidate
+                                                       # whose seed evidence fails the floor leaves
+                                                       # adjudication — the model judges titles when
+                                                       # the quote is noise (the measured [16] family)
+            if (not self.same_session_adjudicate and rv.session_id
+                    and rv.session_id in (c.get("sessions_seen") or ())):
+                # SAME-SESSION GATE (§3.1 gates): distinct-session corroboration is the unit of
+                # trust — maturity counts DISTINCT sessions — so a same-session merge adds zero
+                # support; the LLM is never asked a question whose yes is worthless. Measured:
+                # same-session pairs were the dominant false-accept family (two lessons from one
+                # working session sharing vocabulary/context); with this gate + the noise floor the
+                # live re-tally reads cross-session recall 4/4, false-accept 9%, ~2/3 of residue
+                # calls gone. A missed same-session merge self-heals — the lesson recurs
+                # cross-session and the derived merge suggestions catch the leftovers. Accepted
+                # loss: a within-session self-correction (contradicts) goes undetected; the
+                # corrected lesson recurs in later sessions. --same-session-adjudicate restores
+                # adjudication for these pairs (the escape hatch).
+                continue
+            scored.append((s, cid))
+        if dup is not None:
+            s, target = dup
+            match = {"stmt_sim": round(s, 6), "subj": round(_subj_score(ev_subj, target), 4),
+                     "by": "det", "candidates_shown": [],
+                     "prompt_version": PROMPT_VERSION, "model": None}
+            write_edge(rv.id, "corroborates", target["id"], session_id=rv.session_id, match=match,
+                       root=root, run_id=run_id)                                     # edge FIRST
+            self._fold_corroboration(target, rv, summary, ev_sh, ev_ent, ev_subj)
+            self.n_corroborated += 1
+            self.claims.append(target)
+            _write_consolidated(rv.id, target["id"], "corroborates", run_id=run_id, root=root)
+            return 1, 0.0
         scored.sort(key=lambda t: (-t[0], t[1]))
         residue = scored[:self.k_residue]
         if not residue:                                # the $0 mass: zero candidates or all NON-MATCH
@@ -938,6 +1034,7 @@ class ResolveBlock:
             "why_fingerprint": None, "why_stale": False,   # nothing synthesized yet (shape parity with the fold)
             "relation": content["relation"], "seed_event": rv.id,
             "seed_quote": rv.quote,                    # the candidate-side evidence, already validated
+            "thin_evidence": thin_quote(rv.quote),     # the derived noise-floor badge, exactly the fold's
             "born": content["born"],
             "cites": [rv.id], "evidence": [dream.evidence_entry(rv)],
             "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
@@ -1040,6 +1137,8 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
         j_maybe: float | None = None, h_min: float | None = None, k_residue: int = K_RESIDUE,
         k_rare: int = K_RARE, rare_min: int = RARE_MIN, facet_df_max: float = FACET_DF_MAX,
         active_floor: float = ACTIVE_FLOOR, active_days: float = ACTIVE_DAYS,
+        dup_exact: float = DUP_EXACT, quote_min_chars: int = QUOTE_MIN_CHARS,
+        same_session_adjudicate: bool = False,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> ResolveReport:
@@ -1049,7 +1148,9 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
     blk = ResolveBlock(complete_resolve, model=model, min_confidence=min_confidence, topic=topic,
                        maturity=maturity, j_maybe=j_maybe, h_min=h_min, k_residue=k_residue,
                        k_rare=k_rare, rare_min=rare_min, facet_df_max=facet_df_max,
-                       active_floor=active_floor, active_days=active_days, max_usd=max_usd,
+                       active_floor=active_floor, active_days=active_days, dup_exact=dup_exact,
+                       quote_min_chars=quote_min_chars,
+                       same_session_adjudicate=same_session_adjudicate, max_usd=max_usd,
                        forget=forget)
     report = block.run(blk, limit=limit, root=root, priority=priority, progress=progress)
     return ResolveReport(report, blk)
@@ -1087,6 +1188,18 @@ def main(argv=None) -> None:
                     help=f"ACTIVE-view entrenchment floor (default {ACTIVE_FLOOR})")
     ap.add_argument("--active-days", type=float, default=ACTIVE_DAYS,
                     help=f"ACTIVE-view recency arm in days (default {ACTIVE_DAYS})")
+    ap.add_argument("--dup-exact", type=float, default=DUP_EXACT,
+                    help=f"exact-duplicate Jaccard bar — at/above it a pair corroborates "
+                         f"deterministically (by:'det', $0, same-session included; default {DUP_EXACT})")
+    ap.add_argument("--quote-min-chars", type=int, default=QUOTE_MIN_CHARS,
+                    help=f"noise floor on verbatim quotes — below it an event is seed-only and a "
+                         f"candidate leaves adjudication (default {QUOTE_MIN_CHARS}; entropy arm is H_MIN)")
+    ap.add_argument("--same-session-adjudicate", action="store_true",
+                    help="escape hatch: adjudicate candidates already carrying the event's session "
+                         "(default off — a same-session merge adds no distinct-session support)")
+    ap.add_argument("--audit-thin", action="store_true",
+                    help="read-only: list every live claim whose seed evidence fails the noise floor "
+                         "(pre-gate noise seeds — bulk-review and retire)")
     ap.add_argument("--max-usd", type=float, help="residue-spend cap: paid calls DEFER past it "
                     "(retried next tick); $0 events always complete (§7.2)")
     ap.add_argument("--limit", type=int, help="cap events examined this run (the salience-ordered top)")
@@ -1104,6 +1217,19 @@ def main(argv=None) -> None:
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
                     help="ordering policy over the working set (default: greedy = highest-salience first)")
     args = ap.parse_args(argv)
+
+    if args.audit_thin:                                # read-only: badge the pre-gate noise seeds
+        root = config.ensure_layout()
+        thin = [c for c in claim_pool(root)
+                if thin_quote(c.get("seed_quote"), min_chars=args.quote_min_chars)]
+        print(f"{len(thin)} live claim(s) whose seed evidence fails the noise floor "
+              f"(quote missing, < {args.quote_min_chars} chars, or entropy < {sig.H_MIN:g}):")
+        for c in thin:
+            print(f"\n  {c['id']}  {c['title'][:RESIDUE_TITLE_MAX]}")
+            q = c.get("seed_quote")
+            print(f"      seed quote: {q!r}" if q is not None
+                  else "      seed quote: (no verbatim evidence resolvable)")
+        return
 
     if args.reset_v2:
         root = config.ensure_layout()
@@ -1146,7 +1272,10 @@ def main(argv=None) -> None:
                  topic=args.topic, maturity=args.maturity, j_maybe=args.j_maybe, h_min=args.h_min,
                  k_residue=args.k_residue, k_rare=args.k_rare, rare_min=args.rare_min,
                  facet_df_max=args.facet_df_max, active_floor=args.active_floor,
-                 active_days=args.active_days, forget=not args.no_forget, max_usd=args.max_usd,
+                 active_days=args.active_days, dup_exact=args.dup_exact,
+                 quote_min_chars=args.quote_min_chars,
+                 same_session_adjudicate=args.same_session_adjudicate,
+                 forget=not args.no_forget, max_usd=args.max_usd,
                  limit=args.limit, priority=block.priority_strategy(args.priority),
                  progress=progress)
     if args.show:

@@ -291,6 +291,27 @@ widens the candidate net. **`J_MAYBE`, not `SPAN_WINDOW`, is the first knob a go
        why = null) + corroborates(event -> it).
 ```
 
+**Structural gates (added 2026-07-03, measured).** The replay audit put the residue adjudicator at
+recall 86% / false-accept 52% (gold set), the false-accepts concentrated in same-session pairs and
+noise-anchored quotes; a virtual re-tally of the live verdicts under the three gates below reads
+cross-session recall 4/4, overall false-accept 9%, ~2/3 of residue calls eliminated:
+
+1. **Same-session gate** — a candidate already carrying the event's session is auto NON-MATCH before
+   adjudication (escape hatch `--same-session-adjudicate`): maturity counts DISTINCT sessions, so a
+   same-session yes buys nothing while a wrong one fuses adjacent lessons — the dominant measured
+   false-accept family; a missed merge self-heals via cross-session corroboration + merge
+   suggestions. Accepted loss: within-session self-corrections go undetected — the corrected lesson
+   recurs in later sessions.
+2. **Exact-duplicate fast path** — shingle-set equality or Jaccard >= `DUP_EXACT` (0.95) corroborates
+   deterministically (`by:"det"`, $0, same-session included): the overlapping-chunk-windows dedup
+   case, and safe where J_HIGH is not — a polarity flip rewrites far more than 5% of char-4 shingles
+   at these summary lengths, so it cannot pass 0.95.
+3. **Noise-quote floor** — a verbatim quote that is missing, under `QUOTE_MIN_CHARS` (40), or below
+   `H_MIN` entropy makes the event SEED-ONLY (its claim folds `thin_evidence: true`, the review
+   badge) and drops a candidate from adjudication — the measured failure where haiku matched a noise
+   observation (`[assistant]`, truncated frontmatter) to a substantive candidate. `--audit-thin`
+   lists pre-gate noise-seeded claims for bulk review.
+
 **Dormant knobs.** `J_HIGH = 0.55` (deterministic merge at shared subject) and `J_CROSS = 0.70` (disjoint
 subject) remain in `classify()` (sig.py) but no measured pair reaches them — the corpus maximum is 0.311.
 They are DOCUMENTED-DORMANT, and reactivating them requires a **negation guard** first: a polarity-flipped

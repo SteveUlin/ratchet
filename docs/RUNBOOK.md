@@ -60,6 +60,8 @@ ratchet resolve --dry-run                          # the priority-ordered workin
 
 The dollars are trivial; **the real cost is wall-clock** — residue calls are serial `claude -p` riding out shared rate limits. `--max-usd` bounds that honestly: past the cap, residue events *defer* (no verdict, no marker; they retry next tick) while $0 events run to completion. Keep the budget small and tick often.
 
+`ratchet resolve --audit-thin` lists live claims whose seed quote fails the noise floor (pre-gate noise seeds like `[assistant]` — bulk-review and retire).
+
 **5 · Synthesize** — prose, **rarely**. Sonnet writes a claim's `why` only after it crosses the maturity bar, so the queue is bounded by the graduation rate, not the event rate. Review never waits for it: a matured, unsynthesized claim still surfaces, provisional title + "why pending" badge.
 
 ```

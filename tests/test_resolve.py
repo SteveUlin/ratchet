@@ -48,6 +48,13 @@ JJ_PARA = "version control goes through jj, so avoid reaching for git commands"
 # G4 — two DIFFERENT lessons sharing vocabulary (~0.35 — the measured-trap shape; corpus max 0.311).
 PYTEST = "run the test suite with python -m pytest from the repo root, not from tests/"
 RUFF = "run the linter with python -m ruff from the repo root before committing"
+# §10–§13 (the structural gates): a third jj paraphrase in the residue band against BOTH tellings
+# (so a thin candidate would compete if not gated), a healthy-length line carrying the JJ_SEED
+# summary verbatim (the overlapping-chunk dup case: same summary, different bytes), and a noise
+# quote — the measured "[assistant]"/frontmatter family, failing the QUOTE_MIN_CHARS arm.
+JJ_PARA2 = "use jj rather than git when committing changes in version control"
+DUP_LINE = "jj is the only vcs here: always commit with jj and never use git for version control"
+NOISE = "node_type: memory"
 
 M_HI = {"surprise": 0.9, "insight": 0.3}
 M_MID = {"surprise": 0.2, "insight": 0.7}
@@ -64,8 +71,18 @@ assert sig.J_MAYBE <= sim_of(JJ_SEED, JJ_PARA) < 0.31, \
     f"G2 fixture must sit in the paraphrase zone (~0.2): {sim_of(JJ_SEED, JJ_PARA):.4f}"
 assert sig.J_MAYBE <= sim_of(PYTEST, RUFF) < sig.J_HIGH, \
     f"G4 fixture must sit in the residue band: {sim_of(PYTEST, RUFF):.4f}"
-for s in (ZIG, JAXL, NEP, JJ_SEED, JJ_PARA, PYTEST, RUFF):
+for s in (ZIG, JAXL, NEP, JJ_SEED, JJ_PARA, JJ_PARA2, PYTEST, RUFF):
     assert sig.entropy(s) >= sig.H_MIN, f"fixture under the entropy gate: {s!r}"
+# the gate fixtures prove what they claim: PARA2 in the residue band against both jj tellings
+# (below DUP_EXACT — a paraphrase, not a duplicate); NOISE under the length arm of the floor.
+for a in (JJ_SEED, JJ_PARA):
+    assert sig.J_MAYBE <= sim_of(a, JJ_PARA2) < resolve.DUP_EXACT, \
+        f"JJ_PARA2 drifted out of the residue band vs {a!r}: {sim_of(a, JJ_PARA2):.4f}"
+assert resolve.thin_quote(NOISE) and len(NOISE) < resolve.QUOTE_MIN_CHARS, "NOISE must fail the floor"
+for q in (ZIG, JAXL, NEP, JJ_SEED, JJ_PARA, JJ_PARA2, DUP_LINE, PYTEST, RUFF):
+    assert not resolve.thin_quote(q), f"healthy fixture reads thin: {q!r}"
+assert resolve.thin_quote(None) and resolve.thin_quote("[assistant]"), \
+    "a missing quote and the measured noise anchor both fail the floor"
 
 
 def rec(uuid, parent, type, **kw):
@@ -553,6 +570,114 @@ assert not is_active({"sessions_seen": [], "contradiction_evidence": []}, now=no
     "a claim with no live evidence folds out of the ACTIVE view (the pool's drain)"
 print("OK §9 — high_confidence_view = accepted ∧ mature ∧ not retired; the ACTIVE view drains")
 print("        evidence-less claims out of candidacy.")
+
+
+# === 10. SAME-SESSION GATE: a same-session pair never reaches the LLM; the escape hatch restores it ==
+
+# Two paraphrased tellings from ONE session (same sid → same session_id on both events; the two
+# transcripts differ in bytes, so both events exist). Without the gate this is a residue call —
+# the escape-hatch twin below proves it — but a same-session yes buys zero distinct-session support.
+SS_SPECS = [("ss-1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha"),
+            ("ss-1", JJ_PARA, JJ_PARA, M_MID, 0.85, "alpha")]
+R10 = use_store("same-session")
+seed_events(SS_SPECS, R10)
+fake10 = NeverCalled()
+rep10 = resolve.run(fake10, model="fake", forget=False, root=R10)
+pool10 = claim_pool(R10)
+assert {c["title"] for c in pool10} == {JJ_SEED, JJ_PARA}, "each telling seeds its OWN claim"
+assert fake10.calls == 0 and rep10.n_residue_calls == 0, \
+    "the same-session candidate is auto non-match — the LLM is never consulted"
+assert rep10.n_minted == 2 and working_set(R10) == [], "both events consolidated at $0"
+
+R10b = use_store("same-session-adj")
+seed_events(SS_SPECS, R10b)
+fake10b = ResolveFake(["same-as-1"])
+rep10b = resolve.run(fake10b, model="fake", forget=False, same_session_adjudicate=True, root=R10b)
+assert fake10b.calls == 1 and rep10b.n_corroborated == 1, \
+    "--same-session-adjudicate restores adjudication for the same pair (the escape hatch)"
+c10b = claim_pool(R10b)[0]
+assert c10b["support"] == {"events": 2, "sessions": 1}, \
+    "and the merge it buys adds NO session support — the gate's whole rationale"
+assert current_claims(R10b) == [], "a same-session merge cannot mature a claim"
+print("OK §10 — same-session gate: the paraphrase pair seeds two claims with ZERO LLM calls; the")
+print("        escape hatch re-adjudicates it, and the merge it buys adds no distinct-session support.")
+
+
+# === 11. EXACT-DUP FAST PATH: identical summaries corroborate by:'det' — no LLM, same-session too ====
+
+R11 = use_store("dup")
+seed_events([("dup-1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha"),
+             ("dup-1", DUP_LINE, JJ_SEED, M_MID, 0.85, "alpha")], R11)   # same summary, new bytes
+fake11 = NeverCalled()
+rep11 = resolve.run(fake11, model="fake", forget=False, root=R11)
+pool11 = claim_pool(R11)
+assert len(pool11) == 1 and fake11.calls == 0, "the duplicate folds into its claim at $0 — no twin"
+c11 = pool11[0]
+assert c11["support"] == {"events": 2, "sessions": 1}, "same-session dedup adds an event, not a session"
+dup_eid = [e for e in c11["cites"] if e != c11["seed_event"]][0]
+e11 = edge_content(dup_eid, "corroborates", c11["id"], R11)
+assert e11["match"]["by"] == "det" and e11["match"]["model"] is None \
+    and e11["match"]["candidates_shown"] == [], \
+    "the dup edge is by:'det' — deterministic, nothing shown to any model"
+assert e11["match"]["stmt_sim"] == 1.0, "shingle-set identity scores 1.0 on the audit key"
+assert rep11.n_corroborated == 1 and rep11.n_residue_calls == 0
+assert current_claims(R11) == [], "dedup never fakes maturity — one session is one session"
+print("OK §11 — exact-dup fast path: the overlapping-chunk duplicate corroborates deterministically")
+print("        (by:'det', stmt_sim 1.0, zero LLM), same-session included; maturity is untouched.")
+
+
+# === 12. NOISE-QUOTE GATE: a thin event seeds flagged; a thin candidate leaves adjudication ==========
+
+R12 = use_store("noise")
+seed_events([("nz-s1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha")], R12)
+resolve.run(NeverCalled(), model="fake", forget=False, root=R12)        # the healthy claim exists
+# a NOISE-quoted event with a HEALTHY summary in the residue band vs the healthy claim: without the
+# gate this is a residue call; with it the event is seed-only — it never corroborates the claim.
+seed_events([("nz-s2", NOISE, JJ_PARA, M_MID, 0.85, "beta")], R12)
+fake12 = NeverCalled()
+rep12 = resolve.run(fake12, model="fake", forget=False, root=R12)
+assert fake12.calls == 0 and rep12.n_minted == 1, "the thin event mints at $0 — never a corroboration"
+pool12 = {c["title"]: c for c in claim_pool(R12)}
+assert set(pool12) == {JJ_SEED, JJ_PARA}, "two claims: the healthy one untouched, the thin one seeded"
+thin12, healthy12 = pool12[JJ_PARA], pool12[JJ_SEED]
+assert thin12["thin_evidence"] is True and thin12["seed_quote"] == NOISE, \
+    "the thin seed folds thin_evidence: true (derived, not stored) — the review badge"
+assert healthy12["thin_evidence"] is False and healthy12["support"] == {"events": 1, "sessions": 1}
+# candidate side (the measured [16] failure): a healthy cross-session paraphrase arrives; the thin
+# claim sits in its residue band (fixture-asserted) but leaves adjudication — only the healthy
+# claim is shown, and the pair adjudicates exactly as G2 did (the regression pin).
+seed_events([("nz-s3", JJ_PARA2, JJ_PARA2, M_MID, 0.85, "gamma")], R12)
+fake12b = ResolveFake(["same-as-1"])
+rep12b = resolve.run(fake12b, model="fake", forget=False, root=R12)
+assert fake12b.calls == 1 and rep12b.n_corroborated == 1, \
+    "the healthy pair still adjudicates — the gate drops thin candidates, never healthy ones"
+merged12 = [c for c in claim_pool(R12) if c["title"] == JJ_SEED][0]
+para2_eid = [e for e in merged12["cites"] if e != merged12["seed_event"]][0]
+e12 = edge_content(para2_eid, "corroborates", healthy12["id"], R12)
+assert e12["match"]["by"] == "llm" and e12["match"]["candidates_shown"] == [healthy12["id"]], \
+    "the thin claim never entered the residue prompt — the model saw the healthy candidate only"
+assert merged12["support"] == {"events": 2, "sessions": 2}, "cross-session corroboration lands"
+assert [c for c in claim_pool(R12) if c["title"] == JJ_PARA][0]["support"]["events"] == 1, \
+    "the thin claim neither corroborates nor gets corroborated"
+print("OK §12 — noise-quote gate: the thin event seeds a flagged claim at $0 (never corroborating the")
+print("        healthy one); the thin candidate leaves adjudication while the healthy cross-session")
+print("        pair merges exactly as before (G2 regression pin).")
+
+
+# === 13. --audit-thin: the read-only listing of noise-seeded claims ==================================
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    resolve.main(["--audit-thin"])                     # env still points at R12 (use_store set it)
+out13 = buf.getvalue()
+assert "1 live claim(s)" in out13, f"exactly the one noise seed lists:\n{out13}"
+assert thin12["id"] in out13 and JJ_PARA in out13 and repr(NOISE) in out13, \
+    "the listing carries id, title, and the failing quote rendered"
+assert healthy12["id"] not in out13 and merged12["id"] not in out13, "healthy claims never list"
+print("OK §13 — --audit-thin lists the noise-seeded claim (id, title, quote verbatim) and nothing else.")
 
 
 print("\nall resolve tests passed.")
