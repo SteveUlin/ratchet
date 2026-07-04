@@ -152,7 +152,7 @@ def _is_out_of_queue(d: dict) -> bool:
 
 
 def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = None,
-               root: Path | None = None) -> float:
+               root: Path | None = None, coalesce_hours: float = dream.COALESCE_HOURS) -> float:
     """A takeaway's REVIEW IMPORTANCE — the signal `pending` orders DESCENDING so the human sees the
     highest-leverage calls first (the active-learning "spend your attention where it matters most"; ADR-0022).
     RECENCY-WEIGHTED net entrenchment × confidence: `dream.net_entrenchment` (support sessions minus
@@ -164,7 +164,8 @@ def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = N
     sort is STABLE, so equal-importance takeaways keep their derivation order."""
     conf = tk.get("confidence")
     conf = conf if isinstance(conf, (int, float)) else 0.5
-    return dream.net_entrenchment(tk, now, valid_times=valid_times, root=root) * conf
+    return dream.net_entrenchment(tk, now, valid_times=valid_times, root=root,
+                                  coalesce_hours=coalesce_hours) * conf
 
 
 def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> bool:
@@ -184,7 +185,8 @@ def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> b
 
 
 def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
-               now: str | None = None, root: Path | None = None) -> dict:
+               now: str | None = None, root: Path | None = None,
+               coalesce_hours: float = dream.COALESCE_HOURS) -> dict:
     """Make the maturity gate TRANSPARENT (ADR-0027): a takeaway's recency-weighted entrenchment SCORE, the
     operator's BAR, whether it clears, and a one-line plain reason. Corroboration is EVIDENCE of durability,
     not a quota — so this EXPLAINS the standing rather than hiding a count behind a constant. The score is
@@ -192,7 +194,8 @@ def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
     next to the score so the call is legible. A takeaway can sit below the bar two ways — too few sessions
     yet, or enough sessions whose evidence has AGED below the recency-weighted line — and the note says which,
     because the remedy differs (wait for recurrence vs. needs RECENT corroboration)."""
-    score = dream.net_entrenchment(tk, now, valid_times=valid_times, root=root)
+    score = dream.net_entrenchment(tk, now, valid_times=valid_times, root=root,
+                                   coalesce_hours=coalesce_hours)
     raw = dream.net_sessions(tk)
     mature = score >= bar
     if mature:
@@ -436,7 +439,8 @@ def _suggestions_by_claim(suggestions: list[dict]) -> dict[str, list[dict]]:
 
 
 def contested(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
-              window: float = CONTESTED_WINDOW) -> list[dict]:
+              window: float = CONTESTED_WINDOW,
+              coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
     """CONTESTED-NEAR-BAR visibility (§6.6, v2's `contradicted_takeaways` carried forward): live claims
     carrying a live contradicts edge whose net entrenchment sits within `window` of the bar — above OR
     below. Above, the claim is in `pending` anyway (flagged `contested`); below, the contradiction is
@@ -454,9 +458,10 @@ def contested(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIG
         d = decisions.get(c["id"])
         if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
             continue                                   # already decided — no longer the gate's business
-        if dream.net_entrenchment(c, now, valid_times=valid_times) < maturity - window:
+        if dream.net_entrenchment(c, now, valid_times=valid_times,
+                                  coalesce_hours=coalesce_hours) < maturity - window:
             continue
-        st = bar_status(c, maturity, valid_times=valid_times, now=now)
+        st = bar_status(c, maturity, valid_times=valid_times, now=now, coalesce_hours=coalesce_hours)
         out.append({"claim_id": c["id"], "kind": "claim", "title": c.get("title", ""),
                     "support": c.get("support"), "contradictions": c.get("contradictions"),
                     "entrenchment": st["entrenchment"], "bar": st["bar"], "mature": st["mature"],
@@ -537,7 +542,8 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             limit: int | None = None, topic: str | None = None,
-            maturity: float = dream.MATURITY_WEIGHT, with_total: bool = False):
+            maturity: float = dream.MATURITY_WEIGHT,
+            coalesce_hours: float = dream.COALESCE_HOURS, with_total: bool = False):
     """The review queue: every takeaway AT/ABOVE the maturity bar with no terminal decision and no live
     snooze, ORDERED by IMPORTANCE descending and presented with its verified evidence + its bar standing.
     Derived from references — stores nothing (ADR-0007).
@@ -573,7 +579,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     pool = resolve.claim_pool(root)
     claim_ids = {c["id"] for c in pool}
     for c in pool:
-        if dream.net_entrenchment(c, now, valid_times=valid_times) < maturity:   # the same bar, same knob
+        if dream.net_entrenchment(c, now, valid_times=valid_times,       # the same bar, same knob —
+                                  coalesce_hours=coalesce_hours) < maturity:   # sittings incl. (ADR-0028)
             continue
         d = decisions.get(c["id"])
         if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
@@ -590,7 +597,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         if topic is not None and not _evidence_in_topic(tk.get("evidence"), topic, root, cache):
             continue                               # FOCUS: drop takeaways with no evidence from the topic project
         rows.append((tk, "takeaway"))
-    rows.sort(key=lambda r: importance(r[0], valid_times=valid_times), reverse=True)  # IMPORTANCE desc; stable
+    rows.sort(key=lambda r: importance(r[0], valid_times=valid_times, coalesce_hours=coalesce_hours),
+              reverse=True)                            # IMPORTANCE desc; stable
     total = len(rows)                              # the backlog depth, counted BEFORE the sitting slice
     if limit is not None and limit > 0:
         rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering);
@@ -604,16 +612,19 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         if kind == "claim":
             card = {**_present_claim(view, root, context_bytes=context_bytes, mats=mats,
                                      valid_times=valid_times),
-                    **bar_status(view, maturity, valid_times=valid_times, now=now)}
+                    **bar_status(view, maturity, valid_times=valid_times, now=now,
+                                 coalesce_hours=coalesce_hours)}
             card["merge_suggestions"] = sugg.get(view["id"], [])
         else:
             card = {**_present(view, root, context_bytes=context_bytes),
-                    **bar_status(view, maturity, valid_times=valid_times)}
+                    **bar_status(view, maturity, valid_times=valid_times,
+                                 coalesce_hours=coalesce_hours)}
         out.append(card)
     return (out, total) if with_total else out
 
 
-def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
+def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
+               coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
     them), but not yet at the human gate. The counterpart to `pending`: `catalog` minus the mature set
     (at the SAME `maturity` bar, so lowering the bar moves takeaways from here into the queue), minus
@@ -633,7 +644,7 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
 
     def row(tk: dict, kind: str) -> dict:
         raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
-        st = bar_status(tk, maturity, valid_times=valid_times)
+        st = bar_status(tk, maturity, valid_times=valid_times, coalesce_hours=coalesce_hours)
         return {"takeaway_id": tk["id"], "kind": kind, "title": tk.get("title", ""),
                 "support": tk.get("support") or {"events": 0, "sessions": 0},
                 "entrenchment": st["entrenchment"], "bar": st["bar"], "rationale": st["rationale"],
@@ -646,7 +657,8 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     pool = resolve.claim_pool(root)
     claim_ids = {c["id"] for c in pool}
     for c in pool:
-        if dream.net_entrenchment(c, now, valid_times=valid_times) >= maturity:
+        if dream.net_entrenchment(c, now, valid_times=valid_times,
+                                  coalesce_hours=coalesce_hours) >= maturity:
             continue
         d = decisions.get(c["id"])
         if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
@@ -1101,6 +1113,12 @@ def main(argv=None) -> None:
                          f"sessions). LOWER it to review more, RAISE it for only the most-corroborated — the "
                          f"bar is yours, nothing is hidden: --incubating lists what sits below, with the "
                          f"reason. Applies to --pending and --incubating.")
+    ap.add_argument("--coalesce-hours", type=float, default=dream.COALESCE_HOURS, metavar="H",
+                    help=f"the SITTING window the maturity count groups by: same-repo sessions whose "
+                         f"valid-times fall within this many hours count as ONE sitting, so a "
+                         f"/clear-split afternoon cannot fake 2-session maturity (default "
+                         f"{dream.COALESCE_HOURS:g}; 0 = off — count every session separately). "
+                         f"Applies to --pending, --incubating and --contested.")
     ap.add_argument("--split-parts",
                     help="a split accept's per-part EVIDENCE PARTITION: JSON [{title,statement,evidence}] "
                          "(the human's to choose — a queued split carries only title/statement)")
@@ -1132,14 +1150,16 @@ def main(argv=None) -> None:
     if args.pending:
         q, total = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
                            limit=sitting_limit, topic=args.topic, maturity=args.maturity,
-                           with_total=True)
+                           coalesce_hours=args.coalesce_hours, with_total=True)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
-            _print_queue(q, total=total, incubating_count=len(incubating(maturity=args.maturity)),
+            _print_queue(q, total=total,
+                         incubating_count=len(incubating(maturity=args.maturity,
+                                                         coalesce_hours=args.coalesce_hours)),
                          bar=args.maturity)
     elif args.incubating:
-        inc = incubating(maturity=args.maturity)                 # cheap (no evidence resolution) — count
+        inc = incubating(maturity=args.maturity, coalesce_hours=args.coalesce_hours)   # cheap — count
         total = len(inc)                                         # the full depth, then slice for the sitting
         if sitting_limit > 0:
             inc = inc[:sitting_limit]
@@ -1148,7 +1168,7 @@ def main(argv=None) -> None:
         else:
             _print_incubating(inc, total=total)
     elif args.contested:
-        rows = contested(maturity=args.maturity)
+        rows = contested(maturity=args.maturity, coalesce_hours=args.coalesce_hours)
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2))
         else:

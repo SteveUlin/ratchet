@@ -335,7 +335,10 @@ print("       fresh corroboration re-matures it into pending with the contested 
 
 RD = use_store("d")
 seed_events([("d-s1", PYTEST, M_HI, 0.85, "gamma", days_ago(10)),
-             ("d-s2", RUFF, M_MID, 0.85, "gamma", days_ago(10))], RD)
+             ("d-s2", RUFF, M_MID, 0.85, "gamma", days_ago(9))], RD)   # a DAY apart: two same-repo
+# sessions at the SAME instant would coalesce into one SITTING (dream.COALESCE_HOURS) and the gate
+# would settle the pair at $0 — this section needs the residue call to fire, so the fixture keeps
+# the sessions genuinely distinct (>12h). Still both >5 days old for the TTL fold-out below.
 fake_d = ResolveFake(["none"])
 resolve.run(fake_d, model="fake", forget=False, root=RD)
 assert fake_d.calls == 1, "the shared vocabulary reached the residue; the honest NONE kept 2 claims"

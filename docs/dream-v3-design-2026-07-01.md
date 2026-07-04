@@ -597,9 +597,18 @@ claim, §4); the **dual maturity bar** (`MATURITY_WEIGHT_CROSS` — awaits a mul
 `J_HIGH`/`J_CROSS` must not reactivate without it, §3.1); **sqrt-saturating corroboration** (Knowledge
 Vault — adopt only if live data shows entrenchment runaway, §4); full **Senzing shared-feature
 devaluation** beyond the `FACET_DF_MAX` slice + a **Splink-style density audit** (over-merged claims
-surface label-free as large low-density evidence clusters); **session-coalescing** — a /clear-split
-sitting counts as 2 distinct sessions today, the cheapest fake-maturity path at a ~2-session bar;
-fold-time coalescing of same-repo sessions within N hours, when it bites.
+surface label-free as large low-density evidence clusters).
+
+**Session-coalescing** left this backlog (built 2026-07-04): a /clear-split or crash-restarted sitting
+read as 2 distinct sessions — the cheapest fake-maturity path at a ~2-session bar. Now
+`dream.coalesce_sessions` greedy-merges same-repo sessions whose valid-times sit within
+`COALESCE_HOURS` (12h default, UNTUNED; `--coalesce-hours` on resolve and review, 0 = off) into one
+SITTING at fold time — nothing stored. `net_entrenchment` counts sittings on both sides (support and
+contradiction, the ADR-0012 symmetry) with recency read from each sitting's LATEST valid-time, and the
+cascade's same-session gate widens through the same helper (`dream.same_sitting`), so a split
+afternoon's second half can neither adjudicate-corroborate the first half's claim nor count as a
+second session. Different repos hours apart stay distinct — a repo jump is a genuine context switch;
+undated or unhomed sessions never coalesce (recall-safe, the mirror of undated=fresh).
 
 Ratchet's invariants hold throughout: content-addressed immutable blobs, append-only decisions, per-item
 resumable ticks, one human gate as the trust boundary, no AI embeddings — feature-arrays + char-shingle

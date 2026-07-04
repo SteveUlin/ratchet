@@ -73,6 +73,12 @@ LLM call owning ACCEPTANCE + a human audit at the gate.
   (`J_HIGH`/`J_CROSS`): a polarity-flipped restatement scores Jaccard ≈ 0.73 and would merge for free.
 - Periodic Senzing/Splink-style ER audits — re-scoring stored match keys against the gold set the
   `sig` CLI drafts.
+- ~~Session coalescing~~ — CLOSED (2026-07-04): the /clear-split fake-maturity path. Same-repo
+  sessions whose valid-times sit within `COALESCE_HOURS` (12h default, `--coalesce-hours` on
+  resolve/review, 0 = off) fold into ONE sitting wherever distinct sessions are counted — support,
+  contradictions (ADR-0012 symmetry), maturity, and the cascade's same-session gate all read
+  `dream.coalesce_sessions`/`same_sitting`; recency weights each sitting by its latest valid-time.
+  Recompute-on-read, nothing stored; different repos, undated, and unhomed sessions never coalesce.
 
 ## Consequences
 

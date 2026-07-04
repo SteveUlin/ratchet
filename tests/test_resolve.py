@@ -18,8 +18,10 @@ Completers (no network, no API key) so the suite is deterministic. The design-do
        ZERO LLM calls.
 
 Plus: budget-deferral (residue events defer unmarked under --max-usd while $0 events complete),
-idempotent re-tick, --reset-v2 on a seeded v2 store, and the reopen-aware + wall-clock-bounded
-forget. Run: `python tests/test_resolve.py`."""
+idempotent re-tick, --reset-v2 on a seeded v2 store, the reopen-aware + wall-clock-bounded
+forget, and SITTING COALESCING (§14): same-repo sessions within COALESCE_HOURS count as one
+sitting for support/maturity and the cascade gate — a /clear-split afternoon cannot fake
+2-session maturity. Run: `python tests/test_resolve.py`."""
 import json
 import os
 import sys
@@ -94,9 +96,11 @@ def amsg(mid, text):
     return {"role": "assistant", "id": mid, "content": [{"type": "text", "text": text}]}
 
 
-def make_session(sid, line, *, repo=None):
+def make_session(sid, line, *, repo=None, mtime=None):
     """A real transcript → cleaned blob → chunkset, with a controlled REPO (origin cwd basename —
-    the subject_key's repo facet). Multibyte filler forces byte≠char offsets (span math under test)."""
+    the subject_key's repo facet) and an optional VALID-TIME (origin mtime — what sitting coalescing
+    and recency weighting read; omitted = undated, which never coalesces and weighs 1.0).
+    Multibyte filler forces byte≠char offsets (span math under test)."""
     records = [rec("u0", None, "user", message={"role": "user", "content": f"session {sid} kickoff"})]
     parent = "u0"
     for i in range(4):
@@ -109,6 +113,8 @@ def make_session(sid, line, *, repo=None):
     origin = {"session_id": sid}
     if repo:
         origin["cwd"] = f"/home/sulin/{repo}"
+    if mtime:
+        origin["mtime"] = mtime
     raw_h, _ = blobstore.ingest(blob, source_kind="transcript", source_id=sid, origin_ref=origin)
     cs, _, _ = chunk.materialize(raw_h, budget=600)
     return cs
@@ -167,10 +173,11 @@ def use_store(prefix):
 
 
 def seed_events(specs, root):
-    """`specs` = [(session_id, line, summary, markers, confidence, repo)] — real sessions → cleaned
-    blobs → glean events with controlled summaries (the signature source) and repos (the subject)."""
-    for sid, line, summary, markers, conf, repo in specs:
-        cs = make_session(sid, line, repo=repo)
+    """`specs` = [(session_id, line, summary, markers, confidence, repo[, mtime])] — real sessions →
+    cleaned blobs → glean events with controlled summaries (the signature source), repos (the
+    subject), and optional valid-times (the sitting-coalescing timeline; absent = undated)."""
+    for sid, line, summary, markers, conf, repo, *rest in specs:
+        cs = make_session(sid, line, repo=repo, mtime=rest[0] if rest else None)
         glean.run([cs], GleanFake([line], summaries={line: summary}, markers={line: markers},
                                   confidence=conf), model="fake", root=root)
 
@@ -678,6 +685,125 @@ assert thin12["id"] in out13 and JJ_PARA in out13 and repr(NOISE) in out13, \
     "the listing carries id, title, and the failing quote rendered"
 assert healthy12["id"] not in out13 and merged12["id"] not in out13, "healthy claims never list"
 print("OK §13 — --audit-thin lists the noise-seeded claim (id, title, quote verbatim) and nothing else.")
+
+
+# === 14. SITTING COALESCING: a /clear-split afternoon is ONE sitting, never 2-session maturity =======
+# The cheapest fake-maturity path (ADR-0028 backlog, closed): a /clear or crash-restart writes 2+
+# transcript files, so one sitting's work reads as 2 "distinct sessions" and matures a claim at the
+# ~2-session bar. `dream.coalesce_sessions` groups same-repo sessions whose valid-times sit within
+# COALESCE_HOURS into one sitting — for the COUNT (net_entrenchment, support/contradiction symmetric)
+# and, via the SAME helper (`dream.same_sitting`), for the cascade's gate.
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+_NOW14 = datetime.now(timezone.utc)
+
+
+def ago(**kw):
+    return (_NOW14 - timedelta(**kw)).isoformat()
+
+
+T_4H, T_2H, T_3D, T_NOW = ago(hours=4), ago(hours=2), ago(days=3), ago()
+
+# -- units: the grouping itself (pure, no store) --
+_vt = {"a": T_4H, "b": T_2H, "c": T_3D, "u": None}
+_rp = {"a": "alpha", "b": "alpha", "c": "alpha", "u": "alpha"}
+g = dream.coalesce_sessions({"a", "b", "c", "u"}, _vt, _rp)
+assert sorted(map(sorted, g)) == [["a", "b"], ["c"], ["u"]], \
+    f"same-repo 2h-apart pair is ONE sitting; 3-days-apart and undated stay distinct: {g}"
+g = dream.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": "beta"})
+assert sorted(map(sorted, g)) == [["a"], ["b"]], "different repos 2h apart stay distinct (context switch)"
+g = dream.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": None})
+assert sorted(map(sorted, g)) == [["a"], ["b"]], "an unhomed session never coalesces (recall-safe)"
+_chain_vt = {"p": ago(hours=20), "q": ago(hours=10), "r": ago(hours=0)}
+_chain_rp = {s: "alpha" for s in _chain_vt}
+assert len(dream.coalesce_sessions(set(_chain_vt), _chain_vt, _chain_rp)) == 1, \
+    "the greedy chain: adjacent 10h gaps merge even though the sitting spans 20h"
+assert dream.coalesce_sessions({"a", "b"}, _vt, _rp, hours=0) == [["a"], ["b"]], \
+    "hours=0 is OFF — every session its own group (the escape hatch)"
+assert dream._sitting_valid_time(["a", "b"], _vt) == T_2H, "a sitting's valid-time is its LATEST member's"
+assert dream._sitting_valid_time(["u"], _vt) is None, "a lone undated session stays undated (weight 1.0)"
+
+# same_sitting — the gate's helper IS the count's helper.
+assert dream.same_sitting("b", {"a"}, _vt, _rp), "2h same-repo → same sitting"
+assert not dream.same_sitting("c", {"a", "b"}, _vt, _rp), "3 days away → its own sitting"
+assert not dream.same_sitting("b", {"a"}, _vt, {"a": "alpha", "b": "beta"}), "repo jump → distinct"
+assert dream.same_sitting("a", {"a"}, _vt, {}, hours=0), "exact same id is same-sitting at ANY hours"
+assert not dream.same_sitting("b", {"a"}, _vt, _rp, hours=0), "hours=0 restores the plain same-session gate"
+
+# net_entrenchment counts SITTINGS, recency reads each group's LATEST valid-time, symmetric for
+# contradictions (ADR-0012), and a view with no _session_repos (a v2 takeaway) never coalesces.
+_now14 = config.now()
+_v = {"sessions_seen": ["a", "b"], "contradiction_evidence": [], "_session_repos": _rp}
+assert dream.net_entrenchment(_v, _now14, valid_times=_vt) == dream.recency_weight(T_2H, _now14), \
+    "one split sitting counts ONCE, weighted by its latest valid-time"
+assert dream.net_entrenchment(_v, _now14, valid_times=_vt, coalesce_hours=0) == \
+    sum(dream.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
+    "coalesce_hours=0 restores the per-session sum byte-exact"
+_vc = {"sessions_seen": ["c"], "contradiction_evidence": [{"session_id": "a"}, {"session_id": "b"}],
+       "_session_repos": _rp}
+assert dream.net_entrenchment(_vc, _now14, valid_times=_vt) == \
+    dream.recency_weight(T_3D, _now14) - dream.recency_weight(T_2H, _now14), \
+    "contradicting sessions coalesce identically — a split sitting can't fake a 2-session overturn"
+_v2 = {"sessions_seen": ["a", "b"], "contradiction_evidence": []}
+assert dream.net_entrenchment(_v2, _now14, valid_times=_vt) == \
+    sum(dream.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
+    "no _session_repos (a v2 takeaway) → nothing coalesces — v2 counting is untouched"
+print("OK §14a — coalesce_sessions: same-repo-within-window merges (greedy chain), repo jumps and")
+print("         undated/unhomed sessions stay distinct, hours=0 is off; the count and the gate share")
+print("         one helper; contradictions group symmetrically; v2 takeaways never coalesce.")
+
+# -- the cascade gate: a split-sitting pair never reaches the LLM (the same-session gate, widened) --
+ST_SPECS = [("st-1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha", T_4H),
+            ("st-2", JJ_PARA, JJ_PARA, M_MID, 0.85, "alpha", T_2H)]
+R14 = use_store("sitting-gate")
+seed_events(ST_SPECS, R14)
+fake14 = NeverCalled()
+rep14 = resolve.run(fake14, model="fake", forget=False, root=R14)
+assert fake14.calls == 0 and rep14.n_minted == 2 and working_set(R14) == [], \
+    "the split-sitting candidate is auto non-match — the LLM is never consulted (the gate, coalesced)"
+assert {c["title"] for c in claim_pool(R14)} == {JJ_SEED, JJ_PARA}, "each telling seeds its OWN claim"
+
+# -- the count: even a merge bought via the escape hatch adds no distinct-SITTING support --
+R14b = use_store("sitting-count")
+seed_events(ST_SPECS, R14b)
+fake14b = ResolveFake(["same-as-1"])
+rep14b = resolve.run(fake14b, model="fake", forget=False, same_session_adjudicate=True, root=R14b)
+assert fake14b.calls == 1 and rep14b.n_corroborated == 1, "the escape hatch restores adjudication"
+c14 = claim_pool(R14b)[0]
+assert c14["support"] == {"events": 2, "sessions": 2}, \
+    "the RAW audit count still says 2 sessions (like net_sessions, kept for the human)"
+vt14 = dream._session_valid_times(R14b)
+assert c14["_session_repos"] == {"st-1": "alpha", "st-2": "alpha"}, "the fold derives the repo map"
+assert len(dream.coalesce_sessions(c14["sessions_seen"], vt14, c14["_session_repos"])) == 1, \
+    "…but the two transcripts are ONE sitting"
+now14 = config.now()
+assert dream.net_entrenchment(c14, now14, valid_times=vt14) == dream.recency_weight(T_2H, now14), \
+    "support counts one sitting, weighted by the sitting's latest valid-time"
+assert current_claims(R14b) == [], "a split sitting can NOT mature a claim — the fake-maturity path is closed"
+assert [c["id"] for c in current_claims(R14b, coalesce_hours=0)] == [c14["id"]], \
+    "--coalesce-hours 0 restores the old per-session counting (the claim matures again)"
+
+# -- multi-day recurrence still matures (the existing behavior, now pinned WITH dates) --
+R14c = use_store("sitting-days")
+seed_events([("st-1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha", T_3D),
+             ("st-2", JJ_PARA, JJ_PARA, M_MID, 0.85, "alpha", T_NOW)], R14c)
+fake14c = ResolveFake(["same-as-1"])
+resolve.run(fake14c, model="fake", forget=False, root=R14c)
+assert fake14c.calls == 1, "3 days apart is NOT one sitting — the pair adjudicates normally"
+assert len(current_claims(R14c)) == 1, "same-repo recurrence across days matures (2 real sittings)"
+
+# -- same-day cross-repo work stays distinct (a repo jump is a genuine context switch) --
+R14d = use_store("sitting-repos")
+seed_events([("st-1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha", T_4H),
+             ("st-2", JJ_PARA, JJ_PARA, M_MID, 0.85, "beta", T_2H)], R14d)
+fake14d = ResolveFake(["same-as-1"])
+resolve.run(fake14d, model="fake", forget=False, root=R14d)
+assert fake14d.calls == 1, "different repos 2h apart adjudicate — no gate"
+assert len(current_claims(R14d)) == 1, "and the merge matures: two repos = two genuine contexts"
+print("OK §14b — the /clear-split sitting: the widened gate settles the pair at $0; a hatch-bought")
+print("         merge counts ONE sitting and cannot mature (hours=0 restores the old count); the same")
+print("         lesson across days or across repos still matures exactly as before.")
 
 
 print("\nall resolve tests passed.")

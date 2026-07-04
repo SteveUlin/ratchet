@@ -25,8 +25,9 @@ mutated in place (it latched). v3 inverts both:
     default, unparseable → none → mint. Zero candidates / none → MINT a claim NOW (deterministic id,
     title = event summary, why = null) + a corroborates(by:"seed") edge, folded in-batch so the next
     event reads it (read-your-writes, the v2 property kept). Three measured structural gates trim
-    the residue before the call (§3.1 gates; replay audit 2026-07-03): a SAME-SESSION candidate is
-    auto non-match (--same-session-adjudicate restores it), shingle identity >= DUP_EXACT
+    the residue before the call (§3.1 gates; replay audit 2026-07-03): a SAME-SITTING candidate is
+    auto non-match (same session id, OR same repo within COALESCE_HOURS by valid-time — the very
+    grouping maturity counts by; --same-session-adjudicate restores it), shingle identity >= DUP_EXACT
     corroborates deterministically (by:"det", $0), and a sub-floor verbatim quote (thin_quote) makes
     an event SEED-ONLY and drops a candidate from adjudication (--audit-thin lists pre-gate seeds).
 
@@ -435,6 +436,7 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
     sessions_seen: list[str] = []
     evidence: list[dict] = []
     subj_keys: list[dict] = []
+    sess_repos: dict[str, str | None] = {}         # session → the repo ITS evidence on this claim lives in
     markers = {k: 0.0 for k in MARKER_KINDS}
     confs: list[float] = []
     corro = sorted((e for e in edges if e["verb"] == "corroborates"), key=lambda e: e["event_id"])
@@ -452,7 +454,10 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         summary = str(ev.get("summary", ""))
         shingles |= sig.char_shingles(summary)
         ent = max(ent, sig.entropy(summary))
-        subj_keys.append(_event_subject(ev, root, subj_cache))
+        sk = _event_subject(ev, root, subj_cache)
+        subj_keys.append(sk)
+        if s and sess_repos.get(s) is None:        # first dated repo wins (corro is event-id-sorted →
+            sess_repos[s] = sk.get("repo")         # deterministic); a gone blob leaves None (never coalesces)
         em = dream._event_markers(ev)
         markers = {k: max(markers[k], em[k]) for k in MARKER_KINDS}
         confs.append(completer.clean_score(ev.get("confidence"), 0.5))
@@ -477,6 +482,11 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         if rv is not None:
             entry = dream.evidence_entry(rv)
             entry["session_id"] = e.get("session_id")
+        s = e.get("session_id")
+        if s and ev is not None and sess_repos.get(s) is None:
+            sess_repos[s] = _event_subject(ev, root, subj_cache).get("repo")   # symmetric (ADR-0012):
+            # contradicting sessions coalesce by the same repo evidence, so a split sitting can no
+            # more fake a 2-session overturn than a 2-session graduation.
         contradiction_evidence.append(entry)
     view = {
         "id": content["id"],
@@ -516,6 +526,9 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         "stmt_shingles": frozenset(shingles),
         "stmt_entropy": ent,
         "_subj_keys": subj_keys,                       # in-memory only: the in-batch scope recompute
+        "_session_repos": sess_repos,                  # in-memory only: sitting coalescing's repo map
+                                                       # (dream.coalesce_sessions) — recomputed per fold,
+                                                       # never stored (ADR-0013)
     }
     view["contradictions"] = dream._contradiction_stats(view)
     return view
@@ -564,13 +577,15 @@ def claim_pool(root: Path | None = None) -> list[dict]:
 
 
 def is_active(view: dict, *, now: str, valid_times: dict, floor: float = ACTIVE_FLOOR,
-              days: float = ACTIVE_DAYS) -> bool:
+              days: float = ACTIVE_DAYS, coalesce_hours: float = dream.COALESCE_HOURS) -> bool:
     """The ACTIVE-view predicate (§2.1/§3.3) — the pool's derived drain, never a stored status:
     active = recency-weighted net entrenchment >= ACTIVE_FLOOR, OR any evidence within ACTIVE_DAYS.
     Inactive claims fold out of the candidate indexes; their blobs, edges, and history remain, and a
     re-seeded near-duplicate reconciles later through the derived merge-suggestion query at review.
-    An undateable session reads as fresh (age 0 — the recall-safe direction, like recency_weight)."""
-    if dream.net_entrenchment(view, now, valid_times=valid_times) >= floor:
+    An undateable session reads as fresh (age 0 — the recall-safe direction, like recency_weight).
+    Entrenchment is the ONE measure (`dream.net_entrenchment`), so `coalesce_hours` threads here too —
+    the active view must not read a split sitting as more entrenched than the maturity gate does."""
+    if dream.net_entrenchment(view, now, valid_times=valid_times, coalesce_hours=coalesce_hours) >= floor:
         return True
     ss = view.get("sessions_seen") or []
     if not ss:
@@ -579,20 +594,24 @@ def is_active(view: dict, *, now: str, valid_times: dict, floor: float = ACTIVE_
 
 
 def current_claims(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
-                   now: str | None = None, valid_times: dict | None = None) -> list[dict]:
+                   now: str | None = None, valid_times: dict | None = None,
+                   coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
     """The MATURITY GATE over the fold — the single bar (§3.4/§4, `dream.MATURITY_WEIGHT`
-    single-sourced): claims whose recency-weighted net entrenchment (distinct support sessions minus
-    contradicting ones, each valid-time-weighted — `dream.net_entrenchment` reads the folded view
-    unchanged) crosses the reviewer's bar. Same shape/semantics as `dream.current_takeaways`."""
+    single-sourced): claims whose recency-weighted net entrenchment (distinct support SITTINGS minus
+    contradicting ones, each valid-time-weighted; same-repo sessions within `coalesce_hours` count as
+    ONE sitting — `dream.net_entrenchment` reads the folded view unchanged) crosses the reviewer's
+    bar. Same shape/semantics as `dream.current_takeaways`."""
     root = root or config.data_root()
     now = now or config.now()
     if valid_times is None:
         valid_times = dream._session_valid_times(root)
     return [c for c in claim_pool(root)
-            if dream.net_entrenchment(c, now, valid_times=valid_times) >= maturity]
+            if dream.net_entrenchment(c, now, valid_times=valid_times,
+                                      coalesce_hours=coalesce_hours) >= maturity]
 
 
-def high_confidence_view(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
+def high_confidence_view(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
+                         coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
     """The trusted subset (§5) — the ONLY thing generate reads and refine's prior: ONE graph, filtered
     to latest_decision == accept AND net_entrenchment >= the bar AND no live retire/supersede (the pool
     fold already drops those). Review appends a decision FACET; nothing forks."""
@@ -605,7 +624,8 @@ def high_confidence_view(root: Path | None = None, *, maturity: float = dream.MA
         d = decisions.get(c["id"])
         if not (d and d.get("verb") in ACCEPT_VERBS and _decision_binds(d, c)):
             continue                                   # a pre-birth accept trusted the same-id predecessor
-        if dream.net_entrenchment(c, now, valid_times=valid_times) >= maturity:
+        if dream.net_entrenchment(c, now, valid_times=valid_times,
+                                  coalesce_hours=coalesce_hours) >= maturity:
             out.append(c)
     return out
 
@@ -833,6 +853,7 @@ class ResolveBlock:
                  facet_df_max: float = FACET_DF_MAX, active_floor: float = ACTIVE_FLOOR,
                  active_days: float = ACTIVE_DAYS, dup_exact: float = DUP_EXACT,
                  quote_min_chars: int = QUOTE_MIN_CHARS, same_session_adjudicate: bool = False,
+                 coalesce_hours: float = dream.COALESCE_HOURS,
                  max_usd: float | None = None,
                  forget: bool = True, forget_tau: int = dream.FORGET_TAU,
                  forget_floor: float = dream.FORGET_SALIENCE_FLOOR,
@@ -853,6 +874,7 @@ class ResolveBlock:
         self.dup_exact = dup_exact
         self.quote_min_chars = quote_min_chars
         self.same_session_adjudicate = same_session_adjudicate
+        self.coalesce_hours = coalesce_hours           # the sitting window (dream.COALESCE_HOURS; 0 = off)
         self.max_usd = max_usd                         # the RESIDUE-spend cap (deferral, not break — §7.2)
         self.forget_on = forget
         self.forget_tau = forget_tau
@@ -866,6 +888,8 @@ class ResolveBlock:
         self._blocked: set[frozenset] = set()
         self._epochs: Counter = Counter()
         self._subj_cache: dict = {}
+        self._valid_times: dict = {}                   # session → valid-time, built once at items() —
+                                                       # the sitting gate reads it per candidate
         self._spent = 0.0
         self._root: Path | None = None
         self._born: dict[str, str | None] | None = None
@@ -890,10 +914,12 @@ class ResolveBlock:
         self._spent = 0.0
         now = config.now()
         valid_times = dream._session_valid_times(root)
+        self._valid_times = valid_times
         pool = claim_pool(root)
         self._pool_by_id = {c["id"]: c for c in pool}
         active = [c for c in pool if is_active(c, now=now, valid_times=valid_times,
-                                               floor=self.active_floor, days=self.active_days)]
+                                               floor=self.active_floor, days=self.active_days,
+                                               coalesce_hours=self.coalesce_hours)]
         self._idx = build_indexes(active)
         self.n_pool, self.n_active = len(pool), len(active)
         rm = _reject_merge_facts(root)
@@ -969,18 +995,26 @@ class ResolveBlock:
                                                        # adjudication — the model judges titles when
                                                        # the quote is noise (the measured [16] family)
             if (not self.same_session_adjudicate and rv.session_id
-                    and rv.session_id in (c.get("sessions_seen") or ())):
-                # SAME-SESSION GATE (§3.1 gates): distinct-session corroboration is the unit of
-                # trust — maturity counts DISTINCT sessions — so a same-session merge adds zero
+                    and dream.same_sitting(
+                        rv.session_id, c.get("sessions_seen") or (), self._valid_times,
+                        {**(c.get("_session_repos") or {}), rv.session_id: ev_subj.get("repo")},
+                        hours=self.coalesce_hours)):
+                # SAME-SITTING GATE (§3.1 gates): distinct-session corroboration is the unit of
+                # trust — maturity counts DISTINCT SITTINGS — so a same-sitting merge adds zero
                 # support; the LLM is never asked a question whose yes is worthless. Measured:
                 # same-session pairs were the dominant false-accept family (two lessons from one
                 # working session sharing vocabulary/context); with this gate + the noise floor the
                 # live re-tally reads cross-session recall 4/4, false-accept 9%, ~2/3 of residue
-                # calls gone. A missed same-session merge self-heals — the lesson recurs
-                # cross-session and the derived merge suggestions catch the leftovers. Accepted
-                # loss: a within-session self-correction (contradicts) goes undetected; the
-                # corrected lesson recurs in later sessions. --same-session-adjudicate restores
-                # adjudication for these pairs (the escape hatch).
+                # calls gone. `dream.same_sitting` extends the exact same-id test to the COALESCED
+                # sitting (same repo, valid-times within COALESCE_HOURS) — the SAME helper the
+                # maturity count groups by, so an event from the second half of a /clear-split
+                # afternoon cannot adjudicate-corroborate the first half's claim and then count as
+                # a second session. A missed same-sitting merge self-heals — the lesson recurs
+                # cross-sitting and the derived merge suggestions catch the leftovers. Accepted
+                # loss: a within-sitting self-correction (contradicts) goes undetected; the
+                # corrected lesson recurs in later sittings. --same-session-adjudicate restores
+                # adjudication for these pairs (the escape hatch; --coalesce-hours 0 narrows the
+                # gate back to exact same-session).
                 continue
             scored.append((s, cid))
         if dup is not None:
@@ -1022,7 +1056,7 @@ class ResolveBlock:
             self._fold_corroboration(target, rv, summary, ev_sh, ev_ent, ev_subj)
             self.n_corroborated += 1
         else:
-            self._fold_contradiction(target, rv)
+            self._fold_contradiction(target, rv, ev_subj)
             self.n_contradicted += 1
         self.claims.append(target)
         _write_consolidated(rv.id, target["id"], verb, run_id=run_id, root=root)    # decision LAST
@@ -1065,6 +1099,7 @@ class ResolveBlock:
             "scope": "local", "scope_repo": scope_repo_of([ev_subj]),
             "stmt_shingles": frozenset(ev_sh) | sig.char_shingles(summary),
             "stmt_entropy": ev_ent, "_subj_keys": [ev_subj],
+            "_session_repos": {rv.session_id: ev_subj.get("repo")} if rv.session_id else {},
         }
         self._pool_by_id[cid] = view                   # the in-batch fold: next event reads this claim
         index_claim(self._idx, view)
@@ -1083,6 +1118,8 @@ class ResolveBlock:
             view["evidence"].append(dream.evidence_entry(rv))
         if rv.session_id and rv.session_id not in view["sessions_seen"]:
             view["sessions_seen"].append(rv.session_id)
+        if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
+            view["_session_repos"][rv.session_id] = ev_subj.get("repo")
         view["support"] = {"events": len(set(view["cites"])), "sessions": len(set(view["sessions_seen"]))}
         new_sh = frozenset(ev_sh) - view["stmt_shingles"]
         view["stmt_shingles"] = view["stmt_shingles"] | new_sh
@@ -1100,15 +1137,19 @@ class ResolveBlock:
         view["markers"] = {k: max(view["markers"][k], em[k]) for k in MARKER_KINDS}
         view["confidence"] = max(view["confidence"], completer.clean_score(rv.event.get("confidence"), 0.5))
 
-    def _fold_contradiction(self, view: dict, rv: dream.ResolvedEvent) -> None:
+    def _fold_contradiction(self, view: dict, rv: dream.ResolvedEvent, ev_subj: dict) -> None:
         """Fold a contradiction into the on-instance view: the symmetric side only — support, title,
-        signature ride untouched (ADR-0012; the negation cue never widens the merge basin)."""
+        signature ride untouched (ADR-0012; the negation cue never widens the merge basin). The
+        session's repo joins the sitting map for the same symmetry: contradicting sessions coalesce
+        exactly as supporting ones do."""
         if rv.id in view["contradicted_by"]:
             return
         view["contradicted_by"].append(rv.id)
         entry = dream.evidence_entry(rv)
         entry["session_id"] = rv.session_id
         view["contradiction_evidence"].append(entry)
+        if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
+            view["_session_repos"][rv.session_id] = ev_subj.get("repo")
         view["contradictions"] = dream._contradiction_stats(view)
 
     def finalize(self, *, root: Path, run_id: str) -> None:
@@ -1157,7 +1198,7 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
         k_rare: int = K_RARE, rare_min: int = RARE_MIN, facet_df_max: float = FACET_DF_MAX,
         active_floor: float = ACTIVE_FLOOR, active_days: float = ACTIVE_DAYS,
         dup_exact: float = DUP_EXACT, quote_min_chars: int = QUOTE_MIN_CHARS,
-        same_session_adjudicate: bool = False,
+        same_session_adjudicate: bool = False, coalesce_hours: float = dream.COALESCE_HOURS,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> ResolveReport:
@@ -1169,7 +1210,8 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
                        k_rare=k_rare, rare_min=rare_min, facet_df_max=facet_df_max,
                        active_floor=active_floor, active_days=active_days, dup_exact=dup_exact,
                        quote_min_chars=quote_min_chars,
-                       same_session_adjudicate=same_session_adjudicate, max_usd=max_usd,
+                       same_session_adjudicate=same_session_adjudicate,
+                       coalesce_hours=coalesce_hours, max_usd=max_usd,
                        forget=forget)
     report = block.run(blk, limit=limit, root=root, priority=priority, progress=progress)
     return ResolveReport(report, blk)
@@ -1216,6 +1258,12 @@ def main(argv=None) -> None:
     ap.add_argument("--same-session-adjudicate", action="store_true",
                     help="escape hatch: adjudicate candidates already carrying the event's session "
                          "(default off — a same-session merge adds no distinct-session support)")
+    ap.add_argument("--coalesce-hours", type=float, default=dream.COALESCE_HOURS,
+                    help=f"the SITTING window: same-repo sessions whose valid-times fall within this "
+                         f"many hours count as ONE sitting for support/contradiction/maturity and the "
+                         f"same-session gate — a /clear-split afternoon is one sitting, not two "
+                         f"sessions (default {dream.COALESCE_HOURS:g}; 0 = off, the exact per-session "
+                         f"counting)")
     ap.add_argument("--audit-thin", action="store_true",
                     help="read-only: list every live claim whose seed evidence fails the noise floor "
                          "(pre-gate noise seeds — bulk-review and retire)")
@@ -1284,9 +1332,11 @@ def main(argv=None) -> None:
         now = config.now()
         valid_times = dream._session_valid_times(root)
         active = [c for c in pool if is_active(c, now=now, valid_times=valid_times,
-                                               floor=args.active_floor, days=args.active_days)]
+                                               floor=args.active_floor, days=args.active_days,
+                                               coalesce_hours=args.coalesce_hours)]
         mature = [c for c in pool
-                  if dream.net_entrenchment(c, now, valid_times=valid_times) >= args.maturity]
+                  if dream.net_entrenchment(c, now, valid_times=valid_times,
+                                            coalesce_hours=args.coalesce_hours) >= args.maturity]
         print(f"{len(ws)} un-consolidated events ({args.priority}-ordered) · claim pool {len(pool)} "
               f"({len(active)} active, {len(mature)} mature):")
         for rv in ws[:40]:
@@ -1305,6 +1355,7 @@ def main(argv=None) -> None:
                  active_days=args.active_days, dup_exact=args.dup_exact,
                  quote_min_chars=args.quote_min_chars,
                  same_session_adjudicate=args.same_session_adjudicate,
+                 coalesce_hours=args.coalesce_hours,
                  forget=not args.no_forget, max_usd=args.max_usd,
                  limit=args.limit, priority=block.priority_strategy(args.priority),
                  progress=progress)
