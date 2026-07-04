@@ -416,8 +416,9 @@ class GleanBlock:
         self._last = threading.local()
         # the Aging seam (ADR-0021): `age` needs the run's root + a recency read. `_root` is captured in
         # items() (the driver's root, set before ordering calls age); `_age_cache` memoizes each cleaned
-        # blob's `fetched_at` so the many chunks SHARING one cleaned_hash pay a single meta read, not one
-        # each. Only the Aging strategy calls age() — Greedy ignores it, so a non-aging run touches neither.
+        # blob's SOURCE stamp (the raw transcript's `fetched_at`, via the lineage hop) so the many chunks
+        # SHARING one cleaned_hash pay the two meta reads once, not per chunk. Only the Aging strategy
+        # calls age() — Greedy ignores it, so a non-aging run touches neither.
         self._root: Path | None = None
         self._age_cache: dict[str, str | None] = {}
         # The subject-stamp seam (dream-v3 §2.1, S1): `subject_key` derivation parses the cleaned blob
@@ -481,20 +482,32 @@ class GleanBlock:
         return has_user + diversity + interaction
 
     def age(self, item: ChunkItem) -> float:
-        """The chunk's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the chunk's
-        source CLEANED blob — how long this transcript material has waited un-gleaned. glean is budget-gated
-        (LLM + `--max-usd`), so under a months-long backlog Greedy's lowest-yield chunks could starve
-        forever; aging lets an old chunk's `score + λ·age` eventually overtake fresher richer ones (bounded
-        latency). CHEAP — one cached meta read (no content slice, no LLM), so it keeps the amortized-queue
-        O(1)-per-item promise: chunks share a cleaned_hash, so `_age_cache` reads each blob's stamp once.
-        Degrades to 0.0 ("fresh") if the blob/stamp is gone or unparseable — never raises (a missing recency
-        must not crash ordering). Only Aging calls this; Greedy ignores age, so glean stays byte-identical."""
+        """The chunk's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the RAW
+        transcript BEHIND the chunk's cleaned blob — how long this material has waited un-gleaned. The
+        cleaned blob is a render, so its age is its SOURCE's age: derived meta carries `created_at`
+        (when the render ran — resettable by any re-render), never `fetched_at` (when the material
+        arrived), so age hops the lineage `derived_from` cleaned → raw and reads the raw's stamp —
+        recompute-on-read (ADR-0013), the same hop `session_of`/`subject` walk. Reading the cleaned
+        meta directly finds no stamp on any weave-derived blob and silently flattens every age to 0.0,
+        never firing aging's anti-starvation term.
+
+        glean is budget-gated (LLM + `--max-usd`), so under a months-long backlog Greedy's lowest-yield
+        chunks could starve forever; aging lets an old chunk's `score + λ·age` eventually overtake
+        fresher richer ones (bounded latency). CHEAP — two meta reads, cached per cleaned_hash (no
+        content slice, no LLM), so it keeps the amortized-queue O(1)-per-item promise: chunks share a
+        cleaned_hash, so `_age_cache` pays the hop once per blob. Degrades to 0.0 ("fresh") when the
+        lineage or stamp is gone/unparseable — never raises (a missing recency must not crash
+        ordering). Only Aging calls this; Greedy ignores age, so glean stays byte-identical."""
         ch = item.chunk.cleaned_hash
         if ch not in self._age_cache:
+            stamp = None
             try:
-                self._age_cache[ch] = blobstore.get_meta(ch, self._root).get("fetched_at")
+                raw = blobstore.get_meta(ch, self._root).get("derived_from")
+                if raw:
+                    stamp = blobstore.get_meta(raw, self._root).get("fetched_at")
             except (OSError, json.JSONDecodeError):
-                self._age_cache[ch] = None        # absent/unreadable meta → treat as fresh (0.0), never raise
+                pass                              # absent/unreadable lineage → treat as fresh (0.0), never raise
+            self._age_cache[ch] = stamp
         return config.age_days(self._age_cache[ch])
 
     # -- the concept digest seam: "what we already know", provenance-relevant to THIS chunk --------

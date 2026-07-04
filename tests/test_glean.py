@@ -547,6 +547,50 @@ print("OK — relevance (4b): a valid verdict stores verbatim; an unknown one co
 print("     end-to-end through completer → verify → build_event → ingest → load_events.")
 
 
+# --- 8d. age(): aging reads the RAW transcript's fetched_at through the cleaned lineage (ADR-0021) ---
+# weave-derived cleaned blobs carry `created_at`, never `fetched_at` — so reading the stamp off the
+# CLEANED meta finds None on every chunk and flattens all ages to 0.0 ("fresh"), leaving `--priority
+# aging`'s anti-starvation term inert. age() must hop cleaned → derived_from → raw and use the
+# transcript's own arrival stamp (recompute-on-read, ADR-0013: the render's age is its source's age).
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+OLD_STAMP = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+raw_old, _ = blobstore.ingest(blob.replace("kick off", "kick off aged"), source_kind="transcript",
+                              source_id="glean-aged", origin_ref={"session_id": "glean-aged"},
+                              fetched_at=OLD_STAMP)
+cs_old, _, ochunks = chunk.materialize(raw_old, budget=600)
+# the regression premise, pinned: the weave-derived cleaned blob carries NO fetched_at — a direct
+# cleaned-meta read could only ever see None, so every chunk degraded to age 0.0.
+assert "fetched_at" not in blobstore.get_meta(ochunks[0].cleaned_hash), \
+    "cleaned (derived) meta has no fetched_at — derived blobs stamp created_at only"
+ablk = glean.GleanBlock(FakeCompleter([]), model="aged", targets=[cs_old])
+aitems = list(ablk.items(config.data_root()))          # items() captures _root, as the driver does
+age_old = ablk.age(aitems[0])
+assert 9.99 < age_old < 10.01, f"a 10-day-old raw transcript reports ~10.0d via the lineage hop: {age_old}"
+assert ablk._age_cache[ochunks[0].cleaned_hash] == OLD_STAMP, "the hop's stamp is cached per cleaned blob"
+assert all(abs(ablk.age(i) - age_old) < 0.01 for i in aitems), "chunks sharing the cleaned blob share the age"
+
+# the documented degradation holds THROUGH the hop: no stamp anywhere → 0.0, never a raise.
+# (a) a raw meta missing its stamp (legacy/hand-written snapshot): strip fetched_at in this temp store.
+raw_ns, _ = blobstore.ingest(blob.replace("kick off", "kick off nostamp"), source_kind="transcript",
+                             source_id="glean-nostamp", origin_ref={"session_id": "glean-nostamp"})
+cs_ns, _, nschunks = chunk.materialize(raw_ns, budget=600)
+_mp = blobstore._paths(raw_ns, config.data_root())[1]
+_mns = json.loads(_mp.read_text(encoding="utf-8"))
+_mns.pop("fetched_at")
+_mp.write_text(json.dumps(_mns), encoding="utf-8")
+nblk = glean.GleanBlock(FakeCompleter([]), model="nostamp", targets=[cs_ns])
+nitems = list(nblk.items(config.data_root()))
+assert nblk.age(nitems[0]) == 0.0, "raw meta without fetched_at → age 0.0 (fresh), the documented degrade"
+# (b) broken lineage: a chunk whose cleaned blob is unknown to the store → 0.0, never raises.
+ghost = glean.ChunkItem(chunk=chunk.Chunk(cleaned_hash="0" * 64, byte_start=0, byte_end=1,
+                                          turn_start=0, turn_end=1, segment=0, kinds=["user"]),
+                        chunkset_hash="cs")
+assert nblk.age(ghost) == 0.0, "absent cleaned meta → age 0.0, never raises"
+print("OK — age (ADR-0021): the lineage hop reads the RAW transcript's fetched_at (~10.0d pinned),")
+print("     cached per cleaned blob; missing stamp or broken lineage degrades to 0.0, never raises.")
+
+
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------
 
 if os.environ.get("RATCHET_LIVE_TEST") == "1":
