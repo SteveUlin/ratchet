@@ -24,6 +24,7 @@ every output+marker is in finalize, never split — or the crash-safety ordering
 """
 from __future__ import annotations
 
+import statistics
 import sys
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -310,6 +311,100 @@ def write_processed(name: str, key: str, params: tuple[tuple[str, str], ...], *,
     s = blobstore.canonical_json(body)
     blobstore.ingest(s, source_kind="decision", source_id=blobstore.blob_hash(s), prev=None,
                      origin_ref={"stage": name, "run_id": run_id}, fetched_at=at, root=root)
+
+
+# --- the scores report: the pending queue's value curve, read-only (--scores, --dry-run's sibling) --
+
+# The operator question this answers: "what is my next --limit/--max-usd tick going to BUY, and what
+# does the backlog's value curve look like behind it?" A capped tick takes the TOP slice of the
+# priority order, so the score DISTRIBUTION — not any single item — is what tells you whether the cap
+# is skimming cream off a long flat tail or splitting a cliff. Pure string, no writes, no LLM.
+
+SCORES_BAR_WIDTH = 40   # widest histogram bar, in '#'s: one '#' per item while the peak bin fits,
+                        # proportionally scaled past that (a nonzero bin never rounds to an empty bar
+                        # — presence must stay visible). One edit here retunes every stage's report.
+SCORES_TOPN = 5         # items shown at each end: the next tick's buy vs the longest wait
+
+
+def _score_histogram(scores: list[float], buckets: int) -> list[str]:
+    """Equal-width ASCII histogram rows over `scores` — `[lo, hi)  count  bar` per bin, the LAST bin
+    closed (`]`) so the max score lands inside it instead of falling off the edge. Two degradations,
+    both graceful: all-equal scores collapse to ONE closed row (a zero bin width has nothing to
+    spread — and would divide by zero), and the caller guards empty. Bars scale to the WIDEST bin
+    (see SCORES_BAR_WIDTH)."""
+    lo, hi = min(scores), max(scores)
+    if lo == hi:
+        n = len(scores)
+        return [f"  [{lo:.3f}, {hi:.3f}]  {n:>4}  " + "#" * min(n, SCORES_BAR_WIDTH)]
+    buckets = max(1, buckets)
+    width = (hi - lo) / buckets
+    counts = [0] * buckets
+    for s in scores:
+        counts[min(int((s - lo) / width), buckets - 1)] += 1   # float edge-noise clamps into the last bin
+    peak = max(counts)
+    rows = []
+    for i, c in enumerate(counts):
+        close = "]" if i == buckets - 1 else ")"
+        bar = "#" * (c if peak <= SCORES_BAR_WIDTH else max(1, round(c * SCORES_BAR_WIDTH / peak))) \
+            if c else ""
+        rows.append(f"  [{lo + i * width:.3f}, {lo + (i + 1) * width:.3f}{close}  {c:>4}  {bar}".rstrip())
+    return rows
+
+
+def scores_report(blk: Block, *, root: Path, source_id: str | None = None,
+                  priority: str = "greedy", buckets: int = 12) -> str:
+    """The pending queue's priority-score distribution, rendered read-only — enumerate items exactly
+    as `run()` would (same `items()`, same `done_index` split, same `--priority` registry), then show
+    the operator the value curve a capped tick draws from: summary stats, an equal-width histogram,
+    and the SCORES_TOPN items at each end of the processing order. Under the Aging policy a SECOND
+    histogram of EFFECTIVE scores (`score + λ·age`, the ordering the tick actually uses) sits beside
+    the raw one, so what aging changes is visible rather than asserted. Composable exactly like
+    --dry-run: no writes, no LLM, no markers."""
+    root = config.ensure_layout(root)
+    strat = priority_strategy(priority)
+    aging = isinstance(strat, Aging)
+    pvals = tuple(v for _, v in blk.params)
+    done = done_index(blk.name, root)
+    items = list(blk.items(root, source_id=source_id))
+    pending = [it for it in items if (blk.key(it), *pvals) not in done]
+    lines = [f"{blk.name} scores — {len(pending)} pending · {len(items) - len(pending)} done · "
+             f"policy {priority}"]
+    if not pending:
+        lines.append("  queue empty — nothing pending under the current filters")
+        return "\n".join(lines)
+
+    scores = [blk.priority(it) for it in pending]
+    lines.append(f"score: min {min(scores):.3f} · median {statistics.median(scores):.3f} · "
+                 f"mean {statistics.mean(scores):.3f} · max {max(scores):.3f}")
+    lines.append("")
+    lines.append(f"score histogram ({buckets} equal-width bins over {len(pending)} pending):")
+    lines.extend(_score_histogram(scores, buckets))
+    if aging:                                      # show what aging CHANGES, next to what it changed
+        effective = [blk.priority(it) + AGING_LAMBDA * blk.age(it) for it in pending]
+        lines.append("")
+        lines.append(f"effective histogram (score + λ·age, λ={AGING_LAMBDA}/day — the order the "
+                     f"tick uses):")
+        lines.extend(_score_histogram(effective, buckets))
+
+    # the two ends of the ACTUAL processing order (the strategy's, not a re-derivation): what the
+    # next tick buys first vs what waits longest. Greedy/Arrival ignore age_of; only Aging reads it.
+    ordered = strat.order(pending, blk.priority, blk.age)
+
+    def _item_line(it) -> str:
+        s = blk.priority(it)
+        if not aging:
+            return f"  {blk.key(it)}  score {s:.3f}"
+        a = blk.age(it)
+        return f"  {blk.key(it)}  eff {s + AGING_LAMBDA * a:.3f} · score {s:.3f} · age {a:.1f}d"
+
+    lines.append("")
+    lines.append(f"top {min(SCORES_TOPN, len(ordered))} — the next tick buys these first:")
+    lines.extend(_item_line(it) for it in ordered[:SCORES_TOPN])
+    rest = ordered[SCORES_TOPN:]
+    if rest:
+        lines.append(f"bottom {min(SCORES_TOPN, len(rest))} — waits longest:")
+        lines.extend(_item_line(it) for it in rest[-SCORES_TOPN:])
+    return "\n".join(lines)
 
 
 # --- the shared Report (one shape for every stage's CLI surface + driver contract) ------------------

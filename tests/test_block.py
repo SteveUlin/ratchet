@@ -606,7 +606,102 @@ assert "tripping the breaker" in err17.getvalue() and "20 items left pending" in
 print(f"OK §17 — breaker (parallel): dispatch stops, in-flight drains ({rep17.errored} errored, bound 5..7), loud")
 
 
+# === 18. scores_report: the pending queue's value curve — pure string, exact math, no writes ==========
+# The operator surface behind --scores: enumerate exactly as run() would (items() + done_index split),
+# then render stats + an equal-width histogram + the two ends of the processing order. The checks pin
+# the bin/count math byte-exactly, the two graceful degradations (all-equal → one closed row; empty
+# queue → no div-by-zero), the aging twin (an old item's EFFECTIVE score climbs the order and a second
+# histogram appears), and purity (a report writes nothing — no marker, no blob, no process call).
+
+r18 = fresh_root("scores")
+# scores [0,0,1,2,4,4,4] over 4 bins of width 1.0: [0,1)→2, [1,2)→1, [2,3)→1, [3,4] (closed)→3.
+sb = PriorityBlock(["i1", "i2", "i3", "i4", "i5", "i6", "i7"],
+                   {"i1": 0.0, "i2": 0.0, "i3": 1.0, "i4": 2.0, "i5": 4.0, "i6": 4.0, "i7": 4.0})
+done_before = block.done_index("prio", r18)
+rep18 = block.scores_report(sb, root=r18, buckets=4)
+assert isinstance(rep18, str), "the report is a pure string"
+lines18 = rep18.splitlines()
+assert lines18[0] == "prio scores — 7 pending · 0 done · policy greedy", lines18[0]
+assert lines18[1] == "score: min 0.000 · median 2.000 · mean 2.143 · max 4.000", lines18[1]
+# the histogram rows, byte-exact: count math, the half-open bins, the CLOSED last bin (max lands
+# inside), and the 1-#-per-item bar (peak 3 fits SCORES_BAR_WIDTH).
+assert lines18[3] == "score histogram (4 equal-width bins over 7 pending):", lines18[3]
+assert lines18[4] == "  [0.000, 1.000)     2  ##", lines18[4]
+assert lines18[5] == "  [1.000, 2.000)     1  #", lines18[5]
+assert lines18[6] == "  [2.000, 3.000)     1  #", lines18[6]
+assert lines18[7] == "  [3.000, 4.000]     3  ###", lines18[7]
+# the two ends of the greedy order (stable: score ties keep enumeration order): top-5 = the 4.0s then
+# the 2.0; bottom = whatever the top didn't show, worst last.
+assert "top 5 — the next tick buys these first:" in lines18, lines18
+i_top = lines18.index("top 5 — the next tick buys these first:")
+assert lines18[i_top + 1:i_top + 6] == ["  i5  score 4.000", "  i6  score 4.000", "  i7  score 4.000",
+                                        "  i4  score 2.000", "  i3  score 1.000"], lines18[i_top + 1:i_top + 6]
+assert lines18[i_top + 6] == "bottom 2 — waits longest:", lines18[i_top + 6]
+assert lines18[i_top + 7:] == ["  i1  score 0.000", "  i2  score 0.000"], lines18[i_top + 7:]
+# PURITY: rendering the report processed nothing and wrote nothing.
+assert sb.processed_keys == [], "scores_report never calls process()"
+assert block.done_index("prio", r18) == done_before, "scores_report writes no marker"
+
+# the done-split: after a --limit 2 tick takes the top slice (i5,i6), the report sees 5 pending, 2 done.
+block.run(PriorityBlock(["i1", "i2", "i3", "i4", "i5", "i6", "i7"],
+                        {"i1": 0.0, "i2": 0.0, "i3": 1.0, "i4": 2.0, "i5": 4.0, "i6": 4.0, "i7": 4.0}),
+          root=r18, limit=2, progress=None)
+rep18b = block.scores_report(sb, root=r18, buckets=4)
+assert rep18b.splitlines()[0] == "prio scores — 5 pending · 2 done · policy greedy", rep18b.splitlines()[0]
+assert "score: min 0.000 · median 1.000 · mean 1.400 · max 4.000" in rep18b, rep18b
+
+# DEGENERATE: all scores equal (FakeBlock's uniform 0.0) → ONE closed row, no div-by-zero.
+r18c = fresh_root("scores-flat")
+fb18 = FakeBlock(["a", "b", "c"])
+rep18c = block.scores_report(fb18, root=r18c)
+assert "fake scores — 3 pending · 0 done · policy greedy" in rep18c, rep18c
+assert "  [0.000, 0.000]     3  ###" in rep18c, f"all-equal collapses to one closed bin: {rep18c}"
+
+# DEGENERATE: empty queue → the header + one line, no stats, no histogram, no crash.
+rep18d = block.scores_report(FakeBlock([]), root=fresh_root("scores-empty"))
+assert rep18d.splitlines() == ["fake scores — 0 pending · 0 done · policy greedy",
+                               "  queue empty — nothing pending under the current filters"], rep18d
+
+
+class AgedScoresBlock(PriorityBlock):
+    """A PriorityBlock exposing per-item AGE (the ADR-0021 seam), so the report's aging twin — the
+    effective histogram + the eff/score/age item lines — is testable with controlled signals."""
+    name = "agedscores"
+
+    def __init__(self, items, scores, ages, **kw):
+        super().__init__(items, scores, **kw)
+        self._ages = ages
+
+    def age(self, item):
+        return self._ages[item]
+
+
+# AGING: old (score 1.0, age 100d) → effective 1.0 + 0.05·100 = 6.0, overtaking fresh (2.0, age 0).
+r18e = fresh_root("scores-aging")
+ab = AgedScoresBlock(["fresh", "old", "mid"], {"fresh": 2.0, "old": 1.0, "mid": 1.5},
+                     {"fresh": 0.0, "old": 100.0, "mid": 10.0})
+rep18e = block.scores_report(ab, root=r18e, priority="aging", buckets=4)
+assert "policy aging" in rep18e.splitlines()[0], rep18e.splitlines()[0]
+assert "effective histogram (score + λ·age" in rep18e, "aging renders the SECOND histogram"
+i_eff = [i for i, ln in enumerate(rep18e.splitlines()) if ln.startswith("effective histogram")][0]
+eff_rows = rep18e.splitlines()[i_eff + 1:i_eff + 5]
+# effective scores [2.0, 6.0, 2.0] over 4 bins of width 1.0 from 2.0: [2,3)→2, [5,6]→1.
+assert eff_rows[0] == "  [2.000, 3.000)     2  ##", eff_rows
+assert eff_rows[3] == "  [5.000, 6.000]     1  #", eff_rows
+i_top18e = rep18e.splitlines().index("top 3 — the next tick buys these first:")
+assert rep18e.splitlines()[i_top18e + 1] == "  old  eff 6.000 · score 1.000 · age 100.0d", \
+    "the aged item climbed to the head — aging's effective column shifted it up"
+# the SAME block under greedy: no effective histogram, and the raw score leads (old sinks).
+rep18f = block.scores_report(ab, root=r18e, priority="greedy", buckets=4)
+assert "effective histogram" not in rep18f, "greedy shows one histogram — aging's twin is policy-gated"
+i_top18f = rep18f.splitlines().index("top 3 — the next tick buys these first:")
+assert rep18f.splitlines()[i_top18f + 1] == "  fresh  score 2.000", rep18f.splitlines()[i_top18f + 1]
+print("OK §18 — scores_report: pinned histogram math, all-equal + empty degrade, aging's effective "
+      "twin re-orders, pure string (no writes)")
+
+
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
       "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol "
-      "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps), and the "
-      "consecutive-failure breaker (K unbroken failures abort the tick; success/skip resets; 0 disables)")
+      "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps), the "
+      "consecutive-failure breaker (K unbroken failures abort the tick; success/skip resets; 0 disables), "
+      "and the read-only scores report (--scores: the pending queue's value curve)")

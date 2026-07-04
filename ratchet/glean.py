@@ -662,6 +662,10 @@ def main(argv=None) -> None:
                          f"chunks stay pending (default {block.BREAKER_ERRORS}; 0 disables)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list chunks that would be processed (skips done); no LLM calls")
+    ap.add_argument("--scores", action="store_true",
+                    help="read-only: the pending queue's priority-score distribution (stats + "
+                         "histogram + top/bottom items — what a capped tick buys); composes with "
+                         "--priority/--topic/--source-id; no LLM calls, no writes")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
@@ -682,6 +686,12 @@ def main(argv=None) -> None:
         targets = [args.hash]
     else:
         ap.error("give a chunkset hash, --source-id, or --all")
+
+    if args.scores:                               # read-only early-return, --dry-run's sibling: the
+        blk = GleanBlock(completer.make_cli_completer(args.model), model=args.model,   # completer is
+                         targets=targets, topic=args.topic)          # bound but never called (no LLM)
+        print(block.scores_report(blk, root=config.ensure_layout(), priority=args.priority))
+        return
 
     complete = completer.make_cli_completer(args.model)
     blk = GleanBlock(complete, model=args.model, targets=targets, topic=args.topic)

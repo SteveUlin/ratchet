@@ -1211,6 +1211,10 @@ def main(argv=None) -> None:
                          "consolidated event (idempotent; combine with --dry-run to preview)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list the priority-ordered working set + pool sizes; no LLM calls, no writes")
+    ap.add_argument("--scores", action="store_true",
+                    help="read-only: the pending working set's salience distribution (stats + "
+                         "histogram + top/bottom events — what a capped tick buys); composes with "
+                         "--priority/--topic/--min-confidence; no LLM calls, no writes")
     ap.add_argument("--show", action="store_true", help="print each minted/corroborated claim")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-event progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
@@ -1239,6 +1243,13 @@ def main(argv=None) -> None:
               f"{'would reopen' if args.dry_run else 'reopened'} {len(reopened)} consolidated event(s)")
         if not args.dry_run and reopened:
             print("  drain the reopened backlog with `resolve --no-forget` until pending hits 0 (§7.3)")
+        return
+
+    if args.scores:                                    # read-only early-return, --dry-run's sibling:
+        root = config.ensure_layout()                  # the pending queue's value curve. The block is
+        blk = ResolveBlock(completer.make_cli_completer(args.model), model=args.model,  # built exactly
+                           min_confidence=args.min_confidence, topic=args.topic)  # as run() would (its
+        print(block.scores_report(blk, root=root, priority=args.priority))  # completer never fires)
         return
 
     if args.dry_run:                                   # eyeball the queue + pool before spending
