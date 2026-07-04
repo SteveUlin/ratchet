@@ -169,6 +169,28 @@ def clean_kind(v) -> str:
     see CONCEPT_KINDS above). The coercion idiom of `_clean_relation`/`clean_score`, for the typology."""
     return v if v in CONCEPT_KINDS else KIND_BEHAVIORAL
 
+
+# The concept SCOPE (ADR-0030) — the kind's mirror axis: WHERE a lesson applies, not what shape it
+# has. A lesson about one repo's harness belongs in THAT repo's CLAUDE.md, not the global one. Unlike
+# kind, no LLM proposes: the proposal DERIVES deterministically from the claim's live evidence's
+# subject keys (`resolve.scope_repo_of` — every quote in one repo → that repo's label; 2+ repos or
+# none → `global`, because a multi-repo lesson is de facto general and pinning narrower is what the
+# reviewer's override is for). The same trust boundary as kind: the derivation is a default, the
+# accept records the confirmed scope (`--scope` overrides), and review's `set_scope` re-scopes later,
+# outranking the accept in the fold below. The vocabulary is OPEN — any repo label the reviewer
+# names — so the only guard is emptiness, never membership.
+SCOPE_GLOBAL = "global"
+VERB_SET_SCOPE = "set_scope"   # review's re-scoping decision verb — written there, folded here
+
+
+def clean_scope(v) -> str:
+    """Coerce a scope to the open vocabulary's one invariant — a non-empty label. Absent/blank →
+    `global` (a lesson with no stated home applies everywhere; narrowing it is the reviewer's
+    explicit call). `clean_kind`'s sibling, minus the closed-set check: repo labels are free text."""
+    s = v.strip() if isinstance(v, str) else ""
+    return s or SCOPE_GLOBAL
+
+
 ROUTE_SYSTEM = (
     "You are the ROUTER for a developer's long-term memory. A new OBSERVATION arrived from a Claude "
     "Code session; you are shown the CURRENT CATALOG of takeaways the memory already holds. Decide "
@@ -250,6 +272,36 @@ def concept_kinds(root: Path | None = None) -> dict[str, str]:
     return out
 
 
+def concept_scopes(root: Path | None = None) -> dict[str, str]:
+    """concept id → its reviewer-confirmed SCOPE, folded from DECISIONS only (ADR-0030) —
+    `concept_kinds`' mirror on the scope axis, same precedence for the same reason: the latest
+    `set_scope` decision targeting the concept outranks the `scope` the latest accept/edit recorded,
+    because re-scoping is a LATER, deliberate call on the same trust boundary. A concept in neither
+    map is absent here and defaults `global` at the caller (legacy concepts predate the axis). The
+    vocabulary is open, so the fold keeps any non-blank label; blank/foreign decisions are skipped."""
+    root = root or config.data_root()
+    set_best: dict[str, tuple[tuple[str, str], str]] = {}
+    acc_best: dict[str, tuple[tuple[str, str], str]] = {}
+    for d in blobstore.decisions_for(None, root):
+        s = d.get("scope")
+        if not isinstance(s, str) or not s.strip():
+            continue                                   # scope-less (legacy) or blank — nothing to fold
+        s = s.strip()
+        key = (d.get("fetched_at", ""), d.get("content_hash", ""))
+        verb = d.get("verb")
+        if verb == VERB_SET_SCOPE and isinstance(d.get("target"), str):
+            t = d["target"]
+            if t not in set_best or key > set_best[t][0]:
+                set_best[t] = (key, s)
+        elif verb in ("accept", "edit") and isinstance(d.get("concept"), str):
+            c = d["concept"]
+            if c not in acc_best or key > acc_best[c][0]:
+                acc_best[c] = (key, s)
+    out = {c: s for c, (_, s) in acc_best.items()}
+    out.update({c: s for c, (_, s) in set_best.items()})   # set_scope > accept — the later call wins
+    return out
+
+
 def load_concepts(root: Path | None = None) -> list[dict]:
     """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
     against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
@@ -259,11 +311,14 @@ def load_concepts(root: Path | None = None) -> list[dict]:
 
     Each returned concept carries a derived `kind` (ADR-0029): latest set_kind decision > the accept
     decision's kind > `behavioral` (the legacy default — concepts predating the facet shape conduct
-    until the reviewer says otherwise). Attached here, on the ONE valid-concept view, so every
-    consumer (generate's projection filter, status's census, review's listing) reads one derivation."""
+    until the reviewer says otherwise) — and a derived `scope` (ADR-0030, the same fold shape on the
+    open vocabulary): latest set_scope > the accept's scope > `global`. Attached here, on the ONE
+    valid-concept view, so every consumer (generate's projection filters, status's census, review's
+    listing) reads one derivation."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     kinds = concept_kinds(root)
+    scopes = concept_scopes(root)
     out: list[dict] = []
     for sid, h in blobstore.latest_by_kind("concept", root).items():
         d = decisions.get(sid)
@@ -275,6 +330,7 @@ def load_concepts(root: Path | None = None) -> list[dict]:
             continue
         if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
             obj["kind"] = kinds.get(obj["id"], KIND_BEHAVIORAL)
+            obj["scope"] = scopes.get(obj["id"], SCOPE_GLOBAL)
             out.append(obj)
     return out
 

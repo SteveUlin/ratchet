@@ -26,6 +26,11 @@ event → claim + edges), so the trust chain under test is genuine. The load-bea
     it on the DECISION (default = the proposal; --kind overrides — the reviewer's call is
     authoritative); `set_kind` re-kinds an existing concept and outranks the accept in the fold; a
     concept with no kind anywhere reads behavioral (the legacy default).
+  THE SCOPE AXIS (ADR-0030) — kind's mirror, derivation-proposed instead of LLM-proposed: the card's
+    `scope_repo` derives from the live evidence's subject keys (one repo → its label; 2+/none →
+    global); accept records the scope on the DECISION (default = the derivation; --scope overrides,
+    open vocabulary, blank refused); `set_scope` re-scopes an existing concept, outranks the accept,
+    latest wins, valid targets only; a concept with no scope anywhere reads global.
 
 Run: `python tests/test_review_claims.py` (throwaway dirs)."""
 import io
@@ -200,6 +205,8 @@ assert t["title"] == JJ_SEED, "the provisional title is the seed event's summary
 assert t["mature"] and "≥ bar" in t["rationale"], "the bar standing rides the card (ADR-0027)"
 assert t["scope"] == "cross-cutting" and t["subject"]["repos"] == ["alpha", "beta"], \
     "scope is SHOWN (soft signal, §3.4), never a veto"
+assert t["scope_repo"] == "global", \
+    "evidence spanning 2 repos derives scope_repo=global — a multi-repo lesson is de facto general (ADR-0030)"
 assert {e["quote"] for e in t["evidence"]} == {JJ_SEED, JJ_PARA}, "both tellings re-validate"
 assert all(e["verified"] for e in t["evidence"])
 assert t["contested"] is False and t["merge_suggestions"] == []
@@ -247,6 +254,8 @@ assert c["kind"] == "behavioral", "no proposal, no override → the legacy defau
 d2 = blobstore.latest_decision(claim_a["id"], RA)
 assert d2["verb"] == "accept" and d2["kind"] == "behavioral", \
     "the accept DECISION records the confirmed kind — the authoritative record (ADR-0029)"
+assert d2["scope"] == "global" and c["scope"] == "global", \
+    "…and the confirmed scope (ADR-0030): the two-repo derivation proposed global, the accept recorded it"
 assert [v["id"] for v in resolve.high_confidence_view(RA)] == [claim_a["id"]], \
     "accepted ∧ mature → the trusted view (§5)"
 print("OK 2 — accept mints the concept from the live-edge fold's re-validated spans; the claim leaves")
@@ -262,6 +271,8 @@ resolve.run(ResolveFake(["same-as-1"]), model="fake", forget=False, root=RB)
 claim_b = the_claim(RB)
 tb = review.pending(RB)[0]
 assert tb["scope"] == "local", "same repo → local scope"
+assert tb["scope_repo"] == "alpha", \
+    "every quote in ONE repo derives scope_repo=that repo — the lesson never left home (ADR-0030)"
 assert tb["audit"] is not None and tb["audit"]["disjoint"] is False, "no ⚠ on shared-subject evidence"
 assert all(r["disjoint"] is False for r in tb["audit"]["corroborations"]), \
     "⚠ fires ONLY on disjoint subjects — same-repo llm merges are audited but not flagged"
@@ -525,5 +536,86 @@ assert kinds_of(RK)["c-legacy"] == "behavioral", \
     "legacy concepts default behavioral — they keep shaping conduct until the reviewer says otherwise"
 print("OK 8 — kind: proposed on the card, confirmed on the accept decision (default = proposal, --kind")
 print("       overrides), re-kinded via set_kind (latest wins, valid targets only), legacy → behavioral.")
+
+
+# === 9. THE SCOPE AXIS (ADR-0030): derive → card → accept confirms → set_scope re-scopes ============
+# The kind facet's mirror image: the proposal comes from the EVIDENCE (deterministic — no LLM), the
+# reviewer's decision is authoritative, and the vocabulary is OPEN (free-text repo labels; blank refused).
+
+RS = use_store("s")
+seed_events([("s-s1", PYTEST, M_HI, 0.85, "claude-bus", None),   # one-repo evidence → its label
+             ("s-s2", RUFF, M_MID, 0.85, None, None)], RS)       # no-repo evidence → global
+resolve.run(ResolveFake(["none"]), model="fake", forget=False, root=RS)
+pool_s = {c["title"]: c for c in resolve.claim_pool(RS)}
+pid_s, rid_s = pool_s[PYTEST]["id"], pool_s[RUFF]["id"]
+
+def scopes_of(root):
+    return {c["id"]: c["scope"] for c in dream.load_concepts(root)}
+
+# (a) the DERIVATION proposes on the card: one repo → that repo's label; no repo → global.
+cards_s = {t["takeaway_id"]: t for t in review.pending(RS, maturity=0.5)}
+assert cards_s[pid_s]["scope_repo"] == "claude-bus", \
+    "all live evidence in one repo → the card proposes that repo's label"
+assert cards_s[rid_s]["scope_repo"] == "global", \
+    "evidence with no repo at all → global (a lesson with no known home applies everywhere)"
+
+# (b) accept DEFAULT follows the derivation; the decision is the authoritative record.
+cids = review.accept(pid_s, RS, assessment="a claude-bus-local lesson, faithfully quoted")
+assert scopes_of(RS)[cids] == "claude-bus", "accept default = the derived scope"
+ds = blobstore.latest_decision(pid_s, RS)
+assert ds["verb"] == "accept" and ds["scope"] == "claude-bus"
+
+# (c) --scope OVERRIDES the derivation (open vocabulary — any repo label) — through the CLI wiring.
+buf = io.StringIO()
+with redirect_stdout(buf):
+    review.main(["--accept", rid_s, "--scope", "claude-bus", "--json"])
+outs = json.loads(buf.getvalue())
+cidr_s = outs["concept"]
+assert outs["scope"] == "claude-bus" and scopes_of(RS)[cidr_s] == "claude-bus", \
+    "--scope claude-bus overrides a global derivation (pinning narrower is what the override is for)"
+
+# (d) scope is an OPEN vocabulary — free text is allowed; only an explicit BLANK is refused.
+try:
+    review.accept(rid_s, RS, scope="   ")
+    assert False, "an explicit empty --scope must raise — nothing can live at an unnamable place"
+except ValueError:
+    pass
+
+# (e) set_scope re-scopes an EXISTING concept and OUTRANKS the accept; the latest set_scope wins.
+review.set_scope(cids, "global", RS, reason="it generalizes after all")
+assert scopes_of(RS)[cids] == "global", "set_scope > the accept's scope (the later, deliberate call)"
+buf = io.StringIO()
+with redirect_stdout(buf):
+    review.main(["--set-scope", cids, "my.weird_repo-2", "--reason", "no — it is repo-local"])
+assert "re-scoped → my.weird_repo-2" in buf.getvalue()
+assert scopes_of(RS)[cids] == "my.weird_repo-2", \
+    "the LATEST set_scope wins (append-only, latest decision in force) — and free-text labels are fine"
+
+# (f) guards: blank refused; valid targets only (a decision on a retired concept would resurrect it).
+for bad_call in (lambda: review.set_scope(cids, "  ", RS),
+                 lambda: review.set_scope("c-nope", "claude-bus", RS)):
+    try:
+        bad_call()
+        assert False, "set_scope must refuse a blank scope / unknown concept"
+    except ValueError:
+        pass
+review.retire(cidr_s, RS, reason="retired to prove the guard")
+try:
+    review.set_scope(cidr_s, "claude-bus", RS)
+    assert False, "set_scope on a retired concept must refuse — re-scoping is never an accidental un-retire"
+except ValueError:
+    pass
+assert cidr_s not in scopes_of(RS), "…and the retired concept stayed retired"
+
+# (g) LEGACY: a concept with no scope anywhere — no derivation, no accept-scope, no set_scope — reads global.
+legacy_s = {"id": "c-legacy-s", "title": "old concept", "statement": "predates the scope axis",
+            "evidence": [], "source_takeaway": "t-old-s"}
+blobstore.ingest(blobstore.canonical_json(legacy_s), source_kind="concept", source_id="c-legacy-s",
+                 origin_ref={"stage": "test"}, root=RS)
+assert scopes_of(RS)["c-legacy-s"] == "global", \
+    "legacy concepts default global — they apply everywhere until the reviewer says otherwise"
+print("OK 9 — scope: derived on the card (one repo → its label; 2+/none → global), confirmed on the")
+print("       accept decision (default = derivation, --scope overrides, blank refused), re-scoped via")
+print("       set_scope (latest wins, valid targets only, open vocabulary), legacy → global.")
 
 print("\nall review-claims tests passed.")

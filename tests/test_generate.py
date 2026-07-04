@@ -4,9 +4,11 @@ provenance, then assert `generate.project` renders the expected TAG-LED, provena
 trailing `## general` bucket), `--apply` refreshes the region IN PLACE while preserving human content above
 AND below the markers, a target with the markers TWICE is REFUSED (ambiguous region — never clobber), a
 RETIRED concept vanishes on re-project (retraction-for-free), re-apply with unchanged concepts is
-byte-identical (idempotent), the empty store yields a clear empty projection, and the KIND filter
+byte-identical (idempotent), the empty store yields a clear empty projection, the KIND filter
 (ADR-0029) keeps `reference` concepts out of the default projection — stated in the region's kinds note
-— while `--kinds behavioral,reference` widens.
+— while `--kinds behavioral,reference` widens, and the SCOPE filter (ADR-0030) keeps repo-scoped
+concepts out of the global projection — stated in the region's scope note — while `--repo X` projects
+exactly that repo's behavioral concepts and an unknown `--repo` is refused with the scopes present.
 
 generate is the mechanical projection that CLOSES THE LOOP (concept → CLAUDE.md); no LLM, so this whole suite
 runs offline.
@@ -210,8 +212,9 @@ assert generate.START in ftext and generate.END in ftext, "the region is created
 
 empty = config.ensure_layout(Path(tempfile.mkdtemp(prefix="ratchet-test-generate-empty-")))
 pe = generate.project(empty)
-assert pe == f"{generate.START}\n<!-- kinds: behavioral -->\n{generate.EMPTY_BODY}\n{generate.END}", \
-    f"the empty store yields a clear empty projection (kinds note + empty-body sentinel):\n{pe}"
+assert pe == (f"{generate.START}\n<!-- kinds: behavioral -->\n<!-- scope: global -->\n"
+              f"{generate.EMPTY_BODY}\n{generate.END}"), \
+    f"the empty store yields a clear empty projection (kinds+scope notes + empty-body sentinel):\n{pe}"
 assert "<!--" in pe and "## " not in pe, "no rules/headings, but a well-formed (idempotent) region"
 
 
@@ -253,5 +256,53 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     generate.main(["--dry-run", "--kinds", "behavioral,reference"])
 assert "<!-- c-f -->" in buf.getvalue(), "the CLI escape hatch reaches the projection"
+
+
+# === 8. the SCOPE filter (ADR-0030): repo-scoped concepts route via --repo, never into global =======
+# The kind filter's mirror on the WHERE axis. The scope lives on the reviewer's set_scope/accept
+# DECISION, never the blob — same fold as kind, open vocabulary.
+
+mint_concept("c-g", "fleet fact", "Restart the fleet harness after config changes.", [ch3])
+review.set_scope("c-g", "beta", R, reason="a beta-local lesson — belongs in beta's CLAUDE.md")
+
+p8 = generate.project(R)
+assert "<!-- c-g -->" not in p8 and "Restart the fleet harness" not in p8, \
+    "a repo-scoped concept is EXCLUDED from the global projection — it belongs in ITS repo's CLAUDE.md"
+assert "scope: global — 1 concept(s) scoped to a repo (beta×1)" in p8, \
+    f"the region's scope note states the filter and where the rest live:\n{p8}"
+
+p8r = generate.project(R, scope="beta")
+assert "Restart the fleet harness after config changes. <!-- c-g -->" in p8r, \
+    "--repo beta projects the beta-scoped behavioral concept"
+assert "<!-- c-a -->" not in p8r and "<!-- c-d -->" not in p8r and "<!-- c-e -->" not in p8r, \
+    "…and EXACTLY that repo's concepts — the global ones stay in the global region"
+assert "scope: beta" in p8r, f"the repo region names itself:\n{p8r}"
+assert generate.project(R, scope="beta") == p8r, "the scoped projection is deterministic too"
+
+# an unknown --repo is REFUSED with the scopes present (ADR-0027: a typo must not project nothing).
+try:
+    generate.project(R, scope="nope")
+    assert False, "a --repo matching no concept's scope must raise"
+except ValueError as e:
+    assert "scopes present" in str(e) and "beta×1" in str(e) and "global×" in str(e), \
+        f"the refusal lists what to type instead: {e}"
+raised = False
+try:
+    generate.main(["--dry-run", "--repo", "nope"])
+except SystemExit:
+    raised = True
+assert raised, "the CLI surfaces the bad --repo cleanly (SystemExit, not a traceback)"
+
+# projected_concepts (the faithfulness context) tracks the SAME scope filter as the region.
+assert "c-g" not in {c["id"] for c in generate.projected_concepts(R)}, \
+    "the default faithfulness context is global-only, like the region"
+beta_rows = generate.projected_concepts(R, scope="beta")
+assert [c["id"] for c in beta_rows] == ["c-g"] and beta_rows[0]["scope"] == "beta", \
+    "--repo's faithfulness context is exactly that repo's projected concepts, each carrying its scope"
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    generate.main(["--dry-run", "--repo", "beta"])
+assert "<!-- c-g -->" in buf.getvalue(), "the CLI --repo routing reaches the projection"
 
 print("test_generate: all assertions passed")

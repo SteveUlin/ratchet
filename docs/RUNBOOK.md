@@ -85,6 +85,7 @@ The claim card is an audit surface, not just a summary:
 - **Merge suggestions** ride the cards (residue-band pairs, quotes side by side, TTL'd, stored nowhere): confirm `--merge-claims <loser> <winner>`, dismiss `--reject-merge A,B`.
 - **`--contested`** — near-bar claims carrying a live contradicts edge, so one wrong LLM CONTRADICTS verdict can't silently suppress a good claim.
 - **Kind** — synthesize proposes `behavioral` (shapes conduct → projected into CLAUDE.md) or `reference` (a fact to look up — kept, never projected by default). `--accept` records it (`--kind` overrides); `--set-kind <concept> <kind>` re-kinds a concept accepted earlier (ADR-0029).
+- **Scope** — the evidence proposes *where* the lesson applies (no LLM): every quote in one repo → that repo's label; 2+ repos or none → `global`. The card shows `SCOPE: <repo> (derived)` when non-global. `--accept` records it (`--scope` overrides, any repo label); `--set-scope <concept> <repo|global>` re-scopes a concept accepted earlier (ADR-0030).
 
 **7 · Garden — reorganize the concept layer** *(periodic).* Once concepts have accumulated, tidy them: tag, then propose merges / splits / abstractions / retires, and flag stale ones. Low-stakes auto-applies; the rest queues for review². Run occasionally, not every tick.
 
@@ -103,11 +104,13 @@ ratchet review --accept-proposal <id>
 ratchet review --reject-proposal <id> --reason "…"
 ```
 
-**9 · Generate — project concepts → CLAUDE.md.** Refreshed from your reviewed concepts each run; a retired concept's rule *vanishes*. Projects **behavioral** concepts only — reference facts are lookup material, not rules (`--kinds behavioral,reference` widens; the region's header states the filter). The diff is your final gate.
+**9 · Generate — project concepts → CLAUDE.md.** Refreshed from your reviewed concepts each run; a retired concept's rule *vanishes*. Projects **behavioral ∧ global** concepts only — reference facts are lookup material, not rules (`--kinds behavioral,reference` widens), and a repo-scoped concept belongs in *that repo's* CLAUDE.md, not the global one (`--repo` routes it; the region's header states both filters). The diff is your final gate.
 
 ```
 ratchet generate --diff   --target ~/.claude/CLAUDE.md   # review the change
 ratchet generate --apply  --target ~/.claude/CLAUDE.md   # write it — only the marked region; your own content is untouched
+ratchet generate --diff  --repo claude-bus --target ~/claude-bus/CLAUDE.md   # a repo's own region: behavioral ∧ scope=claude-bus
+ratchet generate --apply --repo claude-bus --target ~/claude-bus/CLAUDE.md   # (an unknown --repo is refused, with the scopes present)
 ```
 
 > The default target is a *safe staged file* — you point `--target` at a real CLAUDE.md deliberately. To craft the wording with Claude rather than a mechanical render, use `/ratchet-generate`.

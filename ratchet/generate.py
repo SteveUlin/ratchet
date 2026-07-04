@@ -26,8 +26,9 @@ Three properties make the projection safe to run against a real CLAUDE.md:
     what lands in a real CLAUDE.md. The default `--target` is a STAGED path under the data root, so the
     default NEVER clobbers a real CLAUDE.md — the human points `--target` at one deliberately.
 
-Deferred (v1 is one marked CLAUDE.md region): skills / `.claude/rules/*`, repo-SCOPING (which CLAUDE.md
-a concept belongs to), and any LLM polish of the rule text — all deliberate follow-ups (ADR-0020).
+Repo-SCOPING landed (ADR-0030): each concept carries a reviewer-confirmed scope, the default
+projection takes `global` only, and `--repo X` projects that repo's concepts for ITS CLAUDE.md
+(`--target ~/X/CLAUDE.md`). Still deferred (ADR-0020): skills / `.claude/rules/*`, LLM polish.
 """
 from __future__ import annotations
 
@@ -89,6 +90,45 @@ def _kinds_note(kinds: tuple[str, ...], excluded: Counter) -> str:
     ex = " · ".join(f"{excluded[k]} {k}" for k in dream.CONCEPT_KINDS if excluded.get(k))
     return (f"<!-- kinds: {shown} — {ex} concept(s) excluded: lookup material, not conduct "
             f"(kept + queryable; `--kinds` widens) -->")
+
+
+# The projection's SCOPE filter (ADR-0030), the kind filter's mirror on the WHERE axis: `global`
+# only by default — the global CLAUDE.md gets only what applies everywhere. A repo-scoped concept
+# (its reviewer-confirmed scope names a repo) is just as valid; it belongs in THAT repo's CLAUDE.md,
+# so `--repo X` projects behavioral ∧ scope=X instead (point `--target` at ~/X/CLAUDE.md). The
+# region's header states the filter beside the kinds note.
+
+def _normalize_scope(scope) -> str:
+    """Validate a scope selection: a blank scope is REFUSED (the flag is reviewer-facing; a typo
+    silently projecting nothing is the hidden-rule failure ADR-0027 forbids). The vocabulary is
+    open — the membership check against the store rides in `project` where the valid set is known."""
+    s = scope.strip() if isinstance(scope, str) else ""
+    if not s:
+        raise ValueError("--repo takes a repo label (a concept scope) — got an empty string")
+    return s
+
+
+def _scopes_present(scope_by_id: dict[str, str]) -> str:
+    """The helpful listing a refused `--repo` gets: every scope the valid set actually carries, with
+    counts — so the operator sees what to type instead of guessing (ADR-0027)."""
+    counts = Counter(scope_by_id.values())
+    order = sorted(counts, key=lambda s: (s != dream.SCOPE_GLOBAL, s))   # global first, then names
+    return ", ".join(f"{s}×{counts[s]}" for s in order) or "(no valid concepts)"
+
+
+def _scope_note(scope: str, excluded: Counter) -> str:
+    """The region's scope line, beside the kinds note: WHICH scope this projection carries and how
+    many concepts live elsewhere — a reader of the global CLAUDE.md learns that repo-local rules
+    exist without seeing them, and a repo's region names itself. Deterministic like `_kinds_note`."""
+    if not excluded:
+        return f"<!-- scope: {scope} -->"
+    order = sorted(excluded, key=lambda s: (s != dream.SCOPE_GLOBAL, s))
+    ex = " · ".join(f"{s}×{excluded[s]}" for s in order)
+    if scope == dream.SCOPE_GLOBAL:
+        return (f"<!-- scope: global — {sum(excluded.values())} concept(s) scoped to a repo ({ex}): "
+                f"repo-local lessons; `--repo <name>` projects them into that repo's CLAUDE.md -->")
+    return (f"<!-- scope: {scope} — this repo's view; {sum(excluded.values())} concept(s) "
+            f"elsewhere ({ex}) -->")
 
 
 def default_target(root: Path | None = None) -> Path:
@@ -158,31 +198,47 @@ def _render_body(ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def project(root: Path | None = None, *, kinds: tuple[str, ...] = DEFAULT_KINDS) -> str:
-    """The MECHANICAL projection — the full marked region (START + kinds note + tag-led rule body + END)
-    for the current VALID concept set of the selected `kinds` (behavioral-only by default — see
-    DEFAULT_KINDS; the note line states the filter and what it excluded). Built from
-    `concepts.digest_context` (ONE facet pass — the gardener's managed tags ride on each node's facets,
-    so the primary-tag grouping reads straight off it), so retraction is automatic: a concept absent
-    from the valid set is absent here, and so is one the reviewer re-kinds `reference` (`--set-kind`).
-    Deterministic — same store → byte-identical region — so `--apply` with unchanged concepts is a
-    no-op. NO LLM."""
+def project(root: Path | None = None, *, kinds: tuple[str, ...] = DEFAULT_KINDS,
+            scope: str = dream.SCOPE_GLOBAL) -> str:
+    """The MECHANICAL projection — the full marked region (START + kinds note + scope note + tag-led
+    rule body + END) for the current VALID concept set of the selected `kinds` (behavioral-only by
+    default — see DEFAULT_KINDS) and `scope` (global by default — see the scope-filter note above;
+    both header lines state their filter and what it excluded). Built from `concepts.digest_context`
+    (ONE facet pass — the gardener's managed tags ride on each node's facets, so the primary-tag
+    grouping reads straight off it), so retraction is automatic: a concept absent from the valid set
+    is absent here, and so is one the reviewer re-kinds `reference` (`--set-kind`) or re-scopes to a
+    repo (`--set-scope`). A `scope` naming NO concept's scope is REFUSED with the scopes present —
+    a typo'd --repo silently projecting nothing would be a hidden rule (ADR-0027). Deterministic —
+    same store → byte-identical region — so `--apply` with unchanged concepts is a no-op. NO LLM."""
     kinds = _normalize_kinds(kinds)
+    scope = _normalize_scope(scope)
     ctx = concepts.digest_context(root or config.data_root())
-    # each node's derived kind rides ctx["blobs"] (dream.load_concepts attaches it); a node whose blob
-    # is gone reads behavioral — the recall-safe default (rendered, caught at the diff gate).
+    # each node's derived kind/scope rides ctx["blobs"] (dream.load_concepts attaches them); a node
+    # whose blob is gone reads behavioral/global — the recall-safe defaults (rendered, caught at the
+    # diff gate). SCOPE filters first (where does it apply), kinds second (does it shape conduct),
+    # so each note counts exactly its own exclusions — the two partition the drop.
     kind_of = {cid: dream.clean_kind(ctx["blobs"].get(cid, {}).get("kind")) for cid in ctx["by_node"]}
-    excluded = Counter(k for k in kind_of.values() if k not in kinds)
-    ctx = {**ctx, "by_node": {cid: n for cid, n in ctx["by_node"].items() if kind_of[cid] in kinds}}
-    return f"{START}\n{_kinds_note(kinds, excluded)}\n{_render_body(ctx)}\n{END}"
+    scope_of = {cid: dream.clean_scope(ctx["blobs"].get(cid, {}).get("scope")) for cid in ctx["by_node"]}
+    if scope != dream.SCOPE_GLOBAL and scope not in scope_of.values():
+        raise ValueError(f"--repo {scope!r} matches no concept's scope — scopes present: "
+                         f"{_scopes_present(scope_of)}")
+    scope_excluded = Counter(s for s in scope_of.values() if s != scope)
+    in_scope = {cid for cid, s in scope_of.items() if s == scope}
+    kind_excluded = Counter(kind_of[cid] for cid in in_scope if kind_of[cid] not in kinds)
+    ctx = {**ctx, "by_node": {cid: n for cid, n in ctx["by_node"].items()
+                              if cid in in_scope and kind_of[cid] in kinds}}
+    return (f"{START}\n{_kinds_note(kinds, kind_excluded)}\n{_scope_note(scope, scope_excluded)}\n"
+            f"{_render_body(ctx)}\n{END}")
 
 
 # --- the faithfulness context: each projected concept's statement + verified evidence -------------
 
 def projected_concepts(root: Path | None = None, *,
-                       kinds: tuple[str, ...] = DEFAULT_KINDS) -> list[dict]:
+                       kinds: tuple[str, ...] = DEFAULT_KINDS,
+                       scope: str = dream.SCOPE_GLOBAL) -> list[dict]:
     """The FAITHFULNESS context for the projection — each VALID concept (the ones the region renders:
-    same `kinds` filter as `project`, behavioral-only by default), paired with the verified EVIDENCE
+    same `kinds` + `scope` filters as `project`, behavioral ∧ global by default, same unknown-scope
+    refusal), paired with the verified EVIDENCE
     behind its statement. Read-only, NO LLM: `valid_concepts` enriched
     with the `concepts.digest_context` facets (`repos`/`tags` — the grouping + repo-trigger inputs) and
     `review.resolve_evidence` (spans RE-VALIDATED, a stale one dropped — the same verified quotes the
@@ -195,11 +251,17 @@ def projected_concepts(root: Path | None = None, *,
     matches the convention used for the other cross-module reads and keeps the module's import graph flat."""
     from . import review                         # function-local: review serves the canonical evidence resolver
     kinds = _normalize_kinds(kinds)
+    scope = _normalize_scope(scope)
     root = root or config.data_root()
     by_node = concepts.digest_context(root)["by_node"]
+    valid = sorted(review.valid_concepts(root), key=lambda c: c["id"])
+    scope_of = {c["id"]: dream.clean_scope(c.get("scope")) for c in valid}
+    if scope != dream.SCOPE_GLOBAL and scope not in scope_of.values():
+        raise ValueError(f"--repo {scope!r} matches no concept's scope — scopes present: "
+                         f"{_scopes_present(scope_of)}")
     out: list[dict] = []
-    for c in sorted(review.valid_concepts(root), key=lambda c: c["id"]):
-        if dream.clean_kind(c.get("kind")) not in kinds:
+    for c in valid:
+        if scope_of[c["id"]] != scope or dream.clean_kind(c.get("kind")) not in kinds:
             continue                             # the region doesn't render it → nothing to be faithful to
         facets = by_node.get(c["id"], {}).get("facets", {})
         out.append({
@@ -207,6 +269,7 @@ def projected_concepts(root: Path | None = None, *,
             "title": c.get("title", ""),
             "statement": c.get("statement", ""),
             "kind": c["kind"],
+            "scope": scope_of[c["id"]],
             "repos": facets.get("repos") or [],
             "tags": facets.get("tags") or [],
             "evidence": review.resolve_evidence(c, root),   # pointers → re-validated verbatim quotes
@@ -254,7 +317,7 @@ def _splice(text: str, region: str) -> tuple[str, str]:
 
 
 def apply(root: Path | None = None, *, target: Path | str | None = None,
-          kinds: tuple[str, ...] = DEFAULT_KINDS) -> dict:
+          kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = dream.SCOPE_GLOBAL) -> dict:
     """Write the projection into `target`'s marked region (refresh-in-place). Reads the current file (or ""
     when absent), splices in `project(root)`, writes only when the bytes CHANGE (so re-apply with unchanged
     concepts touches nothing). The staged default target is created on demand; a real CLAUDE.md is written
@@ -262,7 +325,7 @@ def apply(root: Path | None = None, *, target: Path | str | None = None,
     root = root or config.data_root()
     tgt = Path(target) if target is not None else default_target(root)
     old = tgt.read_text() if tgt.exists() else ""
-    new, action = _splice(old, project(root, kinds=kinds))
+    new, action = _splice(old, project(root, kinds=kinds, scope=scope))
     tgt.parent.mkdir(parents=True, exist_ok=True)
     changed = new != old
     if changed:
@@ -271,13 +334,13 @@ def apply(root: Path | None = None, *, target: Path | str | None = None,
 
 
 def diff(root: Path | None = None, *, target: Path | str | None = None,
-         kinds: tuple[str, ...] = DEFAULT_KINDS) -> str:
+         kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = dream.SCOPE_GLOBAL) -> str:
     """A unified diff of the PROPOSED region vs the target's CURRENT one — what `--apply` would change, for
     the human to review BEFORE applying (the second review tier). Empty string when they already match."""
     root = root or config.data_root()
     tgt = Path(target) if target is not None else default_target(root)
     old = tgt.read_text() if tgt.exists() else ""
-    proposed = project(root, kinds=kinds)
+    proposed = project(root, kinds=kinds, scope=scope)
     lines = difflib.unified_diff(current_region(old).split("\n"), proposed.split("\n"),
                                  fromfile=f"{tgt} (current region)", tofile=f"{tgt} (proposed region)",
                                  lineterm="")
@@ -310,24 +373,32 @@ def main(argv=None) -> None:
                          f"lookup material; it stays valid and queryable (review --concepts), it just "
                          f"doesn't spend CLAUDE.md attention. `--kinds "
                          f"{','.join(dream.CONCEPT_KINDS)}` widens (ADR-0029)")
+    ap.add_argument("--repo", metavar="REPO",
+                    help=f"project ONLY concepts scoped to this repo (default: {dream.SCOPE_GLOBAL} "
+                         f"— the global CLAUDE.md gets only what applies everywhere). A repo-scoped "
+                         f"concept belongs in that repo's own CLAUDE.md: pair `--repo X` with "
+                         f"`--target ~/X/CLAUDE.md`. A repo no concept is scoped to is refused, "
+                         f"with the scopes present (ADR-0030)")
     args = ap.parse_args(argv)
     root = config.data_root()
     target = args.target            # None → the staged default, resolved inside apply/diff
 
-    try:                                # a corrupted/ambiguous target region or a bad --kinds raises —
+    try:                                # a corrupted/ambiguous target region, a bad --kinds, or an
         kinds = tuple(s.strip() for s in args.kinds.split(",") if s.strip())
-        if args.apply:                  # surface it cleanly, not as a traceback; the file is never
-            res = apply(root, target=target, kinds=kinds)                 # written on the raise path
-            print(f"{res['action']} ratchet region in {res['target']}"
-                  + ("" if res["changed"] else " (no change — byte-identical)"))
+        scope = args.repo if args.repo is not None else dream.SCOPE_GLOBAL
+        if args.apply:                  # unmatched --repo raises — surface it cleanly, not as a
+            res = apply(root, target=target, kinds=kinds, scope=scope)    # traceback; the file is
+            print(f"{res['action']} ratchet region in {res['target']}"    # never written on the
+                  + ("" if res["changed"] else " (no change — byte-identical)"))     # raise path
         elif args.concepts:
-            print(json.dumps(projected_concepts(root, kinds=kinds), ensure_ascii=False, indent=2))
+            print(json.dumps(projected_concepts(root, kinds=kinds, scope=scope),
+                             ensure_ascii=False, indent=2))
         elif args.diff:
-            d = diff(root, target=target, kinds=kinds)
+            d = diff(root, target=target, kinds=kinds, scope=scope)
             tgt = target if target is not None else default_target(root)
             print(d if d.strip() else f"no changes — {tgt}'s region already matches the projection")
         else:
-            print(project(root, kinds=kinds))
+            print(project(root, kinds=kinds, scope=scope))
     except ValueError as e:
         raise SystemExit(f"generate: {e}")
 

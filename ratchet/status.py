@@ -21,7 +21,9 @@ could desync):
             the live edge census (llm-adjudicated vs total — how much of the graph the matcher
             built vs $0 seeds).
   REVIEW    tier-1 pending + incubating, tier-2 open structural-op proposals.
-  CONCEPTS  the valid set, split by kind (behavioral — the generate surface — vs reference, ADR-0029).
+  CONCEPTS  the valid set, split by kind (behavioral — the generate surface — vs reference,
+            ADR-0029) and by scope (repo-scoped concepts route to their repo's CLAUDE.md via
+            `generate --repo`, ADR-0030 — counted per repo when any exist).
   GENERATE  would the projected region be non-empty (generate's own `project`, never written).
 
 Every section DEGRADES to zeros: a stage with no data (or a mid-edit module) prints a zero-line,
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 from . import blobstore, block, chunk, config, dream, glean, resolve, tap, weave
@@ -48,7 +51,7 @@ ZEROS: dict[str, dict] = {
     "claims": {"total": 0, "active": 0, "dormant": 0, "mature": 0, "awaiting_synthesize": 0,
                "accepted": 0, "contested": 0, "edges": 0, "llm_edges": 0},
     "review": {"pending": 0, "incubating": 0, "proposals": 0},
-    "concepts": {"valid": 0, "behavioral": 0, "reference": 0},
+    "concepts": {"valid": 0, "behavioral": 0, "reference": 0, "scoped": 0, "scopes": {}},
     "generate": {"region_nonempty": False, "rules": 0},
 }
 
@@ -153,11 +156,16 @@ def _review(root: Path, maturity: float) -> dict:
 
 def _concepts(root: Path) -> dict:
     """The valid set, split by KIND (ADR-0029) — behavioral is what generate projects by default;
-    reference is kept lookup material. Same derivation the projection filters on (`load_concepts`
-    attaches each concept's decision-folded kind), so the split and the region always agree."""
+    reference is kept lookup material — and by SCOPE (ADR-0030): a repo-scoped concept sits out of
+    the global projection and routes via `generate --repo`. Same derivation the projection filters
+    on (`load_concepts` attaches each concept's decision-folded kind + scope), so the splits and
+    the region always agree."""
     cs = dream.load_concepts(root)
     ref = sum(1 for c in cs if c.get("kind") == dream.KIND_REFERENCE)
-    return {"valid": len(cs), "behavioral": len(cs) - ref, "reference": ref}
+    scopes = Counter(dream.clean_scope(c.get("scope")) for c in cs)
+    scopes.pop(dream.SCOPE_GLOBAL, None)
+    return {"valid": len(cs), "behavioral": len(cs) - ref, "reference": ref,
+            "scoped": sum(scopes.values()), "scopes": dict(sorted(scopes.items()))}
 
 
 def _generate(root: Path) -> dict:
@@ -203,7 +211,10 @@ def render(c: dict, *, datastore: Path, maturity: float) -> str:
         f"          edges: {cl['edges']} live · {cl['llm_edges']} by llm",
         f"REVIEW    tier-1: {rv['pending']} pending · {rv['incubating']} incubating · "
         f"tier-2: {rv['proposals']} proposal(s)",
-        f"CONCEPTS  {co['valid']} valid ({co['behavioral']} behavioral · {co['reference']} reference)",
+        f"CONCEPTS  {co['valid']} valid ({co['behavioral']} behavioral · {co['reference']} reference"
+        + (f"; {co['scoped']} scoped: "
+           + " · ".join(f"{r}×{n}" for r, n in co["scopes"].items()) if co["scoped"] else "")
+        + ")",
         f"GENERATE  region would be {'NON-EMPTY' if g['region_nonempty'] else 'empty'}"
         + (f" ({g['rules']} rule(s))" if g["region_nonempty"] else ""),
     ]

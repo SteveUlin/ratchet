@@ -404,6 +404,18 @@ def scope_of(subj_keys: list[dict]) -> str:
     return "cross-cutting" if len(repos) >= 2 and not shared_file else "local"
 
 
+def scope_repo_of(subj_keys: list[dict]) -> str:
+    """The DERIVED scope proposal (ADR-0030), recomputed from the corroborating events' subject keys:
+    every piece of live evidence in ONE repo → that repo's label (the lesson never left home — it
+    belongs in that repo's CLAUDE.md); 2+ repos or no repo at all → `global` (a lesson seen across
+    repos is de facto general, and one with no known home applies everywhere — pinning narrower is
+    exactly what review's `--scope` override is for). Deterministic, no LLM — the mirror of kind's
+    synthesize-proposes step: here the EVIDENCE proposes, and the reviewer's decision is what a
+    concept's scope actually reads from (`dream.concept_scopes`)."""
+    repos = {k.get("repo") for k in subj_keys if k.get("repo")}
+    return next(iter(repos)) if len(repos) == 1 else dream.SCOPE_GLOBAL
+
+
 def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dict, blobs: dict,
                 sessions: dict, subj_cache: dict, root: Path) -> dict:
     """One claim's DERIVED view (§2.1): the stored blob is seed identity only; support, sessions,
@@ -500,6 +512,7 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         "subject": {"repos": sorted({k["repo"] for k in subj_keys if k.get("repo")}),
                     "files": sorted({f for k in subj_keys for f in (k.get("files") or ())})},
         "scope": scope_of(subj_keys),
+        "scope_repo": scope_repo_of(subj_keys),        # the derived scope proposal (ADR-0030)
         "stmt_shingles": frozenset(shingles),
         "stmt_entropy": ent,
         "_subj_keys": subj_keys,                       # in-memory only: the in-batch scope recompute
@@ -1049,7 +1062,8 @@ class ResolveBlock:
             "confidence": completer.clean_score(rv.event.get("confidence"), 0.5),
             "subject": {"repos": [ev_subj["repo"]] if ev_subj.get("repo") else [],
                         "files": sorted(ev_subj.get("files") or ())},
-            "scope": "local", "stmt_shingles": frozenset(ev_sh) | sig.char_shingles(summary),
+            "scope": "local", "scope_repo": scope_repo_of([ev_subj]),
+            "stmt_shingles": frozenset(ev_sh) | sig.char_shingles(summary),
             "stmt_entropy": ev_ent, "_subj_keys": [ev_subj],
         }
         self._pool_by_id[cid] = view                   # the in-batch fold: next event reads this claim
@@ -1079,6 +1093,7 @@ class ResolveBlock:
         view["subject"] = {"repos": sorted({k["repo"] for k in view["_subj_keys"] if k.get("repo")}),
                            "files": sorted({f for k in view["_subj_keys"] for f in (k.get("files") or ())})}
         view["scope"] = scope_of(view["_subj_keys"])
+        view["scope_repo"] = scope_repo_of(view["_subj_keys"])
         for f in _claim_facets(view):
             self._idx["facets"].setdefault(f, set()).add(view["id"])
         em = dream._event_markers(rv.event)

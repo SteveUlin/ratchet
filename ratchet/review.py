@@ -28,7 +28,9 @@ corroboration's verified quote next to the match key the resolver persisted (the
 the reviewer audits the acceptance layer with the same evidence the model saw); a "why pending" badge
 keeps a matured-but-unsynthesized claim VISIBLE (review never blocks on synthesize's cadence); the
 card carries synthesize's PROPOSED kind (behavioral vs reference, ADR-0029) which `--accept` confirms
-on the decision (`--kind` overrides; `--set-kind` re-kinds an existing concept — the backfill verb);
+on the decision (`--kind` overrides; `--set-kind` re-kinds an existing concept — the backfill verb)
+and the DERIVED scope proposal (which repo the evidence lives in, ADR-0030) which `--accept` likewise
+confirms (`--scope` overrides; `--set-scope` re-scopes an existing concept);
 CONTESTED claims near the bar surface via `--contested`; merge SUGGESTIONS are a derived render-time
 query over residue-band claim pairs (§2.2 — zero stored state, nothing can harden); the human "not the
 same" verdict is the ONE compound `reject-merge` decision (`resolve.reject_merge` — review-only by
@@ -350,6 +352,10 @@ def _present_claim(c: dict, root: Path, *, context_bytes: int, mats: dict, valid
         "markers": c.get("markers") or {},
         "confidence": c.get("confidence"),
         "scope": c.get("scope"),                       # shown, never wired to a second bar (§3.4)
+        # the DERIVED scope proposal (ADR-0030) — which repo's CLAUDE.md this lesson belongs to,
+        # read off the live evidence (one repo → its label; 2+/none → global). --accept records it
+        # (--scope overrides), mirroring claim_kind's propose→confirm shape.
+        "scope_repo": c.get("scope_repo"),
         "subject": c.get("subject") or {"repos": [], "files": []},
         "contested": bool(c.get("contradicted_by")),   # a mature claim carrying a live contradiction
         "evidence": evidence,
@@ -725,7 +731,8 @@ def _mint_concept_id(takeaway: dict) -> str:
 
 def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = None,
            assessment: str = "", reviewer: str = "sulin", note: str = "",
-           kind: str | None = None, allow_no_evidence: bool = False) -> str:
+           kind: str | None = None, scope: str | None = None,
+           allow_no_evidence: bool = False) -> str:
     """Promote a takeaway to a concept (the loop closes here) and record the accept. The concept stores
     ONLY the evidence that re-validates *now* — exactly the verified spans the reviewer saw, never the
     raw (possibly malformed/stale) takeaway evidence — so the trust chain reaches the concept, the
@@ -734,8 +741,10 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     takeaway's `relation`: `strengthens`/`refines` an EXISTING concept → a new version of it; otherwise
     (incl. a stale/unknown concept_id) mint fresh. `edited` ({title?, why?}) corrects the synthesis
     before it becomes a concept, captured before/after. `kind` confirms/overrides the claim's proposed
-    typology (ADR-0029; default = the proposal, else behavioral) — recorded ON THE DECISION, where the
-    valid-concept view reads it (`dream.concept_kinds`), never on the blob. Returns the concept id.
+    typology (ADR-0029; default = the proposal, else behavioral) and `scope` confirms/overrides its
+    DERIVED scope (ADR-0030; default = the evidence-derived proposal, else global) — both recorded ON
+    THE DECISION, where the valid-concept view reads them (`dream.concept_kinds`/`concept_scopes`),
+    never on the blob. Returns the concept id.
 
     A v3 CLAIM accepts through the same door (§5 — review appends a decision FACET, nothing forks):
     the id resolves to the claim's LIVE-EDGE FOLD first (`_claim_view` — the stored blob is seed
@@ -760,6 +769,13 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     if kind is not None and kind not in dream.CONCEPT_KINDS:
         raise ValueError(f"--kind must be one of {dream.CONCEPT_KINDS}; got {kind!r}")
     kind = kind if kind is not None else dream.clean_kind(tk.get("kind"))
+    # the SCOPE the accept confirms (ADR-0030): the reviewer's explicit --scope wins; else the
+    # claim's DERIVED proposal (scope_repo — the evidence's repo, or global); else global (v2
+    # takeaways carry no derivation). The vocabulary is OPEN (any repo label), so only an explicit
+    # BLANK is refused — an empty scope is a reviewer's slip, never a namable place for a rule.
+    if scope is not None and not scope.strip():
+        raise ValueError("--scope must be a repo label or 'global' — got an empty string")
+    scope = scope.strip() if scope is not None else dream.clean_scope(tk.get("scope_repo"))
     rel = tk.get("relation") or {}
     known = dream.valid_concept_ids(root)
     concept_id = (rel["concept_id"] if rel.get("kind") in ("strengthens", "refines")
@@ -769,7 +785,8 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
                "evidence": evidence, "source_takeaway": takeaway_id}
     ch, _ = blobstore.ingest(blobstore.canonical_json(concept), source_kind="concept", source_id=concept_id,
                              origin_ref={"stage": "review", "reviewer": reviewer, "takeaway": takeaway_id}, root=root)
-    fields = {"concept": concept_id, "concept_hash": ch, "kind": kind, "reviewer": reviewer,
+    fields = {"concept": concept_id, "concept_hash": ch, "kind": kind, "scope": scope,
+              "reviewer": reviewer,
               "assessment": str(assessment)[:ASSESSMENT_MAX], "note": str(note)[:ASSESSMENT_MAX]}
     if edited:
         fields["edited"] = {"before": {"title": tk.get("title", ""), "why": tk.get("why", "")},
@@ -832,11 +849,32 @@ def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: st
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
+def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: str = "",
+              reviewer: str = "sulin") -> None:
+    """Re-SCOPE an EXISTING concept (ADR-0030) — `set_kind`'s twin on the scope axis, the reviewer-
+    owned append-only decision `valid_concepts` reads FIRST (latest set_scope > the accept's scope >
+    global). The backfill path for concepts accepted before the axis existed, and the correction path
+    when the derivation guessed wrong (e.g. a genuinely repo-local lesson whose evidence happens to
+    span repos). The vocabulary is OPEN — any repo label — so only a BLANK scope is refused (nothing
+    can live at an unnamable place); the target must be VALID for the same reason as set_kind: a
+    fresh decision on a retired concept would become its latest lifecycle decision and pull it back
+    into the valid set — re-scoping must never double as an accidental un-retire."""
+    root = root or config.data_root()
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError("scope must be a repo label or 'global' — got an empty string")
+    if concept_id not in dream.valid_concept_ids(root):
+        raise ValueError(f"no valid concept {concept_id!r} — set-scope targets the valid set only "
+                         f"(a decision on a retired concept would resurrect it)")
+    _record(dream.VERB_SET_SCOPE, concept_id, root, scope=scope.strip(),
+            reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
+
+
 def valid_concepts(root: Path | None = None) -> list[dict]:
     """The current valid concept set — what dream judges belief-change against and `generate` projects
     to skills/CLAUDE.md. Same derivation as `dream.load_concepts` (kept there to avoid a review→dream
     cycle); re-exported here for inspection. Each concept carries its derived `kind` (ADR-0029:
-    latest set_kind decision > the accept's kind > behavioral)."""
+    latest set_kind decision > the accept's kind > behavioral) and `scope` (ADR-0030: latest
+    set_scope decision > the accept's scope > global)."""
     return dream.load_concepts(root)
 
 
@@ -1037,6 +1075,10 @@ def main(argv=None) -> None:
                    help="re-kind an EXISTING concept (behavioral|reference) — an append-only reviewer "
                         "decision that outranks the kind recorded at accept; the backfill path for "
                         "concepts accepted before the typology (ADR-0029)")
+    g.add_argument("--set-scope", nargs=2, metavar=("CONCEPT", "SCOPE"),
+                   help="re-scope an EXISTING concept (a repo label, or 'global') — an append-only "
+                        "reviewer decision that outranks the scope recorded at accept; the backfill "
+                        "path for concepts accepted before the scope axis (ADR-0030)")
     g.add_argument("--concepts", action="store_true", help="the current valid concept set")
     g.add_argument("--proposals", action="store_true",
                    help="the structural-op proposal queue (3d: op + rationale + cited concepts' evidence)")
@@ -1070,6 +1112,11 @@ def main(argv=None) -> None:
                          "proposal, else behavioral). behavioral shapes conduct and projects into "
                          "CLAUDE.md; reference is a fact/mechanism kept for lookup, excluded from "
                          "generation by default (ADR-0029)")
+    ap.add_argument("--scope", metavar="REPO|global",
+                    help="accept with this scope, overriding the derived proposal (default: the "
+                         "repo the claim's evidence lives in, else global). A repo-scoped concept "
+                         "is excluded from the global projection and routed by `generate --repo` "
+                         "into that repo's CLAUDE.md (ADR-0030)")
     ap.add_argument("--allow-no-evidence", action="store_true",
                     help="accept a takeaway with no resolvable evidence (a deliberate, recorded override)")
     ap.add_argument("--assessment", default="", help="Claude's faithfulness assessment (recorded as provenance)")
@@ -1132,17 +1179,27 @@ def main(argv=None) -> None:
         if args.edit_why is not None:
             edited["why"] = args.edit_why
         cid = accept(args.accept, edited=edited or None, assessment=args.assessment, note=args.note,
-                     kind=args.kind, allow_no_evidence=args.allow_no_evidence)
-        kind = next((c["kind"] for c in valid_concepts() if c["id"] == cid), dream.KIND_BEHAVIORAL)
-        print(json.dumps({"accepted": args.accept, "concept": cid, "kind": kind, "edited": bool(edited)})
+                     kind=args.kind, scope=args.scope, allow_no_evidence=args.allow_no_evidence)
+        cv = next((c for c in valid_concepts() if c["id"] == cid), {})
+        kind = cv.get("kind", dream.KIND_BEHAVIORAL)
+        scope = cv.get("scope", dream.SCOPE_GLOBAL)
+        print(json.dumps({"accepted": args.accept, "concept": cid, "kind": kind, "scope": scope,
+                          "edited": bool(edited)})
               if args.json else f"accepted → concept {cid}"
                                 + (f" ({kind})" if kind != dream.KIND_BEHAVIORAL else "")
+                                + (f" (scope: {scope})" if scope != dream.SCOPE_GLOBAL else "")
                                 + (" (edited)" if edited else ""))
     elif args.set_kind:
         set_kind(args.set_kind[0], args.set_kind[1], reason=args.reason)
         print(f"concept {args.set_kind[0]} re-kinded → {args.set_kind[1]}"
               + ("" if args.set_kind[1] == dream.KIND_BEHAVIORAL
                  else " (kept + queryable; excluded from generate's default projection)"))
+    elif args.set_scope:
+        set_scope(args.set_scope[0], args.set_scope[1], reason=args.reason)
+        print(f"concept {args.set_scope[0]} re-scoped → {args.set_scope[1]}"
+              + ("" if args.set_scope[1] == dream.SCOPE_GLOBAL
+                 else " (out of the global projection; `generate --repo "
+                      f"{args.set_scope[1]}` routes it)"))
     elif args.reject:
         reject(args.reject, reason=args.reason, assessment=args.assessment)
         print(f"rejected {args.reject}")
@@ -1157,6 +1214,8 @@ def main(argv=None) -> None:
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
               else "\n".join(f"  {c['id']}  {c.get('title', '')}"
                              + (f"  [{c['kind']}]" if c.get("kind") != dream.KIND_BEHAVIORAL else "")
+                             + (f"  [scope: {c['scope']}]"
+                                if c.get("scope") not in (None, dream.SCOPE_GLOBAL) else "")
                              for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
         q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
@@ -1220,6 +1279,10 @@ def _print_queue(q: list[dict], *, total: int | None = None, incubating_count: i
         if t.get("claim_kind") == dream.KIND_REFERENCE:   # only the non-default is worth a card line
             print("  KIND: reference (proposed) — a fact/mechanism to look up, not conduct; kept but "
                   "excluded from generate's default projection. --accept records it; --kind overrides.")
+        if t.get("scope_repo") not in (None, dream.SCOPE_GLOBAL):   # same judgment: global is noise
+            print(f"  SCOPE: {t['scope_repo']} (derived) — every live quote sits in this repo; the "
+                  f"lesson belongs in its CLAUDE.md, not the global one (`generate --repo "
+                  f"{t['scope_repo']}`). --accept records it; --scope overrides.")
         if t.get("contested"):
             print("  ⚡ CONTESTED: carries a live contradiction — `--contested` shows the other side")
         for ev in t["evidence"]:
