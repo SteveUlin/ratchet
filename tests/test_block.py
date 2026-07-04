@@ -16,6 +16,11 @@ substrate's cross-cutting guarantees are pinned independent of any stage. The lo
     the end-state is IDENTICAL to serial (completion order invisible), the budget gate's overshoot is
     bounded (cap + up to `parallel` calls' cost — the leash), a block that hasn't opted in clamps to
     serial with a stderr note, and a raising item stays isolated mid-pool.
+  BREAKER — K CONSECUTIVE failures abort the tick (a systemic wall, not K flaky items): serial trips
+    at exactly K with earlier successes marked and the remainder pending; any success or skip resets
+    the count (scattered failures never trip); the pool stops dispatch and drains in-flight (bounded
+    extra collections); `breaker_errors=0` disables (the escape hatch). Loud: one stderr line + the
+    Report's `breaker_tripped`.
 
 Run: `python tests/test_block.py`."""
 import os
@@ -504,6 +509,7 @@ print("OK §13 — clamps: non-opted-in block runs serial (why on stderr); N cap
 
 
 # === 14. parallel error isolation: one raising item doesn't kill the tick or its siblings =============
+# (default breaker: 1 failure among 3 siblings never nears BREAKER_ERRORS — isolation, not a wall)
 r14 = fresh_root("par-boom")
 b14 = ParallelBlock(["g1", "BOOM", "g2", "g3"], boom_on=["BOOM"],
                     naps={"g1": 0.03, "g2": 0.02})
@@ -519,6 +525,88 @@ assert rep14.pending == 1, f"the errored item stays pending: {rep14}"
 print("OK §14 — parallel isolation: a mid-pool raise ticks errored, writes no marker, siblings commit")
 
 
+# === 15. the breaker (serial): K CONSECUTIVE failures abort the tick — a wall, not K flaky items ======
+# The failure mode this closes: the account's usage window goes up mid-run and every further LLM call
+# burns fast-fail retries + backoff against a dead seam (1,300+ consecutive doomed calls, live). From
+# item k onward EVERY process() raises; the breaker trips at exactly K, earlier successes stay marked,
+# the aborted remainder (errored + never-reached) is simply pending next tick, and the trip is LOUD:
+# `breaker_tripped` on the Report + one stderr line saying why.
+r15 = fresh_root("breaker")
+ok15 = ["w1", "w2"]
+bad15 = [f"x{i}" for i in range(8)]                 # the wall: everything from here on fails
+b15 = FakeBlock(ok15 + bad15 + ["z1", "z2", "z3"], boom_on=bad15)
+err15 = io.StringIO()
+with redirect_stderr(err15):
+    rep15 = block.run(b15, root=r15, breaker_errors=5, progress=None)
+assert rep15.breaker_tripped, f"the breaker tripped: {rep15}"
+assert rep15.errored == 5, f"exactly K=5 consecutive failures, then STOP (no 6th doomed call): {rep15}"
+assert rep15.examined == 7, f"2 successes + 5 failures examined; the tick ended there: {rep15}"
+assert rep15.processed == 2 and b15.processed_keys == ["w1", "w2"], "earlier successes landed"
+assert block.done_index("fake", r15) == {("w1", "v1"), ("w2", "v1")}, \
+    "earlier successes are marked; no aborted item got a marker"
+assert rep15.pending == 11, f"aborted items (5 errored + 6 never reached) are simply pending: {rep15}"
+line15 = err15.getvalue().strip()
+assert "5 consecutive errors" in line15 and "tripping the breaker" in line15 and \
+    "11 items left pending" in line15 and "usage window" in line15, \
+    f"the trip says why on stderr: {line15!r}"
+# recovery is the normal pending path: once the wall lifts (nothing booms), a re-run drains the rest.
+b15r = FakeBlock(ok15 + bad15 + ["z1", "z2", "z3"], boom_on=[])
+rep15r = block.run(b15r, root=r15, progress=None)
+assert rep15r.processed == 11 and rep15r.skipped == 2 and rep15r.pending == 0, \
+    f"next tick retries every aborted item (no marker was written): {rep15r}"
+print("OK §15 — breaker (serial): trips at exactly K, successes stay marked, remainder pending, loud")
+
+
+# === 16. the breaker resets on success/skip (scattered failures never trip); 0 disables ===============
+# The counter measures an UNBROKEN run — the wall signature — so any success or skip resets it: a
+# corpus with scattered bad items is isolation's job (§1/§7), never the breaker's.
+r16 = fresh_root("breaker-reset")
+b16 = FakeBlock(["f1", "s1", "f2", "s2", "f3", "s3"], boom_on=["f1", "f2", "f3"])
+rep16 = block.run(b16, root=r16, breaker_errors=2, progress=None)
+assert not rep16.breaker_tripped, f"alternating fail/success never reaches 2 consecutive: {rep16}"
+assert rep16.errored == 3 and rep16.processed == 3, f"every item attempted, failures isolated: {rep16}"
+
+r16b = fresh_root("breaker-skip")                   # a SKIP resets too (it breaks the unbroken run)
+block.run(FakeBlock(["mid"]), root=r16b, progress=None)              # mark "mid" done
+b16b = FakeBlock(["f1", "mid", "f2"], boom_on=["f1", "f2"])
+rep16b = block.run(b16b, root=r16b, breaker_errors=2, progress=None)
+assert not rep16b.breaker_tripped and rep16b.skipped == 1 and rep16b.errored == 2, \
+    f"fail, skip, fail — the skip reset the counter, no trip: {rep16b}"
+
+r16c = fresh_root("breaker-off")                    # breaker_errors=0 — the escape hatch: never trips
+all_bad = [f"d{i}" for i in range(block.BREAKER_ERRORS + 2)]         # more than the default K
+b16c = FakeBlock(all_bad, boom_on=all_bad)
+rep16c = block.run(b16c, root=r16c, breaker_errors=0, progress=None)
+assert not rep16c.breaker_tripped and rep16c.errored == len(all_bad) and \
+    rep16c.examined == len(all_bad), f"0 disables: every item attempted despite the unbroken run: {rep16c}"
+print("OK §16 — breaker resets on success AND skip (scattered failures never trip); 0 disables it")
+
+
+# === 17. the breaker (parallel twin): trip stops DISPATCH; in-flight drains (the budget-stop shape) ====
+# Successes dispatch first (no nap) and land before the napping failures collect, so the streak counts
+# only failures. Errored is a documented BOUND, not an exact count: K collected at the trip, plus up to
+# (workers-1) already in flight that the drain lands — same leash shape as §12's budget overshoot.
+r17 = fresh_root("par-breaker")
+ok17 = ["g1", "g2", "g3"]
+bad17 = [f"h{i}" for i in range(20)]
+b17 = ParallelBlock(ok17 + bad17, boom_on=bad17, naps={k: 0.01 for k in bad17})
+err17 = io.StringIO()
+with redirect_stderr(err17):
+    rep17 = block.run(b17, root=r17, parallel=3, breaker_errors=5, progress=None)
+assert rep17.breaker_tripped, f"the pool tripped the breaker: {rep17}"
+assert rep17.processed == 3 and sorted(b17.processed_keys) == ok17, "every success landed (drained, not orphaned)"
+assert 5 <= rep17.errored <= 7, \
+    f"bound: K=5 at the trip, plus up to (workers-1)=2 in flight when it tripped: {rep17}"
+assert rep17.examined < len(ok17 + bad17), f"dispatch STOPPED — the remainder was never attempted: {rep17}"
+assert block.done_index("par", r17) == {(k, "v1") for k in ok17}, \
+    "successes marked; no failed/aborted item got a marker (all retry next tick)"
+assert rep17.pending == 20, f"everything but the 3 successes is pending (errored included): {rep17}"
+assert "tripping the breaker" in err17.getvalue() and "20 items left pending" in err17.getvalue(), \
+    f"same loud stderr line as serial, with the FINAL pending count (post-drain): {err17.getvalue()!r}"
+print(f"OK §17 — breaker (parallel): dispatch stops, in-flight drains ({rep17.errored} errored, bound 5..7), loud")
+
+
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
       "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol "
-      "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps)")
+      "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps), and the "
+      "consecutive-failure breaker (K unbroken failures abort the tick; success/skip resets; 0 disables)")

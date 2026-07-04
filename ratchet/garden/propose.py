@@ -664,6 +664,8 @@ def propose_main(argv=None) -> None:
         for p in blk.proposals:
             print(f"  queued   [{p['op']} · stakes {p['stakes']:.2f}]  {p['concept_ids']}  {p['rationale']!r}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
+    if report.breaker_tripped:
+        tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\ngarden-ops-{report.run_id}: {report.examined} clusters, {report.processed} gardened, "
           f"{report.skipped} skipped, {blk.n_applied} auto-applied, {blk.n_queued} queued{errs}, "

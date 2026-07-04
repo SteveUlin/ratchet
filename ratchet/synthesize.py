@@ -303,6 +303,8 @@ def main(argv=None) -> None:
             print(f"\n  • {c['title']}  [{c['relation']['kind']}]")
             print(f"    {c['why']}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
+    if report.breaker_tripped:
+        tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\nsynthesize-{report.run_id}: {report.n_queue} queued → {report.n_filled} filled, "
           f"{report.n_dropped} dropped, {report.skipped} skipped{errs}, ${report.cost_usd:.4f}{tail}")

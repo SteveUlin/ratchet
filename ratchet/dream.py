@@ -1319,6 +1319,8 @@ def main(argv=None) -> None:
                   f"conf {t['confidence']:.2f}]")
             print(f"    {t['why']}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
+    if report.breaker_tripped:
+        tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\ndream-{report.run_id}: {report.n_events} events → {report.n_new} new, "
           f"{report.n_strengthened} strengthened, {report.n_weakened} weakened, {report.n_noop} noop, "

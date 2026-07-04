@@ -2,8 +2,8 @@
 
 The stages (tap/weave/chunk/glean/dream) grew at different abstraction levels with ad-hoc
 `run()`/`materialize()` APIs. This is their single tested home for the cross-cutting concerns:
-enumeration, the done-skip, per-item error isolation, `--max-usd`/`--limit`/`--dry-run`,
-crash-safety, and streaming progress. A stage implements only its two stage-specific bits —
+enumeration, the done-skip, per-item error isolation, the consecutive-failure breaker,
+`--max-usd`/`--limit`/`--dry-run`, crash-safety, and streaming progress. A stage implements only its two stage-specific bits —
 `items()` (enumerate inputs) and `process()` (transform one → ingest output blobs) — plus a few
 declarative knobs (`name`, `params`, `key()`); the shared `run()` driver does everything else,
 IDENTICALLY for every stage.
@@ -328,6 +328,8 @@ class Report:
     outputs: int = 0           # total output blobs ingested (events, takeaways, cleaned, …)
     cost_usd: float = 0.0
     stopped_on_budget: bool = False
+    breaker_tripped: bool = False  # K CONSECUTIVE failures aborted the tick (see BREAKER_ERRORS) —
+                               # a systemic wall, not flaky items; the aborted remainder is pending
     would_process: int = 0     # --dry-run only
     pending: int = 0           # un-done items STILL in the store after this run (the amortized backlog):
                                # full enumeration minus markers minus what this run processed. >0 means
@@ -369,6 +371,9 @@ class ProxyReport:
     @property
     def stopped_on_budget(self) -> bool:
         return self._report.stopped_on_budget
+    @property
+    def breaker_tripped(self) -> bool:
+        return self._report.breaker_tripped
 
 
 # --- live progress: spinner + ▰▱ bar + spend on a TTY; idempotent per-item lines when piped --------
@@ -508,10 +513,25 @@ class Progress:
 # (one edit here), enforced as a clamp with a stderr note — never a silent hard rule.
 PARALLEL_MAX = 10
 
+# The consecutive-failure BREAKER (the tripwire on a doomed tick). K CONSECUTIVE item failures abort
+# the tick: a LONE flaky item is already isolated per item (counted `errored`, no marker, retried next
+# run), but an UNBROKEN failure run means a systemic wall — the usage window exhausted, auth dead, the
+# network gone — and every further call just burns the completer's fast-fail retries + backoff against
+# it (a glean tick once ground through 1,300+ consecutive doomed calls, most of a 53-minute run). Any
+# success or skip resets the count, so a corpus with scattered bad items never trips. Tripping is
+# CLEAN: aborted items are unmarked and simply pending next tick — nothing lost, the next run retries
+# once the wall lifts. 10 is high enough that a burst of genuinely bad items (real failures arrive
+# scattered, not unbroken) rides through, low enough that a dead wall costs ~10 doomed calls, not the
+# rest of the run. A principle-driven, adjustable default (one edit here; `--breaker-errors K` per run
+# on the stages that expose driver knobs; 0 disables outright — the escape hatch), announced with a
+# stderr note when it trips — never a silent hard rule.
+BREAKER_ERRORS = 10
+
 
 def run(block: Block, *, source_id: str | None = None, max_usd: float | None = None,
         limit: int | None = None, dry_run: bool = False, priority: PriorityStrategy | None = None,
-        progress: Progress | None = None, root: Path | None = None, parallel: int = 1) -> Report:
+        progress: Progress | None = None, root: Path | None = None, parallel: int = 1,
+        breaker_errors: int = BREAKER_ERRORS) -> Report:
     """Drive a block over its items, IDENTICALLY for every stage. The per-item contract:
 
       1. enumerate (eager, so the bar knows the total) → 1b. ORDER by the `priority` POLICY (default
@@ -526,11 +546,15 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
     unaffected (it re-orders the same working set, commits in finalize). Default Greedy ignores age, so a
     non-Aging run is byte-identical; only `--priority aging` reads `block.age` (`no_age` → 0.0 elsewhere).
 
-    The four invariants the driver guarantees so no stage re-implements them:
+    The five invariants the driver guarantees so no stage re-implements them:
       PER-ITEM COMMIT — output blobs (in process) then the marker (here, LAST), so a kill/crash keeps
         every completed item and re-does only the one in flight.
       ERROR ISOLATION — a raising process() counts `errored`, writes NO marker, and the run CONTINUES;
         the item retries next run (its key never entered the done-set).
+      BREAKER — isolation's complement: `breaker_errors` (default BREAKER_ERRORS; 0 = off) aborts the
+        tick after K CONSECUTIVE failures, because an unbroken run is a systemic wall (usage window /
+        auth / network), not K flaky items — every further call would burn retries against it. Any
+        success or skip resets the count; aborted items are unmarked, simply pending next tick.
       IDEMPOTENCY — `done_index` skips items with a marker for (key, *params); a bumped param flips the
         key, so the item re-processes.
       BUDGET/LIMIT — `--limit` caps items EXAMINED (the first `limit`); `--max-usd` stops cleanly,
@@ -569,6 +593,7 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
         parallel = 1
     if dry_run:
         parallel = 1                               # a dry run makes no calls — nothing to overlap
+    breaker_errors = max(0, breaker_errors)        # <=0 → off (a negative must not trip on the first error)
     priority = priority or Greedy()                # resolve the default HERE, not as a shared default-arg
                                                    # instance, so every run gets a FRESH strategy (a future
                                                    # seeded/stateful policy must not leak state across runs).
@@ -594,13 +619,16 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
 
     if parallel > 1:                               # the pooled lane — same contract, N calls in flight
         _run_pool(block, items, done=done, pvals=pvals, params=params, report=report,
-                  progress=progress, max_usd=max_usd, root=root, run_id=run_id, workers=parallel)
+                  progress=progress, max_usd=max_usd, root=root, run_id=run_id, workers=parallel,
+                  breaker_errors=breaker_errors)
     else:
+        streak = 0                                 # consecutive failures — the breaker's signal
         for item in items:                         # the serial lane — the original loop, untouched
             report.examined += 1
             k = block.key(item)
             if (k, *pvals) in done:
                 report.skipped += 1
+                streak = 0                         # a skip breaks the run of failures (not a wall signal)
                 if progress:
                     progress.tick(k, "skipped")
                 continue
@@ -616,9 +644,14 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
                 n_out, cost = block.process(item, root=root, run_id=run_id)  # blobs committed inside
             except Exception:
                 report.errored += 1                # per-item isolation; run continues, item retried
+                streak += 1
                 if progress:
                     progress.tick(k, "errored")
+                if breaker_errors and streak >= breaker_errors:
+                    report.breaker_tripped = True  # K unbroken failures = the wall, not the items
+                    break                          # stop the tick; the remainder is simply pending
                 continue
+            streak = 0                             # a success proves the seam is alive
             report.processed += 1
             report.outputs += n_out
             report.cost_usd += cost
@@ -634,6 +667,10 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
                                                    # a full drain (or --dry-run, processed=0) leaves backlog.
     if progress:
         progress.stop()
+    if report.breaker_tripped:                     # after progress.stop(): the note must not race the bar.
+        print(f"{block.name}: {breaker_errors} consecutive errors — tripping the breaker; "
+              f"{report.pending} items left pending; likely the usage window / rate wall "
+              f"(BREAKER_ERRORS; --breaker-errors 0 to disable)", file=sys.stderr)
     if not dry_run:
         block.finalize(root=root, run_id=run_id)   # no-op default; dream/tap act on their own state
     return report
@@ -643,7 +680,8 @@ def run(block: Block, *, source_id: str | None = None, max_usd: float | None = N
 
 def _run_pool(blk: Block, items: list[Item], *, done: set[tuple], pvals: tuple,
               params: tuple[tuple[str, str], ...], report: Report, progress: Progress | None,
-              max_usd: float | None, root: Path, run_id: str, workers: int) -> None:
+              max_usd: float | None, root: Path, run_id: str, workers: int,
+              breaker_errors: int = BREAKER_ERRORS) -> None:
     """`run`'s parallel lane — the same per-item contract with up to `workers` process() calls in
     flight (the LLM call is a subprocess: the GIL releases, so threads overlap the real wait). The
     division of labor keeps every shared mutation SINGLE-THREADED, so no lock beyond Progress's own:
@@ -659,24 +697,36 @@ def _run_pool(blk: Block, items: list[Item], *, done: set[tuple], pvals: tuple,
     On a budget stop the window DRAINS rather than cancels: an in-flight call is paid work whose blobs
     process() already committed, so it lands normally (marker + Report), never orphans. Per-item
     semantics are otherwise the serial lane's: blobs inside process(), the marker AFTER (per-item
-    commit), a raising item isolated as `errored` with no marker (retried next run)."""
+    commit), a raising item isolated as `errored` with no marker (retried next run).
+
+    The BREAKER follows the budget-stop shape: `breaker_errors` consecutive COLLECTED failures (a
+    landed success resets the count) flag `breaker_tripped`, which stops DISPATCH at the next gate;
+    the in-flight window drains normally, so a straggling success still lands with its marker (the
+    drain may collect a few more failures — bounded by the window). run() prints the one stderr note
+    after the drain, when the pending count is final — the serial lane's exact line."""
     def work(item: Item) -> tuple[int, float, dict]:
         n_out, cost = blk.process(item, root=root, run_id=run_id)     # blobs committed inside
         return n_out, cost, blk.marker_extra(item)   # audit fields read in THIS worker (see docstring)
 
     inflight: dict = {}                            # future → its item key; main-thread-only
+    streak = 0                                     # consecutive COLLECTED failures — the breaker's signal
 
     def land(futures) -> None:
         """Collect finished futures — MAIN thread only, the sole mutator of Report/markers/progress."""
+        nonlocal streak
         for f in futures:
             k = inflight.pop(f)
             try:
                 n_out, cost, extra = f.result()    # re-raises whatever process() raised
             except Exception:
                 report.errored += 1                # per-item isolation, exactly the serial contract
+                streak += 1
+                if breaker_errors and streak >= breaker_errors:
+                    report.breaker_tripped = True  # stop DISPATCH (the loop's gate); in-flight drains
                 if progress:
                     progress.tick(k, "errored")
                 continue
+            streak = 0                             # a landed success proves the seam is alive
             report.processed += 1
             report.outputs += n_out
             report.cost_usd += cost
@@ -699,6 +749,8 @@ def _run_pool(blk: Block, items: list[Item], *, done: set[tuple], pvals: tuple,
             while len(inflight) >= workers:        # window full → land finished work before dispatching
                 finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
                 land(finished)
+            if report.breaker_tripped:
+                break                              # stop DISPATCH; the drain below lands in-flight work
             if max_usd is not None and report.cost_usd >= max_usd:
                 report.stopped_on_budget = True
                 break                              # stop DISPATCH; the drain below lands in-flight work

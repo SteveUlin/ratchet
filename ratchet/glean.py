@@ -656,6 +656,10 @@ def main(argv=None) -> None:
                     help=f"concurrent LLM calls, capped at {block.PARALLEL_MAX} (default 1 = serial). "
                          "2-3 when stepping away from the keyboard; shares your interactive token "
                          "budget, so it buys latency, not capacity")
+    ap.add_argument("--breaker-errors", type=int, default=block.BREAKER_ERRORS, metavar="K",
+                    help=f"abort the tick after K CONSECUTIVE chunk failures — an unbroken run means a "
+                         f"systemic wall (usage window / auth / network), not K flaky chunks; aborted "
+                         f"chunks stay pending (default {block.BREAKER_ERRORS}; 0 disables)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list chunks that would be processed (skips done); no LLM calls")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
@@ -687,13 +691,15 @@ def main(argv=None) -> None:
         blk.name, cap=args.max_usd, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
     report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
                        priority=block.priority_strategy(args.priority), progress=progress,
-                       parallel=args.parallel)
+                       parallel=args.parallel, breaker_errors=args.breaker_errors)
 
     if args.dry_run:
         print(f"\nglean-{report.run_id}: {report.would_process} chunk(s) would process "
               f"({report.skipped} already done for {PROMPT_VERSION}/{args.model}).")
         return
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
+    if report.breaker_tripped:
+        tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\nglean-{report.run_id}: {report.examined} examined, {report.processed} done, "
           f"{report.skipped} skipped, {report.outputs} events, {blk.rejected} rejected{errs}, "

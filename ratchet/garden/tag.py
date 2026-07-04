@@ -449,6 +449,8 @@ def main(argv=None) -> None:
         for a in blk.assignments:
             print(f"  {a['concept_id'][:14]}  {a['tags']}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
+    if report.breaker_tripped:
+        tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
     print(f"\ngarden-{report.run_id}: {report.examined} examined, {report.processed} tagged, "
           f"{report.skipped} skipped, {blk.n_tagged} got tags, {blk.n_new_tags} new vocab{errs}, "
