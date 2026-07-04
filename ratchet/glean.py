@@ -533,7 +533,12 @@ class GleanBlock:
         ch = item.chunk
         kinds = set(ch.kinds or [])
         has_user = 2.0 if "user" in kinds else 0.0
-        diversity = 0.5 * len(kinds)
+        # `compact` is EXCLUDED from diversity — measured, not guessed (2026-07-04, the 317-chunk
+        # glean/4 cohort): compact-segment chunks yielded HALF the events of their score-mates with
+        # 20% zeros, because a compaction summary is a RETELLING of already-compressed material —
+        # the durable lessons live in the original exchanges, and rewarding the kind's presence
+        # actively mis-ranked (score 4.5 compact chunks under-yielded 4.0 plain ones, Spearman −0.32).
+        diversity = 0.5 * len(kinds - {"compact"})
         interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
         if ch.cleaned_hash not in self._vt_cache:
             self._fill_stamps(ch.cleaned_hash)
