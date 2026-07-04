@@ -1,7 +1,8 @@
 """status tests: the read-only census over (1) a seeded tiny store — a mature claim awaiting
-synthesize, an accepted claim, an un-resolved event, live seed+llm edges — and (2) an empty store,
-which must emit clean zeros, never a traceback. The --json object and the text render read the SAME
-census dict, so the JSON shape is asserted against `status.census` directly.
+synthesize, an accepted claim, an un-resolved event, live seed+llm edges, and two concepts split by
+KIND (behavioral vs reference, ADR-0029 — the reference one held out of generate's projection) — and
+(2) an empty store, which must emit clean zeros, never a traceback. The --json object and the text
+render read the SAME census dict, so the JSON shape is asserted against `status.census` directly.
 
 Fixtures follow test_resolve.py's idiom: real transcript → cleaned blob → chunkset → GleanFake
 events with controlled summaries → resolve with a scripted ResolveFake. No network, no API key.
@@ -17,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-status-")
 
-from ratchet import blobstore, chunk, config, glean, resolve, status  # noqa: E402
+from ratchet import blobstore, chunk, config, glean, resolve, review, status  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 EMPTY_DATASTORE = Path(tempfile.mkdtemp(prefix="ratchet-test-status-datastore-"))  # 0 available
@@ -122,6 +123,15 @@ assert len(pool) == 1 and pool[0]["title"] in (JJ_SEED, JJ_PARA)  # Greedy ties 
 claim_id = pool[0]["id"]
 write_accept(claim_id, ROOT)
 
+# Two concepts split by KIND (ADR-0029): a bare (kind-less, legacy-shape) blob reads behavioral; the
+# reference one is re-kinded by the reviewer's set_kind decision — the same fold generate filters on.
+for cid, statement in (("c-beh", "Run the linter before committing."),
+                       ("c-ref", "The --effort flag overrides the env var.")):
+    body = {"id": cid, "title": cid, "statement": statement, "evidence": [], "source_takeaway": f"t-{cid}"}
+    blobstore.ingest(blobstore.canonical_json(body), source_kind="concept", source_id=cid,
+                     origin_ref={"stage": "test"}, root=ROOT)
+review.set_kind("c-ref", "reference", ROOT, reason="lookup material")
+
 c = status.census(ROOT, datastore=EMPTY_DATASTORE)
 
 assert c["sources"] == {"tapped": 3, "available": 0}, c["sources"]
@@ -147,11 +157,14 @@ assert set(rv) == {"pending", "incubating", "proposals"}
 assert all(isinstance(v, int) and v >= 0 for v in rv.values()), rv  # counts only — review.py is
 assert rv["proposals"] == 0, rv                                     # a moving sibling surface
 
-assert c["concepts"] == {"valid": 0}, c["concepts"]
-assert c["generate"] == {"region_nonempty": False, "rules": 0}, c["generate"]
+assert c["concepts"] == {"valid": 2, "behavioral": 1, "reference": 1}, c["concepts"]
+assert c["generate"] == {"region_nonempty": True, "rules": 1}, \
+    f"the census projects generate's OWN default view — behavioral only, the reference rule held out: " \
+    f"{c['generate']}"
 
 print("OK census — 3 tapped, all chunks gleaned, 1 event awaiting resolve, 1 mature claim awaiting")
-print("            synthesize (why=null), accepted+edge counts exact, generate honestly empty.")
+print("            synthesize (why=null), accepted+edge counts exact, concepts split by kind, and the")
+print("            generate line counts only the behavioral rule.")
 
 
 # === 2. --json emits the census object; the text render carries every section ======================
@@ -170,7 +183,8 @@ text = buf.getvalue()
 for head in ("SOURCES", "PREP", "EVENTS", "CLAIMS", "REVIEW", "CONCEPTS", "GENERATE"):
     assert head in text, f"text render missing the {head} section:\n{text}"
 assert "1 awaiting synthesize (why=null)" in text, text
-print("OK json+text — --json == census(); every section renders one line.")
+assert "2 valid (1 behavioral · 1 reference)" in text, f"the CONCEPTS line carries the kind split:\n{text}"
+print("OK json+text — --json == census(); every section renders one line, CONCEPTS split by kind.")
 
 
 # === 3. the empty store: zeros everywhere, no traceback ============================================

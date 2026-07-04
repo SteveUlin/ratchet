@@ -470,6 +470,10 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         "id": content["id"],
         "title": title,
         "why": content.get("why"),
+        # the PROPOSED typology (ADR-0029), stored by synthesize beside the why: None until prose is
+        # minted (nothing proposed yet), else coerced to the closed vocabulary. A proposal only — the
+        # reviewer's accept/set_kind decision is what a CONCEPT's kind reads from.
+        "kind": dream.clean_kind(content["kind"]) if content.get("kind") is not None else None,
         # the why-staleness derivation (§7.3): synthesize stamped the edge-set fingerprint its prose
         # consumed; if the LIVE corroborates set has since diverged (a retraction, a new merge), the
         # prose no longer describes the evidence — flag it for the review surface. why=null claims and

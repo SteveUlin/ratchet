@@ -26,7 +26,9 @@ makes the call. This module just serves the materials and records the verdict, a
 The v3 claim surfaces (design §6, ADR-0028) ride the same fold: the LLM-merge AUDIT CARD renders every
 corroboration's verified quote next to the match key the resolver persisted (the v2-failure detector —
 the reviewer audits the acceptance layer with the same evidence the model saw); a "why pending" badge
-keeps a matured-but-unsynthesized claim VISIBLE (review never blocks on synthesize's cadence);
+keeps a matured-but-unsynthesized claim VISIBLE (review never blocks on synthesize's cadence); the
+card carries synthesize's PROPOSED kind (behavioral vs reference, ADR-0029) which `--accept` confirms
+on the decision (`--kind` overrides; `--set-kind` re-kinds an existing concept — the backfill verb);
 CONTESTED claims near the bar surface via `--contested`; merge SUGGESTIONS are a derived render-time
 query over residue-band claim pairs (§2.2 — zero stored state, nothing can harden); the human "not the
 same" verdict is the ONE compound `reject-merge` decision (`resolve.reject_merge` — review-only by
@@ -336,6 +338,9 @@ def _present_claim(c: dict, root: Path, *, context_bytes: int, mats: dict, valid
     return {
         "takeaway_id": c["id"],                        # claims share dream's t-… id space; one queue key
         "kind": "claim",
+        # the PROPOSED typology (ADR-0029) — `claim_kind`, because the card's `kind` is the queue-source
+        # tag above. None until synthesize proposes one; --accept records it (--kind overrides).
+        "claim_kind": c.get("kind"),
         "title": c.get("title", ""),
         "why": c.get("why"),
         "why_pending": not c.get("why"),               # the badge: provisional title, prose not yet minted
@@ -720,7 +725,7 @@ def _mint_concept_id(takeaway: dict) -> str:
 
 def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = None,
            assessment: str = "", reviewer: str = "sulin", note: str = "",
-           allow_no_evidence: bool = False) -> str:
+           kind: str | None = None, allow_no_evidence: bool = False) -> str:
     """Promote a takeaway to a concept (the loop closes here) and record the accept. The concept stores
     ONLY the evidence that re-validates *now* — exactly the verified spans the reviewer saw, never the
     raw (possibly malformed/stale) takeaway evidence — so the trust chain reaches the concept, the
@@ -728,7 +733,9 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     anchor would feed dream/generate) unless `allow_no_evidence` overrides. Identity comes from the
     takeaway's `relation`: `strengthens`/`refines` an EXISTING concept → a new version of it; otherwise
     (incl. a stale/unknown concept_id) mint fresh. `edited` ({title?, why?}) corrects the synthesis
-    before it becomes a concept, captured before/after. Returns the concept id.
+    before it becomes a concept, captured before/after. `kind` confirms/overrides the claim's proposed
+    typology (ADR-0029; default = the proposal, else behavioral) — recorded ON THE DECISION, where the
+    valid-concept view reads it (`dream.concept_kinds`), never on the blob. Returns the concept id.
 
     A v3 CLAIM accepts through the same door (§5 — review appends a decision FACET, nothing forks):
     the id resolves to the claim's LIVE-EDGE FOLD first (`_claim_view` — the stored blob is seed
@@ -746,6 +753,13 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     edited = edited or {}
     title = edited.get("title", tk.get("title", ""))
     statement = edited.get("why", tk.get("why") or "")   # a claim's why is null until synthesize (§7.3)
+    # the KIND the accept confirms (ADR-0029): the reviewer's explicit --kind wins; else the claim's
+    # proposed kind (synthesize's, coerced); else behavioral (v2 takeaways and unsynthesized claims
+    # carry no proposal). An explicit override outside the vocabulary is REFUSED, not coerced —
+    # coercion absorbs a model's noise, never a reviewer's typo (their decision is authoritative).
+    if kind is not None and kind not in dream.CONCEPT_KINDS:
+        raise ValueError(f"--kind must be one of {dream.CONCEPT_KINDS}; got {kind!r}")
+    kind = kind if kind is not None else dream.clean_kind(tk.get("kind"))
     rel = tk.get("relation") or {}
     known = dream.valid_concept_ids(root)
     concept_id = (rel["concept_id"] if rel.get("kind") in ("strengthens", "refines")
@@ -755,7 +769,7 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
                "evidence": evidence, "source_takeaway": takeaway_id}
     ch, _ = blobstore.ingest(blobstore.canonical_json(concept), source_kind="concept", source_id=concept_id,
                              origin_ref={"stage": "review", "reviewer": reviewer, "takeaway": takeaway_id}, root=root)
-    fields = {"concept": concept_id, "concept_hash": ch, "reviewer": reviewer,
+    fields = {"concept": concept_id, "concept_hash": ch, "kind": kind, "reviewer": reviewer,
               "assessment": str(assessment)[:ASSESSMENT_MAX], "note": str(note)[:ASSESSMENT_MAX]}
     if edited:
         fields["edited"] = {"before": {"title": tk.get("title", ""), "why": tk.get("why", "")},
@@ -798,10 +812,31 @@ def retire(concept_id: str, root: Path | None = None, *, reason: str = "", revie
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
+def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: str = "",
+             reviewer: str = "sulin") -> None:
+    """Re-KIND an EXISTING concept (ADR-0029) — the reviewer-owned append-only decision `valid_concepts`
+    reads FIRST (latest set_kind > the accept's kind > behavioral). This is the backfill path for
+    concepts accepted before the typology existed, and the correction path when a kind call ages badly
+    — like `retire`, a decision only the human writes; nothing upstream can flip it back. The vocabulary
+    is closed and the target must be VALID: an out-of-vocabulary kind is refused (a reviewer's typo is
+    an error, never silently coerced), and a retired/superseded target is refused because a fresh
+    decision would become its LATEST lifecycle decision and pull it back into the valid set — re-kinding
+    must never double as an accidental un-retire."""
+    root = root or config.data_root()
+    if kind not in dream.CONCEPT_KINDS:
+        raise ValueError(f"kind must be one of {dream.CONCEPT_KINDS}; got {kind!r}")
+    if concept_id not in dream.valid_concept_ids(root):
+        raise ValueError(f"no valid concept {concept_id!r} — set-kind targets the valid set only "
+                         f"(a decision on a retired concept would resurrect it)")
+    _record(dream.VERB_SET_KIND, concept_id, root, kind=kind,
+            reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
+
+
 def valid_concepts(root: Path | None = None) -> list[dict]:
     """The current valid concept set — what dream judges belief-change against and `generate` projects
     to skills/CLAUDE.md. Same derivation as `dream.load_concepts` (kept there to avoid a review→dream
-    cycle); re-exported here for inspection."""
+    cycle); re-exported here for inspection. Each concept carries its derived `kind` (ADR-0029:
+    latest set_kind decision > the accept's kind > behavioral)."""
     return dream.load_concepts(root)
 
 
@@ -998,6 +1033,10 @@ def main(argv=None) -> None:
     g.add_argument("--reject", metavar="TAKEAWAY", help="reject a takeaway")
     g.add_argument("--snooze", metavar="TAKEAWAY", help="defer a takeaway (needs --until)")
     g.add_argument("--retire", metavar="CONCEPT", help="take a concept out of the valid set")
+    g.add_argument("--set-kind", nargs=2, metavar=("CONCEPT", "KIND"),
+                   help="re-kind an EXISTING concept (behavioral|reference) — an append-only reviewer "
+                        "decision that outranks the kind recorded at accept; the backfill path for "
+                        "concepts accepted before the typology (ADR-0029)")
     g.add_argument("--concepts", action="store_true", help="the current valid concept set")
     g.add_argument("--proposals", action="store_true",
                    help="the structural-op proposal queue (3d: op + rationale + cited concepts' evidence)")
@@ -1026,6 +1065,11 @@ def main(argv=None) -> None:
     ap.add_argument("--bytes", type=int, default=None, help="surrounding-context window size")
     ap.add_argument("--edit-title", help="accept with a corrected title")
     ap.add_argument("--edit-why", help="accept with a corrected why")
+    ap.add_argument("--kind", choices=dream.CONCEPT_KINDS,
+                    help="accept with this kind, overriding the claim's proposal (default: the "
+                         "proposal, else behavioral). behavioral shapes conduct and projects into "
+                         "CLAUDE.md; reference is a fact/mechanism kept for lookup, excluded from "
+                         "generation by default (ADR-0029)")
     ap.add_argument("--allow-no-evidence", action="store_true",
                     help="accept a takeaway with no resolvable evidence (a deliberate, recorded override)")
     ap.add_argument("--assessment", default="", help="Claude's faithfulness assessment (recorded as provenance)")
@@ -1088,9 +1132,17 @@ def main(argv=None) -> None:
         if args.edit_why is not None:
             edited["why"] = args.edit_why
         cid = accept(args.accept, edited=edited or None, assessment=args.assessment, note=args.note,
-                     allow_no_evidence=args.allow_no_evidence)
-        print(json.dumps({"accepted": args.accept, "concept": cid, "edited": bool(edited)})
-              if args.json else f"accepted → concept {cid}{' (edited)' if edited else ''}")
+                     kind=args.kind, allow_no_evidence=args.allow_no_evidence)
+        kind = next((c["kind"] for c in valid_concepts() if c["id"] == cid), dream.KIND_BEHAVIORAL)
+        print(json.dumps({"accepted": args.accept, "concept": cid, "kind": kind, "edited": bool(edited)})
+              if args.json else f"accepted → concept {cid}"
+                                + (f" ({kind})" if kind != dream.KIND_BEHAVIORAL else "")
+                                + (" (edited)" if edited else ""))
+    elif args.set_kind:
+        set_kind(args.set_kind[0], args.set_kind[1], reason=args.reason)
+        print(f"concept {args.set_kind[0]} re-kinded → {args.set_kind[1]}"
+              + ("" if args.set_kind[1] == dream.KIND_BEHAVIORAL
+                 else " (kept + queryable; excluded from generate's default projection)"))
     elif args.reject:
         reject(args.reject, reason=args.reason, assessment=args.assessment)
         print(f"rejected {args.reject}")
@@ -1103,7 +1155,9 @@ def main(argv=None) -> None:
     elif args.concepts:
         cs = valid_concepts()
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
-              else "\n".join(f"  {c['id']}  {c.get('title', '')}" for c in cs) or "  (no valid concepts yet)")
+              else "\n".join(f"  {c['id']}  {c.get('title', '')}"
+                             + (f"  [{c['kind']}]" if c.get("kind") != dream.KIND_BEHAVIORAL else "")
+                             for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
         q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
                               limit=args.limit or None, topic=args.topic)   # 0 = everything here too
@@ -1163,6 +1217,9 @@ def _print_queue(q: list[dict], *, total: int | None = None, incubating_count: i
             print(f"  WHY: {t['why']}"
                   + ("  [⚠ why-stale: the live evidence diverged since this prose was written]"
                      if t.get("why_stale") else ""))
+        if t.get("claim_kind") == dream.KIND_REFERENCE:   # only the non-default is worth a card line
+            print("  KIND: reference (proposed) — a fact/mechanism to look up, not conduct; kept but "
+                  "excluded from generate's default projection. --accept records it; --kind overrides.")
         if t.get("contested"):
             print("  ⚡ CONTESTED: carries a live contradiction — `--contested` shows the other side")
         for ev in t["evidence"]:

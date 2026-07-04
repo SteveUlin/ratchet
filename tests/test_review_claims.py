@@ -22,19 +22,25 @@ event → claim + edges), so the trust chain under test is genuine. The load-bea
     the live-edge fold (the stored claim blob carries no evidence at all).
   LEGACY BESIDE — v2 takeaways still queue next to claims (one importance order); on an id collision
     the claim view is preferred; legacy accept still mints.
+  THE KIND FACET (ADR-0029) — synthesize's proposed kind rides the card (`claim_kind`); accept records
+    it on the DECISION (default = the proposal; --kind overrides — the reviewer's call is
+    authoritative); `set_kind` re-kinds an existing concept and outranks the accept in the fold; a
+    concept with no kind anywhere reads behavioral (the legacy default).
 
 Run: `python tests/test_review_claims.py` (throwaway dirs)."""
+import io
 import json
 import os
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-review-claims-")
 
-from ratchet import blobstore, chunk, config, dream, glean, resolve, review, sig  # noqa: E402
+from ratchet import blobstore, chunk, config, dream, glean, resolve, review, sig, synthesize  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 from ratchet.dream import working_set  # noqa: E402
 
@@ -189,6 +195,7 @@ t = q[0]
 assert t["kind"] == "claim" and t["takeaway_id"] == claim_a["id"], "the card is the claim view"
 assert t["why"] is None and t["why_pending"] is True, \
     "why=null (synthesize hasn't run) → the WHY-PENDING badge, and the claim is NOT withheld (§6)"
+assert t["claim_kind"] is None, "no kind proposed yet — the typology arrives with synthesize's prose"
 assert t["title"] == JJ_SEED, "the provisional title is the seed event's summary"
 assert t["mature"] and "≥ bar" in t["rationale"], "the bar standing rides the card (ADR-0027)"
 assert t["scope"] == "cross-cutting" and t["subject"]["repos"] == ["alpha", "beta"], \
@@ -236,7 +243,10 @@ for e in c["evidence"]:
     assert data[e["byte_start"]:e["byte_end"]].decode() in (JJ_SEED, JJ_PARA), \
         "every baked span re-resolves to a verbatim quote (re-validated at accept)"
 assert review.pending(RA) == [], "the accepted claim leaves the queue"
-assert blobstore.latest_decision(claim_a["id"], RA)["verb"] == "accept"
+assert c["kind"] == "behavioral", "no proposal, no override → the legacy default kind"
+d2 = blobstore.latest_decision(claim_a["id"], RA)
+assert d2["verb"] == "accept" and d2["kind"] == "behavioral", \
+    "the accept DECISION records the confirmed kind — the authoritative record (ADR-0029)"
 assert [v["id"] for v in resolve.high_confidence_view(RA)] == [claim_a["id"]], \
     "accepted ∧ mature → the trusted view (§5)"
 print("OK 2 — accept mints the concept from the live-edge fold's re-validated spans; the claim leaves")
@@ -424,5 +434,96 @@ assert lcid.startswith("c-") and "legacy-1" not in {t["takeaway_id"] for t in re
     "the legacy accept path is untouched"
 print("OK 7 — legacy v2 takeaways queue, incubate, and accept beside claims; on an id collision the")
 print("       claim view wins (after --reset-v2 the legacy arm simply empties).")
+
+
+# === 8. THE KIND FACET (ADR-0029): propose → card → accept confirms → set_kind re-kinds =============
+
+RK = use_store("k")
+seed_events([("k-s1", PYTEST, M_HI, 0.85, "gamma", None),
+             ("k-s2", RUFF, M_MID, 0.85, "gamma", None)], RK)
+resolve.run(ResolveFake(["none"]), model="fake", forget=False, root=RK)
+pool_k = {c["title"]: c for c in resolve.claim_pool(RK)}
+pid, rid = pool_k[PYTEST]["id"], pool_k[RUFF]["id"]
+
+
+class SynthKind:
+    """Scripted Sonnet prose carrying a PROPOSED kind — the synthesize side of the facet."""
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __call__(self, system, user):
+        assert '"kind": "behavioral"|"reference"' in system, "the split is defined in the contract"
+        return Completion(text=json.dumps(self.payload), model="synth-fake", cost_usd=0.01)
+
+
+for the_id, line in ((pid, PYTEST), (rid, RUFF)):
+    synthesize.run(SynthKind({"title": line[:60], "why": f"a fact about {line[:24]} one would look up.",
+                              "kind": "reference", "confidence": 0.8}),
+                   model="fake", claim=the_id, root=RK)
+
+def kinds_of(root):
+    return {c["id"]: c["kind"] for c in dream.load_concepts(root)}
+
+# (a) the card carries the proposal — reference, the non-default worth a line.
+cards = {t["takeaway_id"]: t for t in review.pending(RK, maturity=0.5)}
+assert cards[pid]["claim_kind"] == "reference" and cards[rid]["claim_kind"] == "reference", \
+    "the pending card shows synthesize's proposed kind (claim_kind — `kind` is the queue-source tag)"
+
+# (b) accept DEFAULT follows the proposal; the decision is the authoritative record.
+cidp = review.accept(pid, RK, assessment="a lookup fact, faithfully quoted")
+assert kinds_of(RK)[cidp] == "reference", "accept default = the proposed kind"
+dp = blobstore.latest_decision(pid, RK)
+assert dp["verb"] == "accept" and dp["kind"] == "reference"
+
+# (c) --kind OVERRIDES the proposal (the reviewer's call beats the model's) — through the CLI wiring.
+buf = io.StringIO()
+with redirect_stdout(buf):
+    review.main(["--accept", rid, "--kind", "behavioral", "--json"])
+out = json.loads(buf.getvalue())
+cidr = out["concept"]
+assert out["kind"] == "behavioral" and kinds_of(RK)[cidr] == "behavioral", \
+    "--kind behavioral overrides a reference proposal"
+
+# (d) an out-of-vocabulary override is REFUSED, never coerced — a reviewer's typo is an error.
+try:
+    review.accept(rid, RK, kind="mechanism")
+    assert False, "an invalid explicit kind must raise"
+except ValueError:
+    pass
+
+# (e) set_kind re-kinds an EXISTING concept and OUTRANKS the accept; the latest set_kind wins.
+review.set_kind(cidp, "behavioral", RK, reason="it shapes conduct after all")
+assert kinds_of(RK)[cidp] == "behavioral", "set_kind > the accept's kind (the later, deliberate call)"
+buf = io.StringIO()
+with redirect_stdout(buf):
+    review.main(["--set-kind", cidp, "reference", "--reason", "no — lookup material"])
+assert "re-kinded → reference" in buf.getvalue()
+assert kinds_of(RK)[cidp] == "reference", "the LATEST set_kind wins (append-only, latest decision in force)"
+
+# (f) guards: closed vocabulary; valid targets only (a decision on a retired concept would resurrect it).
+for bad_call in (lambda: review.set_kind(cidp, "mechanism", RK),
+                 lambda: review.set_kind("c-nope", "reference", RK)):
+    try:
+        bad_call()
+        assert False, "set_kind must refuse an invalid kind / unknown concept"
+    except ValueError:
+        pass
+review.retire(cidr, RK, reason="retired to prove the guard")
+try:
+    review.set_kind(cidr, "reference", RK)
+    assert False, "set_kind on a retired concept must refuse — re-kinding is never an accidental un-retire"
+except ValueError:
+    pass
+assert cidr not in kinds_of(RK), "…and the retired concept stayed retired"
+
+# (g) LEGACY: a concept with no kind anywhere — no proposal, no accept-kind, no set_kind — reads behavioral.
+legacy = {"id": "c-legacy", "title": "old concept", "statement": "predates the typology",
+          "evidence": [], "source_takeaway": "t-old"}
+blobstore.ingest(blobstore.canonical_json(legacy), source_kind="concept", source_id="c-legacy",
+                 origin_ref={"stage": "test"}, root=RK)
+assert kinds_of(RK)["c-legacy"] == "behavioral", \
+    "legacy concepts default behavioral — they keep shaping conduct until the reviewer says otherwise"
+print("OK 8 — kind: proposed on the card, confirmed on the accept decision (default = proposal, --kind")
+print("       overrides), re-kinded via set_kind (latest wins, valid targets only), legacy → behavioral.")
 
 print("\nall review-claims tests passed.")

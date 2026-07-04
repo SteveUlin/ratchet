@@ -45,7 +45,8 @@ from pathlib import Path
 from . import blobstore, block, completer, config, dream, resolve
 from .completer import Completer
 
-PROMPT_VERSION = "synth/1"     # bump to re-synthesize NOT-yet-prosed claims with a sharper prompt
+PROMPT_VERSION = "synth/2"     # bump to re-synthesize NOT-yet-prosed claims with a sharper prompt
+                               # (synth/2: the kind facet — behavioral vs reference, ADR-0029)
 SYNTH_MODEL = "sonnet"         # prose is rare (bounded by the graduation rate) → afford the sharper model
 OUT_NOUN = "claims"
 
@@ -63,10 +64,14 @@ SYNTH_SYSTEM = (
     "You are also given the developer's already-known CONCEPTS. Judge how this claim relates: new "
     "(nothing covers it), strengthens (more evidence for one), refines (narrows/extends one), or "
     "contradicts (overturns one — the most important to surface).\n\n"
+    "Also type the claim: behavioral if it shapes conduct (prefer X, verify Y before Z, avoid W); "
+    "reference if it is a mechanism or fact one would look up (what a flag means, what a tool can't "
+    "do).\n\n"
     "Return ONLY a JSON object, no prose, no code fences:\n"
     '{\n'
     '  "title": a short noun phrase naming the claim (<= 80 chars),\n'
     '  "why": one or two sentences — the durable principle and why it holds (<= 280 chars),\n'
+    '  "kind": "behavioral"|"reference",\n'
     '  "relation": {"kind": "new"|"strengthens"|"refines"|"contradicts", "concept_id": the related '
     'concept id or null, "note": a brief reason (<= 160 chars)},\n'
     '  "confidence": 0-1, how durable and reusable this is,\n'
@@ -89,7 +94,7 @@ def synthesize_claim(claim: dict, complete_synth: Completer, concept_digest: str
                      known_concept_ids: set[str], model: str, run_id: str,
                      root: Path | None) -> tuple[dict | None, float]:
     """ONE Sonnet call fills a matured claim's prose (§7.3) and mints the new claim VERSION (same id,
-    why filled, title improved, `why_fingerprint` stamped) — edges are never touched; every evidential
+    why filled, title improved, `kind` proposed, `why_fingerprint` stamped) — edges are never touched; every evidential
     attribute keeps deriving from the fold. Returns (content, cost); (None, cost) when the model
     declined (drop / unparseable / no usable why) — a successful adjudication that the evidence carries
     no durable prose: NO version is minted, the claim keeps its provisional title (review shows it with
@@ -112,6 +117,10 @@ def synthesize_claim(claim: dict, complete_synth: Completer, concept_digest: str
         "id": claim["id"],
         "title": str(parsed.get("title", "")).strip()[:dream.TITLE_MAX] or str(claim.get("title", "")),
         "why": why,
+        # the PROPOSED typology (ADR-0029): behavioral (shapes conduct) vs reference (lookup material).
+        # A proposal only — review confirms it on accept; unknown coerces behavioral (recall-first:
+        # wrongly-behavioral is caught at the gate, wrongly-reference vanishes from generation).
+        "kind": dream.clean_kind(parsed.get("kind")),
         "relation": dream._clean_relation(parsed.get("relation"), known_concept_ids),
         "seed_event": claim.get("seed_event"),
         "born": claim.get("born"),
@@ -300,7 +309,8 @@ def main(argv=None) -> None:
         return
     if args.show:
         for c in report.claims:
-            print(f"\n  • {c['title']}  [{c['relation']['kind']}]")
+            tag = f" · {c['kind']}" if c.get("kind") != dream.KIND_BEHAVIORAL else ""
+            print(f"\n  • {c['title']}  [{c['relation']['kind']}{tag}]")
             print(f"    {c['why']}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""
     if report.breaker_tripped:

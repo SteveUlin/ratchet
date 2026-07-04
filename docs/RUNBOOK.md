@@ -84,6 +84,7 @@ The claim card is an audit surface, not just a summary:
 - **`--reject-merge <edge-id>`** — the "not the same" verdict, one compound decision: retracts the edge, reopens the event, blocks the pair permanently. Retraction IS the split; nothing latches.
 - **Merge suggestions** ride the cards (residue-band pairs, quotes side by side, TTL'd, stored nowhere): confirm `--merge-claims <loser> <winner>`, dismiss `--reject-merge A,B`.
 - **`--contested`** — near-bar claims carrying a live contradicts edge, so one wrong LLM CONTRADICTS verdict can't silently suppress a good claim.
+- **Kind** — synthesize proposes `behavioral` (shapes conduct → projected into CLAUDE.md) or `reference` (a fact to look up — kept, never projected by default). `--accept` records it (`--kind` overrides); `--set-kind <concept> <kind>` re-kinds a concept accepted earlier (ADR-0029).
 
 **7 · Garden — reorganize the concept layer** *(periodic).* Once concepts have accumulated, tidy them: tag, then propose merges / splits / abstractions / retires, and flag stale ones. Low-stakes auto-applies; the rest queues for review². Run occasionally, not every tick.
 
@@ -102,7 +103,7 @@ ratchet review --accept-proposal <id>
 ratchet review --reject-proposal <id> --reason "…"
 ```
 
-**9 · Generate — project concepts → CLAUDE.md.** Refreshed from your reviewed concepts each run; a retired concept's rule *vanishes*. The diff is your final gate.
+**9 · Generate — project concepts → CLAUDE.md.** Refreshed from your reviewed concepts each run; a retired concept's rule *vanishes*. Projects **behavioral** concepts only — reference facts are lookup material, not rules (`--kinds behavioral,reference` widens; the region's header states the filter). The diff is your final gate.
 
 ```
 ratchet generate --diff   --target ~/.claude/CLAUDE.md   # review the change

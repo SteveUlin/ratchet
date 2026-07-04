@@ -86,6 +86,7 @@ read: the why follows the quotes; support is solid.
 
 - **title + maturity line** always; add the why (or the `why-pending` badge), the relation, and scope only when they carry information (`cross-cutting` claims span subjects — that's what a global CLAUDE.md is *for*, not a defect).
 - **audit / match-key lines only when `by:llm` edges or flags exist** — a seed-only claim has nothing to audit; don't pad the card. A ⚠ or a discrepancy you found in the private pass goes here, quoted.
+- **kind line only when the proposal is `reference`** (`claim_kind` in the JSON): synthesize types each claim *behavioral* (shapes conduct — projected into CLAUDE.md) or *reference* (a fact/mechanism you'd look up — kept and queryable, excluded from generation). Faithfulness and generation-usefulness are orthogonal: a true fact can still be the wrong thing to project. The proposal is untrusted like the `why`; sulin's accept confirms it.
 - **its merge suggestion, if any** (they ride the cards, derived at render time, TTL'd, stored nowhere): both claims' quotes side by side, no similarity score — the human judges words, not numbers.
 - **your read, ≤ 2 lines** — the faithfulness verdict from the private pass.
 
@@ -99,7 +100,8 @@ Then ask **ONE question** with the verdict options:
 
 ### Record sulin's call (pass your assessment as provenance)
 
-- **accept:** `nix run ~/ratchet#review -- --accept <claim_id> --assessment "<your faithfulness check>"` (add `--note "..."` for anything else worth recording).
+- **accept:** `nix run ~/ratchet#review -- --accept <claim_id> --assessment "<your faithfulness check>"` (add `--note "..."` for anything else worth recording; add `--kind behavioral|reference` when sulin's call differs from the proposed kind — the default follows the proposal).
+- **re-kind** (a concept already accepted under the wrong kind — e.g. a lookup fact projecting as a rule): `--set-kind <concept_id> <kind> --reason "..."` — reviewer-owned like retire, and it outranks the kind recorded at accept.
 - **edit-accept** (sulin corrects the title/why first — the highest-value signal): `--accept <id> --edit-title "..." --edit-why "..." --assessment "..."`
 - **reject:** `--reject <id> --reason "<sulin's reason>"`
 - **merge** (confirm a suggestion — fold the loser into the winner): `--merge-claims <loser> <winner> --reason "…"`; **dismiss** it (distinct lessons — never asked again): `--reject-merge <loserId>,<winnerId> --reason "…"`

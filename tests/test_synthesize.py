@@ -5,8 +5,9 @@ Completer (no network, no API key). The §7.3 properties under test:
       calls. This is THE property that kills Sonnet-per-event (and the rejected "near-mature" trigger,
       which re-created it: at bar 1.5 every fresh seed is within one session of the bar).
   MATURED FILL — a matured why-null claim enumerates; ONE call fills why (title improved, relation
-      coerced); edges are NEVER touched and support/cites stay byte-identical — prose is the one
-      stored non-derived field.
+      coerced, kind PROPOSED — behavioral vs reference, unknown coerced behavioral, ADR-0029); edges
+      are NEVER touched and support/cites stay byte-identical — prose is the one stored non-derived
+      field.
   FINGERPRINT — the minted version stamps the live corroborates-edge-set fingerprint it consumed;
       retract an edge afterwards → the fold flags why_stale (fused prose must not latch silently).
   IDEMPOTENCY — the done-marker keys on (claim_id, prompt_version, model): a drop verdict marks done
@@ -111,11 +112,13 @@ class ResolveFake:
 GOOD = {"title": "  jj is the version-control interface  ",
         "why": "Version control here goes through jj; git commands bypass jj's working-copy model "
                "and desync its view of the repo.",
+        "kind": "reference",           # the model's PROPOSED typology (ADR-0029) — stored on the version
         "relation": {"kind": "strengthens", "concept_id": "c-nonexistent", "note": "covers the jj rule"},
         "confidence": 0.9}
 GOOD2 = {"title": "jj, never git",
          "why": "Every version-control operation must use jj: it is the only tool whose working-copy "
                 "model matches this environment.",
+         "kind": "mechanism",          # OUTSIDE the vocabulary → coerces behavioral (recall-first)
          "relation": {"kind": "new", "concept_id": None, "note": ""}, "confidence": 0.8}
 
 
@@ -212,6 +215,7 @@ resolve.run(ResolveFake(["same-as-1"]), model="fake", forget=False, root=R2)
 before = claim_pool(R2)[0]
 cid = before["id"]
 assert before["why"] is None and before["support"] == {"events": 2, "sessions": 2}
+assert before["kind"] is None, "no kind before synthesize — nothing has proposed one yet"
 edges_before = edge_snapshot(R2)
 
 fake2 = SynthFake([GOOD])
@@ -221,6 +225,7 @@ assert rep2.n_queue == 1 and rep2.n_filled == 1 and rep2.n_dropped == 0 and fake
 after = claim_pool(R2)[0]
 assert after["why"] == GOOD["why"].strip(), "why filled with the clipped prose"
 assert after["title"] == "jj is the version-control interface", "title improved (stripped, capped)"
+assert after["kind"] == "reference", "the proposed kind is stored on the version and folds through"
 assert after["relation"] == {"kind": "new", "concept_id": None, "note": "covers the jj rule"}, \
     "an unknown concept_id coerces the relation to new (dream._clean_relation)"
 assert after["support"] == before["support"] and after["cites"] == before["cites"] \
@@ -229,19 +234,21 @@ assert after["support"] == before["support"] and after["cites"] == before["cites
 assert edge_snapshot(R2) == edges_before, "edges NEVER touched: no new edge, no new edge version"
 system2, user2 = fake2.prompts[0]
 assert "MATURED CLAIM" in system2 and '"drop"' in system2, "the matured-claim framing + JSON contract"
+assert '"kind": "behavioral"|"reference"' in system2, "the typology rides the JSON contract (ADR-0029)"
 assert JJ_SEED in user2 and JJ_PARA in user2, "every corroborating verbatim quote reaches the model"
 assert "(no concepts yet — treat everything as new)" in user2, "the concept digest rides as the prior"
 assert f"provisional title: {JJ_SEED!r}" in user2, "the machine summary is shown as a hint, not truth"
 done2 = block.done_index("synthesize", R2)
 assert (cid, synthesize.PROMPT_VERSION, "fake") in done2, \
     "the done-marker keys on (claim_id, prompt_version, model)"
-print("OK §2 — matured fill: one call, why filled, title improved, relation coerced; edges and")
-print("        support byte-identical; quotes + digest in the prompt; marker keyed as specified.")
+print("OK §2 — matured fill: one call, why filled, title improved, relation coerced, kind proposed;")
+print("        edges and support byte-identical; quotes + digest in the prompt; marker keyed as specified.")
 
 
 # === 3. FINGERPRINT: the minted version stamps the live corroborates-edge-set it consumed ============
 
 content2 = claim_content(cid, R2)
+assert content2["kind"] == "reference", "the stored claim version carries the proposed kind, like title/why"
 want_fp = resolve.corro_fingerprint(cid, after["cites"])
 assert content2["why_fingerprint"] == want_fp, "the stored version carries the edge-set fingerprint"
 assert after["why_fingerprint"] == want_fp and after["why_stale"] is False, \
@@ -299,6 +306,9 @@ fake6a = SynthFake([GOOD2])
 rep6a = synthesize.run(fake6a, model="fake", claim=cid1, root=R1)
 assert rep6a.n_filled == 1 and fake6a.calls == 1
 assert claim_pool(R1)[0]["why"] == GOOD2["why"].strip(), "--claim works regardless of the bar"
+assert claim_pool(R1)[0]["kind"] == "behavioral", \
+    "an out-of-vocabulary kind ('mechanism') coerces behavioral — recall-first: wrongly-behavioral is " \
+    "caught at review; wrongly-reference would silently vanish from generation"
 
 # (b) marker bypass: R3's claim carries a done-marker (the drop) — the demand param re-pays anyway.
 fake6b = SynthFake([GOOD])

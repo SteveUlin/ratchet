@@ -34,9 +34,10 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+from collections import Counter
 from pathlib import Path
 
-from . import concepts, config
+from . import concepts, config, dream
 
 # The region delimiters. generate owns ONLY the span between them; the START marker self-documents that
 # the region is machine-managed so a human who opens the file knows their edits inside it are transient.
@@ -55,6 +56,39 @@ GENERATED_FILENAME = "CLAUDE.md"
 # The trailing bucket for concepts with no managed tag — every concept lands in EXACTLY one group, so an
 # untagged one needs a home; `general` is it (always rendered LAST). A real `general` tag folds here too.
 GENERAL_GROUP = "general"
+
+# The projection's KIND filter (ADR-0029): `behavioral` ONLY by default. The rules budget — a reader's
+# attention inside CLAUDE.md — is behavioral surface: rules that shape conduct. A `reference` concept
+# (a mechanism/fact you'd look up) is just as true and stays in the concept layer, kept + queryable,
+# but projecting it would spend rule-attention on lookup material. `--kinds` widens deliberately; the
+# region's header comment states the filter, so a CLAUDE.md reader knows what is (not) shown.
+DEFAULT_KINDS = (dream.KIND_BEHAVIORAL,)
+
+
+def _normalize_kinds(kinds) -> tuple[str, ...]:
+    """Validate + canonicalize a kind selection: unknown kinds (or an empty selection) are REFUSED —
+    the flag is a reviewer-facing knob, and a typo silently projecting nothing would be the exact
+    hidden-rule failure ADR-0027 forbids — and the survivors take CONCEPT_KINDS order, so
+    `--kinds reference,behavioral` and `--kinds behavioral,reference` render byte-identically
+    (idempotent `--apply`)."""
+    picked = set(kinds)
+    unknown = picked - set(dream.CONCEPT_KINDS)
+    if unknown or not picked:
+        raise ValueError(f"--kinds takes a non-empty subset of {','.join(dream.CONCEPT_KINDS)}; "
+                         f"got {','.join(sorted(picked)) or '(nothing)'!r}")
+    return tuple(k for k in dream.CONCEPT_KINDS if k in picked)
+
+
+def _kinds_note(kinds: tuple[str, ...], excluded: Counter) -> str:
+    """The region's second header line: WHICH kinds this projection carries and what it left out — so a
+    CLAUDE.md reader knows the region is a filtered view, not the whole concept layer. Deterministic
+    (counts derive from the store)."""
+    shown = ", ".join(kinds)
+    if not excluded:
+        return f"<!-- kinds: {shown} -->"
+    ex = " · ".join(f"{excluded[k]} {k}" for k in dream.CONCEPT_KINDS if excluded.get(k))
+    return (f"<!-- kinds: {shown} — {ex} concept(s) excluded: lookup material, not conduct "
+            f"(kept + queryable; `--kinds` widens) -->")
 
 
 def default_target(root: Path | None = None) -> Path:
@@ -124,21 +158,32 @@ def _render_body(ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def project(root: Path | None = None) -> str:
-    """The MECHANICAL projection — the full marked region (START + tag-led rule body + END) for the current
-    VALID concept set. Built from `concepts.digest_context` (ONE facet pass — the gardener's managed tags
-    ride on each node's facets, so the primary-tag grouping reads straight off it), so retraction is
-    automatic: a concept absent from the valid set is absent here. Deterministic — same store → byte-identical
-    region — so `--apply` with unchanged concepts is a no-op. NO LLM."""
+def project(root: Path | None = None, *, kinds: tuple[str, ...] = DEFAULT_KINDS) -> str:
+    """The MECHANICAL projection — the full marked region (START + kinds note + tag-led rule body + END)
+    for the current VALID concept set of the selected `kinds` (behavioral-only by default — see
+    DEFAULT_KINDS; the note line states the filter and what it excluded). Built from
+    `concepts.digest_context` (ONE facet pass — the gardener's managed tags ride on each node's facets,
+    so the primary-tag grouping reads straight off it), so retraction is automatic: a concept absent
+    from the valid set is absent here, and so is one the reviewer re-kinds `reference` (`--set-kind`).
+    Deterministic — same store → byte-identical region — so `--apply` with unchanged concepts is a
+    no-op. NO LLM."""
+    kinds = _normalize_kinds(kinds)
     ctx = concepts.digest_context(root or config.data_root())
-    return f"{START}\n{_render_body(ctx)}\n{END}"
+    # each node's derived kind rides ctx["blobs"] (dream.load_concepts attaches it); a node whose blob
+    # is gone reads behavioral — the recall-safe default (rendered, caught at the diff gate).
+    kind_of = {cid: dream.clean_kind(ctx["blobs"].get(cid, {}).get("kind")) for cid in ctx["by_node"]}
+    excluded = Counter(k for k in kind_of.values() if k not in kinds)
+    ctx = {**ctx, "by_node": {cid: n for cid, n in ctx["by_node"].items() if kind_of[cid] in kinds}}
+    return f"{START}\n{_kinds_note(kinds, excluded)}\n{_render_body(ctx)}\n{END}"
 
 
 # --- the faithfulness context: each projected concept's statement + verified evidence -------------
 
-def projected_concepts(root: Path | None = None) -> list[dict]:
-    """The FAITHFULNESS context for the projection — each VALID concept (the ones the region renders),
-    paired with the verified EVIDENCE behind its statement. Read-only, NO LLM: `valid_concepts` enriched
+def projected_concepts(root: Path | None = None, *,
+                       kinds: tuple[str, ...] = DEFAULT_KINDS) -> list[dict]:
+    """The FAITHFULNESS context for the projection — each VALID concept (the ones the region renders:
+    same `kinds` filter as `project`, behavioral-only by default), paired with the verified EVIDENCE
+    behind its statement. Read-only, NO LLM: `valid_concepts` enriched
     with the `concepts.digest_context` facets (`repos`/`tags` — the grouping + repo-trigger inputs) and
     `review.resolve_evidence` (spans RE-VALIDATED, a stale one dropped — the same verified quotes the
     review gate is served). The `/ratchet-generate` skill reads this to keep a re-worded rule TRUE to its
@@ -149,15 +194,19 @@ def projected_concepts(root: Path | None = None) -> list[dict]:
     `review` is imported FUNCTION-LOCALLY — review doesn't import generate (no cycle), but the lazy import
     matches the convention used for the other cross-module reads and keeps the module's import graph flat."""
     from . import review                         # function-local: review serves the canonical evidence resolver
+    kinds = _normalize_kinds(kinds)
     root = root or config.data_root()
     by_node = concepts.digest_context(root)["by_node"]
     out: list[dict] = []
     for c in sorted(review.valid_concepts(root), key=lambda c: c["id"]):
+        if dream.clean_kind(c.get("kind")) not in kinds:
+            continue                             # the region doesn't render it → nothing to be faithful to
         facets = by_node.get(c["id"], {}).get("facets", {})
         out.append({
             "id": c["id"],
             "title": c.get("title", ""),
             "statement": c.get("statement", ""),
+            "kind": c["kind"],
             "repos": facets.get("repos") or [],
             "tags": facets.get("tags") or [],
             "evidence": review.resolve_evidence(c, root),   # pointers → re-validated verbatim quotes
@@ -204,7 +253,8 @@ def _splice(text: str, region: str) -> tuple[str, str]:
     return text + sep + region + "\n", "appended"
 
 
-def apply(root: Path | None = None, *, target: Path | str | None = None) -> dict:
+def apply(root: Path | None = None, *, target: Path | str | None = None,
+          kinds: tuple[str, ...] = DEFAULT_KINDS) -> dict:
     """Write the projection into `target`'s marked region (refresh-in-place). Reads the current file (or ""
     when absent), splices in `project(root)`, writes only when the bytes CHANGE (so re-apply with unchanged
     concepts touches nothing). The staged default target is created on demand; a real CLAUDE.md is written
@@ -212,7 +262,7 @@ def apply(root: Path | None = None, *, target: Path | str | None = None) -> dict
     root = root or config.data_root()
     tgt = Path(target) if target is not None else default_target(root)
     old = tgt.read_text() if tgt.exists() else ""
-    new, action = _splice(old, project(root))
+    new, action = _splice(old, project(root, kinds=kinds))
     tgt.parent.mkdir(parents=True, exist_ok=True)
     changed = new != old
     if changed:
@@ -220,13 +270,14 @@ def apply(root: Path | None = None, *, target: Path | str | None = None) -> dict
     return {"target": str(tgt), "action": action, "changed": changed}
 
 
-def diff(root: Path | None = None, *, target: Path | str | None = None) -> str:
+def diff(root: Path | None = None, *, target: Path | str | None = None,
+         kinds: tuple[str, ...] = DEFAULT_KINDS) -> str:
     """A unified diff of the PROPOSED region vs the target's CURRENT one — what `--apply` would change, for
     the human to review BEFORE applying (the second review tier). Empty string when they already match."""
     root = root or config.data_root()
     tgt = Path(target) if target is not None else default_target(root)
     old = tgt.read_text() if tgt.exists() else ""
-    proposed = project(root)
+    proposed = project(root, kinds=kinds)
     lines = difflib.unified_diff(current_region(old).split("\n"), proposed.split("\n"),
                                  fromfile=f"{tgt} (current region)", tofile=f"{tgt} (proposed region)",
                                  lineterm="")
@@ -252,23 +303,31 @@ def main(argv=None) -> None:
     ap.add_argument("--target",
                     help="the file whose ratchet:generated region to manage (default: a STAGED "
                          "$RATCHET_DATA_DIR/generated/CLAUDE.md that never clobbers a real CLAUDE.md)")
+    ap.add_argument("--kinds", default=",".join(DEFAULT_KINDS), metavar="K[,K]",
+                    help=f"which concept kinds to project (default: {','.join(DEFAULT_KINDS)}). "
+                         f"reference concepts are EXCLUDED by default because the rules budget is "
+                         f"behavioral surface — rules that shape conduct — while a reference fact is "
+                         f"lookup material; it stays valid and queryable (review --concepts), it just "
+                         f"doesn't spend CLAUDE.md attention. `--kinds "
+                         f"{','.join(dream.CONCEPT_KINDS)}` widens (ADR-0029)")
     args = ap.parse_args(argv)
     root = config.data_root()
     target = args.target            # None → the staged default, resolved inside apply/diff
 
-    try:                                # a corrupted/ambiguous target region raises — surface it cleanly,
-        if args.apply:                  # not as a traceback; the file is never written on the raise path
-            res = apply(root, target=target)
+    try:                                # a corrupted/ambiguous target region or a bad --kinds raises —
+        kinds = tuple(s.strip() for s in args.kinds.split(",") if s.strip())
+        if args.apply:                  # surface it cleanly, not as a traceback; the file is never
+            res = apply(root, target=target, kinds=kinds)                 # written on the raise path
             print(f"{res['action']} ratchet region in {res['target']}"
                   + ("" if res["changed"] else " (no change — byte-identical)"))
         elif args.concepts:
-            print(json.dumps(projected_concepts(root), ensure_ascii=False, indent=2))
+            print(json.dumps(projected_concepts(root, kinds=kinds), ensure_ascii=False, indent=2))
         elif args.diff:
-            d = diff(root, target=target)
+            d = diff(root, target=target, kinds=kinds)
             tgt = target if target is not None else default_target(root)
             print(d if d.strip() else f"no changes — {tgt}'s region already matches the projection")
         else:
-            print(project(root))
+            print(project(root, kinds=kinds))
     except ValueError as e:
         raise SystemExit(f"generate: {e}")
 

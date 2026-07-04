@@ -21,7 +21,7 @@ could desync):
             the live edge census (llm-adjudicated vs total — how much of the graph the matcher
             built vs $0 seeds).
   REVIEW    tier-1 pending + incubating, tier-2 open structural-op proposals.
-  CONCEPTS  the valid set.
+  CONCEPTS  the valid set, split by kind (behavioral — the generate surface — vs reference, ADR-0029).
   GENERATE  would the projected region be non-empty (generate's own `project`, never written).
 
 Every section DEGRADES to zeros: a stage with no data (or a mid-edit module) prints a zero-line,
@@ -48,7 +48,7 @@ ZEROS: dict[str, dict] = {
     "claims": {"total": 0, "active": 0, "dormant": 0, "mature": 0, "awaiting_synthesize": 0,
                "accepted": 0, "contested": 0, "edges": 0, "llm_edges": 0},
     "review": {"pending": 0, "incubating": 0, "proposals": 0},
-    "concepts": {"valid": 0},
+    "concepts": {"valid": 0, "behavioral": 0, "reference": 0},
     "generate": {"region_nonempty": False, "rules": 0},
 }
 
@@ -152,7 +152,12 @@ def _review(root: Path, maturity: float) -> dict:
 
 
 def _concepts(root: Path) -> dict:
-    return {"valid": len(dream.load_concepts(root))}
+    """The valid set, split by KIND (ADR-0029) — behavioral is what generate projects by default;
+    reference is kept lookup material. Same derivation the projection filters on (`load_concepts`
+    attaches each concept's decision-folded kind), so the split and the region always agree."""
+    cs = dream.load_concepts(root)
+    ref = sum(1 for c in cs if c.get("kind") == dream.KIND_REFERENCE)
+    return {"valid": len(cs), "behavioral": len(cs) - ref, "reference": ref}
 
 
 def _generate(root: Path) -> dict:
@@ -198,7 +203,7 @@ def render(c: dict, *, datastore: Path, maturity: float) -> str:
         f"          edges: {cl['edges']} live · {cl['llm_edges']} by llm",
         f"REVIEW    tier-1: {rv['pending']} pending · {rv['incubating']} incubating · "
         f"tier-2: {rv['proposals']} proposal(s)",
-        f"CONCEPTS  {co['valid']} valid",
+        f"CONCEPTS  {co['valid']} valid ({co['behavioral']} behavioral · {co['reference']} reference)",
         f"GENERATE  region would be {'NON-EMPTY' if g['region_nonempty'] else 'empty'}"
         + (f" ({g['rules']} rule(s))" if g["region_nonempty"] else ""),
     ]

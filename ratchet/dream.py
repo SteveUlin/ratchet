@@ -149,6 +149,26 @@ VERB_SUPERSEDE = "supersede"
 VERB_SPLIT = "split"
 CONCEPT_INVALID_VERBS = (VERB_RETIRE, VERB_SUPERSEDE, VERB_SPLIT)
 
+# The concept TYPOLOGY (ADR-0029): faithfulness and generation-usefulness are ORTHOGONAL. A claim can
+# be true, worth keeping, and still not belong in CLAUDE.md — "ultracode = env-set effort level" is a
+# fact you'd look up; "verify the fix is in the exact artifact before the risky action" shapes conduct.
+# So every concept carries a KIND: `behavioral` (shapes conduct — generate projects it) or `reference`
+# (a mechanism/fact — kept, queried, never projected by default). The LLM PROPOSES a kind at
+# synthesize; the reviewer's decision is authoritative (recorded on the accept, re-kindable later via
+# review's `set_kind` — the fold below). Coercion is RECALL-FIRST: an unknown/absent kind reads
+# `behavioral`, because a wrongly-behavioral rule is caught at the review/diff gates while a
+# wrongly-reference lesson silently vanishes from generation.
+KIND_BEHAVIORAL = "behavioral"
+KIND_REFERENCE = "reference"
+CONCEPT_KINDS = (KIND_BEHAVIORAL, KIND_REFERENCE)
+VERB_SET_KIND = "set_kind"     # review's re-kinding decision verb — written there, folded here
+
+
+def clean_kind(v) -> str:
+    """Coerce a proposed kind to the closed vocabulary — unknown/absent → `behavioral` (recall-first,
+    see CONCEPT_KINDS above). The coercion idiom of `_clean_relation`/`clean_score`, for the typology."""
+    return v if v in CONCEPT_KINDS else KIND_BEHAVIORAL
+
 ROUTE_SYSTEM = (
     "You are the ROUTER for a developer's long-term memory. A new OBSERVATION arrived from a Claude "
     "Code session; you are shown the CURRENT CATALOG of takeaways the memory already holds. Decide "
@@ -199,14 +219,51 @@ _STOPWORDS = frozenset(
 
 # --- the concept seam: dream reads the curated-knowledge layer the review gate writes ----------
 
+def concept_kinds(root: Path | None = None) -> dict[str, str]:
+    """concept id → its reviewer-confirmed KIND, folded from DECISIONS only (ADR-0029): the latest
+    `set_kind` decision targeting the concept wins over the `kind` the latest accept/edit decision
+    recorded (the accept references its minted concept via its `concept` field); a concept in NEITHER
+    map is absent here and defaults `behavioral` at the caller (legacy concepts predate the facet).
+    The kind lives on decisions, never the concept blob, so a garden op re-versioning the blob
+    (merge's evidence union) cannot silently drop it — and the reviewer's `set_kind` outranks the
+    accept because re-kinding is a LATER, deliberate call on the same trust boundary. One scan;
+    same (fetched_at, content_hash) recency tie-break as `latest_decisions`. ("accept", "edit") are
+    review's promote verbs — resolve.ACCEPT_VERBS, spelled here to keep dream import-cycle-free."""
+    root = root or config.data_root()
+    set_best: dict[str, tuple[tuple[str, str], str]] = {}
+    acc_best: dict[str, tuple[tuple[str, str], str]] = {}
+    for d in blobstore.decisions_for(None, root):
+        if d.get("kind") not in CONCEPT_KINDS:
+            continue                                   # kind-less (legacy) or foreign — nothing to fold
+        key = (d.get("fetched_at", ""), d.get("content_hash", ""))
+        verb = d.get("verb")
+        if verb == VERB_SET_KIND and isinstance(d.get("target"), str):
+            t = d["target"]
+            if t not in set_best or key > set_best[t][0]:
+                set_best[t] = (key, d["kind"])
+        elif verb in ("accept", "edit") and isinstance(d.get("concept"), str):
+            c = d["concept"]
+            if c not in acc_best or key > acc_best[c][0]:
+                acc_best[c] = (key, d["kind"])
+    out = {c: k for c, (_, k) in acc_best.items()}
+    out.update({c: k for c, (_, k) in set_best.items()})   # set_kind > accept — the later, deliberate call
+    return out
+
+
 def load_concepts(root: Path | None = None) -> list[dict]:
     """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
     against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
     derived: the latest version of each concept source, minus any whose latest decision is `retire`.
     This is the loop closing — review's accepts become the concepts dream reads next run. Empty until
-    review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal."""
+    review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal.
+
+    Each returned concept carries a derived `kind` (ADR-0029): latest set_kind decision > the accept
+    decision's kind > `behavioral` (the legacy default — concepts predating the facet shape conduct
+    until the reviewer says otherwise). Attached here, on the ONE valid-concept view, so every
+    consumer (generate's projection filter, status's census, review's listing) reads one derivation."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
+    kinds = concept_kinds(root)
     out: list[dict] = []
     for sid, h in blobstore.latest_by_kind("concept", root).items():
         d = decisions.get(sid)
@@ -217,6 +274,7 @@ def load_concepts(root: Path | None = None) -> list[dict]:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
+            obj["kind"] = kinds.get(obj["id"], KIND_BEHAVIORAL)
             out.append(obj)
     return out
 

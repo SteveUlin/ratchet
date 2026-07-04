@@ -4,16 +4,20 @@ provenance, then assert `generate.project` renders the expected TAG-LED, provena
 trailing `## general` bucket), `--apply` refreshes the region IN PLACE while preserving human content above
 AND below the markers, a target with the markers TWICE is REFUSED (ambiguous region — never clobber), a
 RETIRED concept vanishes on re-project (retraction-for-free), re-apply with unchanged concepts is
-byte-identical (idempotent), and the empty store yields a clear empty projection.
+byte-identical (idempotent), the empty store yields a clear empty projection, and the KIND filter
+(ADR-0029) keeps `reference` concepts out of the default projection — stated in the region's kinds note
+— while `--kinds behavioral,reference` widens.
 
 generate is the mechanical projection that CLOSES THE LOOP (concept → CLAUDE.md); no LLM, so this whole suite
 runs offline.
 
 Run: `python tests/test_generate.py` (throwaway dir)."""
+import io
 import json
 import os
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -75,6 +79,10 @@ mint_concept("c-a", "foo span", "Run the formatter before every commit.", [ch1, 
 mint_concept("c-b", "foo one", "Keep functions under fifty lines.", [ch1])             # alpha, 1 session
 mint_concept("c-d", "beta baz", "Prefer jj over git for every operation.", [ch3])      # beta, 1 session
 mint_concept("c-e", "no prov", "Write tests first.", [])                               # no evidence → no repo
+# a REFERENCE concept (ADR-0029): true, kept, but lookup material — the default projection excludes it.
+# The kind lives on the reviewer's set_kind DECISION, never the blob (a garden re-version can't drop it).
+mint_concept("c-f", "an effort fact", "ultracode is an effort level, not a model tier.", [])
+review.set_kind("c-f", "reference", R, reason="a fact you'd look up, not conduct")
 
 # Managed tags (3b/ADR-0014) — the PRIMARY tag is now the grouping axis. c-a + c-b share `workflow` (a 2-member
 # group), c-d is alone under `version-control`, c-e is untagged → the trailing `general` bucket.
@@ -202,7 +210,48 @@ assert generate.START in ftext and generate.END in ftext, "the region is created
 
 empty = config.ensure_layout(Path(tempfile.mkdtemp(prefix="ratchet-test-generate-empty-")))
 pe = generate.project(empty)
-assert pe == f"{generate.START}\n{generate.EMPTY_BODY}\n{generate.END}", f"the empty store yields a clear empty projection:\n{pe}"
+assert pe == f"{generate.START}\n<!-- kinds: behavioral -->\n{generate.EMPTY_BODY}\n{generate.END}", \
+    f"the empty store yields a clear empty projection (kinds note + empty-body sentinel):\n{pe}"
 assert "<!--" in pe and "## " not in pe, "no rules/headings, but a well-formed (idempotent) region"
+
+
+# === 7. the KIND filter (ADR-0029): reference excluded by default, stated in the note; --kinds widens =
+
+p7 = generate.project(R)
+assert "<!-- c-f -->" not in p7 and "ultracode is an effort level" not in p7, \
+    "a reference concept is EXCLUDED from the default projection — lookup material, not conduct"
+assert "kinds: behavioral — 1 reference concept(s) excluded" in p7, \
+    f"the region's header note states the filter, so a CLAUDE.md reader knows:\n{p7}"
+
+p7w = generate.project(R, kinds=("behavioral", "reference"))
+assert "ultracode is an effort level, not a model tier. <!-- c-f -->" in p7w, \
+    "--kinds behavioral,reference widens: the reference rule renders (untagged → general)"
+assert "kinds: behavioral, reference" in p7w and "excluded" not in p7w, "nothing excluded → nothing claimed"
+assert generate.project(R, kinds=("reference", "behavioral")) == p7w, \
+    "the kind selection is canonicalized — flag order can't break --apply idempotency"
+
+try:
+    generate.project(R, kinds=("behavioral", "mechanism"))
+    assert False, "an unknown kind must raise — a typo silently projecting nothing is a hidden rule"
+except ValueError:
+    pass
+raised = False
+try:
+    generate.main(["--dry-run", "--kinds", "bogus"])
+except SystemExit:
+    raised = True
+assert raised, "the CLI surfaces the bad --kinds cleanly (SystemExit, not a traceback)"
+
+# projected_concepts (the faithfulness context) tracks the SAME filter as the region.
+ids_default = {c["id"] for c in generate.projected_concepts(R)}
+assert "c-f" not in ids_default and "c-a" in ids_default
+wide = {c["id"]: c for c in generate.projected_concepts(R, kinds=("behavioral", "reference"))}
+assert wide["c-f"]["kind"] == "reference" and wide["c-a"]["kind"] == "behavioral", \
+    "each faithfulness row carries its derived kind (kind-less legacy blobs read behavioral)"
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    generate.main(["--dry-run", "--kinds", "behavioral,reference"])
+assert "<!-- c-f -->" in buf.getvalue(), "the CLI escape hatch reaches the projection"
 
 print("test_generate: all assertions passed")
