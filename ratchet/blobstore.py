@@ -356,7 +356,12 @@ def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     its `repo` facet, single-sourced here so dream/glean/review share one spelling for the `--topic`
     operator filter (ADR-0022). An optional `cache` memoizes across calls; absent/broken meta → None
     (never fatal — a `--topic` run then simply doesn't match that item). One meta hop per call, no
-    content read, no LLM."""
+    content read, no LLM.
+
+    A DOCUMENT source (ADR-0031) carries no `project` — deliberately, because `origin_ref.project`
+    also feeds the repo facet (`concepts._repo_label`) and a document must stay subject-empty — so
+    its FOCUS handle falls back to `origin_ref.path`: `--topic CLAUDE.md` selects the document's
+    chunks/events without ever granting it a repo identity."""
     root = root or config.data_root()
     if cache is not None and cleaned_hash in cache:
         return cache[cleaned_hash]
@@ -364,7 +369,8 @@ def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     try:
         raw = get_meta(cleaned_hash, root).get("derived_from")
         if raw:
-            proj = (get_meta(raw, root).get("origin_ref") or {}).get("project")
+            origin = get_meta(raw, root).get("origin_ref") or {}
+            proj = origin.get("project") or origin.get("path")
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         proj = None
     if cache is not None:

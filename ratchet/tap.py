@@ -15,6 +15,12 @@ content-identical touch the processed marker cannot express — filters unchange
 `items()` (so they are not even examined); the blobstore's content-addressing no-ops a
 re-ingest of identical bytes. The per-session processed marker is written for Report uniformity;
 it is cosmetic (the cursor already skipped). cost is always 0 (no LLM) — `--max-usd` is inert.
+
+DOCUMENT MODE (`--file PATH`, ADR-0031): ingest an explicit file — the owner's hand-written
+CLAUDE.md today, a fetched PDF/webpage dump tomorrow — VERBATIM as a `document` raw blob. The
+file's absolute path is its `source_id` AND its session identity (see `read_document`); the same
+fingerprint cursor and version fold apply, so a re-tap of an unchanged file no-ops and a changed
+file mints a new VERSION of the same source.
 """
 from __future__ import annotations
 
@@ -106,6 +112,38 @@ def read_origin(path: Path) -> tuple[str, dict]:
     return text, origin
 
 
+def read_document(path: Path) -> tuple[str, dict]:
+    """Return (verbatim text, origin_ref backlink) for a `--file` document (ADR-0031).
+
+    VERBATIM: the raw blob is the TRUE file bytes, so the decode is STRICT — a non-UTF-8 file
+    raises, the driver isolates it as errored, and nothing mangled ever enters the store (contrast
+    `read_origin`'s errors="replace", right for transcripts where one bad byte must not cost a
+    whole session). `mtime` is the file's save time — the document's VALID-TIME (when the owner
+    last asserted its content), the clock recency/decay weighting reads.
+
+    SESSION IDENTITY — the document's epistemology, deliberate (ADR-0031): the session is the
+    file's stable PATH, never per-version — ALL versions of one file are ONE session. Maturity
+    counts DISTINCT sessions, so a document asserts a rule ONCE no matter how often it is saved or
+    re-tapped: resolve's exact-dup fast path deterministically corroborates a re-tapped identical
+    rule into its claim at ZERO added maturity (same session), an edited rule seeds a new claim or
+    adjudicates against LIVED claims (those carry different sessions — allowed), and maturity comes
+    only from the owner's real sessions living the rule, or his direct accept at review.
+
+    No `project`/`cwd` — also deliberate: `origin_ref.project` feeds the repo facet
+    (`concepts._repo_label`), and a document must stay subject-EMPTY (seed-only via subject,
+    scope-derives-global); its `--topic` FOCUS handle is the `path` fallback in
+    `blobstore.project_of` instead."""
+    text = path.read_text(encoding="utf-8")
+    st = path.stat()
+    origin = {
+        "path": str(path),
+        "session_id": str(path),   # path-as-session: one file = one session, forever (see above)
+        "size_bytes": st.st_size,
+        "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+    }
+    return text, origin
+
+
 # --- tap-owned mutable fetch-state cursor (the crawler's "last-seen fingerprint"), kept
 #     separate from the immutable blobstore so a touched/reverted file is not re-read forever ---
 
@@ -183,7 +221,8 @@ class TapBlock:
 
     def __init__(self, datastore: Path = DEFAULT_DATASTORE, project: str | None = None,
                  last: int | None = None, since: str | None = None,
-                 exclude: tuple[str, ...] = (), skip_self: Path | None = None) -> None:
+                 exclude: tuple[str, ...] = (), skip_self: Path | None = None,
+                 files: tuple[Path, ...] = ()) -> None:
         # datastore/project/last/since scope the enumeration (tap-specific FETCH SELECTION, not block.run
         # knobs — selection is per-source, owned by the fetcher; ADR-0022). `--last`/`--since` SELECT which
         # to-ingest candidates exist; the driver's `--limit` caps how many are EXAMINED — distinct levers,
@@ -196,6 +235,10 @@ class TapBlock:
         self.since = since
         self.exclude = exclude
         self.skip_self = skip_self
+        # DOCUMENT MODE (--file, ADR-0031): a non-empty `files` REPLACES the datastore sweep with this
+        # explicit list. Normalized to absolute, resolved paths at construction because the path IS the
+        # source/session identity — `~/x` and `/home/…/x` must be ONE session, not two.
+        self.files = tuple(Path(f).expanduser().resolve() for f in files)
         self._state: dict[str, list] = {}
         self._latest: dict[str, tuple[str, str]] = {}
         self._dirty = False
@@ -208,11 +251,30 @@ class TapBlock:
         (path.stem == session id); --all (default) sweeps the datastore.
 
         A file that fails to stat is yielded with an empty fingerprint so process() raises on the read
-        and the driver isolates it as errored — never silently dropped."""
+        and the driver isolates it as errored — never silently dropped.
+
+        DOCUMENT MODE (`files` set): the explicit list IS the selection, so the sweep's selectors
+        (project/last/since/skip_self) don't apply — only the cursor cheap tier does, identically.
+        --source-id matches the full path (the document's session id), not a stem."""
         _sweep_partials(root)                       # disk hygiene at run start (leaked .partial temps)
         self._state = load_fetch_state(root)
         self._latest = blobstore.latest_index(root)  # source_id -> (fetched_at, hash); current in-run
         self._dirty = False
+        if self.files:
+            for path in self.files:
+                if source_id is not None and str(path) != source_id:
+                    continue
+                try:
+                    st = path.stat()
+                except OSError:
+                    yield (path, [])                # unstatable → process() raises → errored, retried
+                    continue
+                fp = [st.st_size, datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()]
+                prior = self._state.get(str(path))
+                if prior is not None and prior[:2] == fp:
+                    continue  # cheap tier: (size, mtime) unchanged since last tap — never examined
+                yield (path, fp)
+            return
         since_dt = _parse_since(self.since) if self.since else None
         # FETCH SELECTION (`--last`/`--since`, ADR-0022) narrows the SURVIVORS of the cursor skip — "the
         # last N I haven't already pulled" / "only since this date". It buffers candidates ONLY when a
@@ -254,17 +316,28 @@ class TapBlock:
         key → re-processed → the new version ingested. A pure touch (mtime only) bumps mtime → a new
         key too, but that file is read exactly once (then the cursor cheap-skips it), so the re-key is
         harmless (the re-ingest no-ops on the unchanged hash). The key is computable from stat() alone
-        (no read), so the done-skip stays cheap and the read stays in process() for error isolation."""
+        (no read), so the done-skip stays cheap and the read stays in process() for error isolation.
+
+        A DOCUMENT's key carries the FULL path (its session id) — the stem would collide every
+        repo's `CLAUDE.md` into one done-target."""
         path, fp = item
-        return f"{path.stem}:{fp[0]}:{fp[1]}" if fp else path.stem
+        sid = str(path) if self.files else path.stem
+        return f"{sid}:{fp[0]}:{fp[1]}" if fp else sid
 
     def process(self, item: tuple[Path, list], *, root: Path, run_id: str) -> tuple[int, float]:
-        """Read the transcript, update the cursor, ingest its raw blob if new. Returns (1, 0.0) on a
+        """Read the file, update the cursor, ingest its raw blob if new. Returns (1, 0.0) on a
         fresh snapshot, (0, 0.0) if the content already exists. cost is always 0 (no LLM). A raising
-        read_origin (unreadable file) propagates → the driver isolates it as errored, no marker, the
-        file is retried next run."""
+        read (unreadable file, or a non-UTF-8 document) propagates → the driver isolates it as
+        errored, no marker, the file is retried next run. Document mode differs only in the reader
+        (`read_document`: verbatim, path-as-session) and the raw blob's `source_kind`; the cursor,
+        version fold (`prev`), and content-address dedup are shared."""
         path, _fp = item
-        text, origin = read_origin(path)
+        if self.files:
+            text, origin = read_document(path)
+            source_kind = "document"
+        else:
+            text, origin = read_origin(path)
+            source_kind = "transcript"
         sid = origin["session_id"]
         h = blobstore.blob_hash(text)
         # update the cursor even on a dedup-skip: the (size, mtime, hash) record means next run's cheap
@@ -279,7 +352,7 @@ class TapBlock:
             return (0, 0.0)  # content already stored (e.g. a touched or reverted file)
         prev = self._latest.get(sid, ("", None))[1]
         fetched_at = config.now()
-        blobstore.ingest(text, source_kind="transcript", source_id=sid, origin_ref=origin,
+        blobstore.ingest(text, source_kind=source_kind, source_id=sid, origin_ref=origin,
                          fetched_at=fetched_at, prev=prev, h=h, root=root)
         self._latest[sid] = (fetched_at, h)
         return (1, 0.0)
@@ -311,8 +384,16 @@ def main(argv=None) -> None:
                     help="FETCH SELECTION: only the N most-recently-MODIFIED to-ingest files (after the cursor skip)")
     ap.add_argument("--since", metavar="ISO-DATE",
                     help="FETCH SELECTION: only files modified at/after this ISO date (e.g. 2026-06-01)")
+    # DOCUMENT MODE (ADR-0031) — an explicit-file source, replacing the datastore sweep:
+    ap.add_argument("--file", action="append", type=Path, default=[], metavar="PATH",
+                    help="DOCUMENT MODE: ingest this file verbatim as a `document` source (repeatable; "
+                         "e.g. ~/.claude/CLAUDE.md). The file's absolute path is its source id AND its "
+                         "session — all versions of one file are ONE session, so a document can never "
+                         "self-mature by re-taps (ADR-0031). Replaces the datastore sweep; the same "
+                         "cursor makes re-taps of an unchanged file no-ops")
     # uniform block surface (per ADR-0009):
-    ap.add_argument("--source-id", help="ingest just this session (path.stem == session id)")
+    ap.add_argument("--source-id", help="ingest just this session (path.stem == session id; "
+                                        "with --file: the full path)")
     ap.add_argument("--all", action="store_true",
                     help="sweep the whole datastore (default when no --source-id)")
     ap.add_argument("--limit", type=int, help="cap items EXAMINED this run")
@@ -328,12 +409,20 @@ def main(argv=None) -> None:
             _parse_since(args.since)
         except ValueError:
             ap.error(f"--since {args.since!r} is not an ISO date/datetime (e.g. 2026-06-01)")
+    if args.file:
+        # the datastore-sweep selectors would be silently inert alongside an explicit file list —
+        # refuse the combination rather than hide the rule (the ADR-0027 posture).
+        for flag, val in (("--project", args.project), ("--last", args.last),
+                          ("--since", args.since), ("--exclude", args.exclude or None)):
+            if val is not None:
+                ap.error(f"{flag} selects datastore transcripts; --file names its files explicitly "
+                         f"— the two don't compose (run them as separate taps)")
 
     # By default skip the project dir ratchet's OWN completer runs land in (cwd=data_root) so tap never
     # re-ingests its generated `claude -p` transcripts; `--include-self` lifts it. (ADR-0025)
     skip_self = None if args.include_self else config.data_root()
     blk = TapBlock(datastore=args.datastore, project=args.project, last=args.last, since=args.since,
-                   exclude=tuple(args.exclude), skip_self=skip_self)
+                   exclude=tuple(args.exclude), skip_self=skip_self, files=tuple(args.file))
     # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
     # else built from this stage's args + OUT_NOUN. tap has params=() and no LLM cost (cap omitted).
     progress = None if (args.quiet or args.dry_run) else block.Progress(

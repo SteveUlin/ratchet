@@ -117,6 +117,27 @@ ratchet generate --apply --repo claude-bus --target ~/claude-bus/CLAUDE.md   # (
 
 ---
 
+## Documents — seed your hand-written rules (ADR-0031)
+
+Your existing `~/.claude/CLAUDE.md` is knowledge ratchet can't see: the novelty digest keeps judging rules you already wrote down as `novel`, and they sit outside decay/contradiction tracking. Ingest it as a **document source** — verbatim; the file's path is its source *and its session*, and the render excludes the `ratchet:generated` region, so re-ingesting your own projection can never let the system corroborate itself:
+
+```
+ratchet tap --file ~/.claude/CLAUDE.md      # cursor applies: re-taps of an unchanged file no-op
+ratchet weave --all                         # documents ride the normal prep sweep ($0, idempotent)
+ratchet chunk --all
+ratchet glean --all --topic CLAUDE.md --max-usd 1   # document prompt: each rule → one event
+ratchet resolve --limit 100
+```
+
+The claims sit **incubating at 1 session — by design**: one file is one session no matter how often it's saved, so a document can never self-mature; only your lived sessions (or your accept) mature it. Seed them in one sitting:
+
+```
+ratchet review --incubating --topic CLAUDE.md --limit 0    # every rule-claim, with its rationale
+ratchet review --accept <claim> --assessment "hand-written rule, seeded from CLAUDE.md"
+```
+
+Kinds and scopes propose as usual (a document claim derives `global`). From then on the rules live like any concept: a re-learned rule judges `known`, a lived contradiction lands a real contradicts edge, an unlived rule decays toward "re-confirm or retire?". An **edited** rule seeds a fresh claim on the next tap. This is also the pilot for fetched sources (PDFs, webpages) — same mechanism, plus a fetcher.
+
 ## Cadence
 
 Documentation, not a typed API (design doc §8): what each stage watches and how often a hand-run is safe. When a scheduler is ever warranted, it reads this table; until then you run stages explicitly.

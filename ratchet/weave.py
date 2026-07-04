@@ -20,6 +20,12 @@ separate block (`ratchet.chunk`) that windows the cleaned blob on demand. Trust 
 deterministic, so the cleaned blob is reproducible from an immutable hash and a downstream quote
 verifies as `get(cleaned_hash)[span]`; lineage is all content-addressed hops:
 event -> span in cleaned blob -> derived_from -> raw blob -> datastore.
+
+DOCUMENT MODE (ADR-0031): a `document` raw blob (tap `--file` — the owner's hand-written
+CLAUDE.md, later fetched PDFs/pages) has no conversation tree to reconstruct; `render_document`
+is a line-preserving passthrough MINUS any `ratchet:generated` region — the SELF-LOOP GUARD (see
+`strip_generated`). Mode is picked by the raw meta's `source_kind`; everything downstream (chunk
+windows, glean spans) is unchanged because both modes end in the same RenderedDoc shape.
 """
 from __future__ import annotations
 
@@ -31,8 +37,48 @@ from pathlib import Path
 from . import blobstore, block, config
 
 RENDER_VERSION = "weave/1"             # bump when render logic changes — pins which logic made a span
+                                       # (ONE version for both modes: a doc-render change re-keys
+                                       # transcript renders too, but weave is $0 and content-addressed,
+                                       # so the re-render no-ops — not worth a second knob)
 RENDER_FORMAT = "transcript.render/1"  # the cleaned-blob artifact's shape (source-kind . shape . ver)
+DOC_RENDER_FORMAT = "document.render/1"   # the document passthrough's shape (same naming scheme)
+RENDER_FORMATS = (RENDER_FORMAT, DOC_RENDER_FORMAT)   # every cleaned-doc shape chunk enumerates over
 OUT_NOUN = "cleaned"                    # the per-item output noun the Progress bar/line shows
+
+
+def render_format(source_kind: str) -> str:
+    """The cleaned-blob format for a source kind. The format string self-describes WHICH render made
+    the artifact (`source-kind . shape . ver`), so a sidecar-only consumer can tell a transcript
+    render from a document render without reading content."""
+    return DOC_RENDER_FORMAT if source_kind == "document" else RENDER_FORMAT
+
+
+# THE SELF-LOOP GUARD (ADR-0031, non-negotiable): `generate --apply` writes a marked
+# `<!-- ratchet:generated START … -->` … `<!-- ratchet:generated END -->` region into a target
+# CLAUDE.md. Re-ingesting that region would let ratchet corroborate its own projections — the
+# concept layer laundering its output back in as fresh document evidence (ADR-0025's tap-self-skip,
+# one layer up). The guard is STRUCTURAL because it lives at RENDER time: every downstream span
+# points into the CLEANED blob, and the cleaned blob simply does not contain the region, so no
+# event can ever cite generated text. The markers couple to `generate.START`/`generate.END` by
+# CONVENTION, not import — generate→dream→glean→weave would cycle; tests/test_document.py pins the
+# exact marker text so drift trips a test, not the guard.
+GENERATED_START_PREFIX = "<!-- ratchet:generated START"
+GENERATED_END = "<!-- ratchet:generated END -->"
+
+
+def strip_generated(text: str) -> str:
+    """Remove every ratchet:generated region — a START-prefixed marker through the END marker,
+    inclusive. Defensive where `generate._region_span` is strict, and deliberately so: generate
+    REFUSES an ambiguous region (it must never clobber human content), but the guard here strips
+    ALL regions, and an UNTERMINATED start strips to end-of-file. When in doubt, exclude —
+    over-stripping costs a little recall; under-stripping poisons the loop."""
+    out = text
+    while True:
+        s = out.find(GENERATED_START_PREFIX)
+        if s == -1:
+            return out
+        e = out.find(GENERATED_END, s)
+        out = out[:s] + (out[e + len(GENERATED_END):] if e != -1 else "")
 
 
 # --- 1. parse + active-path reconstruction ------------------------------------------------
@@ -277,8 +323,40 @@ def _spine_turns(spine: list[dict], tool_results: dict[str, str]) -> list[tuple[
     return out
 
 
-def render(blob_text: str, *, source_kind: str = "transcript") -> RenderedDoc:
-    """Active path → one linear, speaker-tagged cleaned document with per-turn char spans."""
+def render_document(blob_text: str, *, title: str | None = None) -> RenderedDoc:
+    """DOCUMENT MODE (ADR-0031): a line-preserving passthrough — the cleaned text is the file's own
+    bytes MINUS any ratchet:generated region (the self-loop guard), behind one `[document] <path>`
+    header turn (the speaker-tag analogue: a chunk stays self-describing about what it excerpts).
+
+    There is no speaker structure to reconstruct, so the turn grain is the text's own blank-line
+    paragraphs: splitting the body on the exact `"\\n\\n"` separator the transcript render joins
+    with makes split+join the IDENTITY — turns tile the cleaned blob byte-for-byte (the same
+    invariant chunk relies on), chunk windows pack whole paragraphs (a rule/bullet never splits
+    mid-thought under budget), and glean's numbered lines line up with the file's own lines. One
+    segment (documents don't compact)."""
+    body = strip_generated(blob_text)
+    parts = [f"[document] {title}" if title else "[document]"] + body.split("\n\n")
+    texts, turns, pos = [], [], 0
+    for p in parts:
+        p = _drop_surrogates(p)                       # 1:1, offset-preserving (verbatim ingest makes
+        texts.append(p)                               # a lone surrogate near-impossible; belt+braces)
+        turns.append(Turn(kind="document", start=pos, end=pos + len(p), segment=0, index=len(turns)))
+        pos += len(p) + 2
+    text = "\n\n".join(texts)
+    return RenderedDoc(text=text, turns=turns, source_kind="document",
+                       render_version=RENDER_VERSION, cleaned_hash=blobstore.blob_hash(text))
+
+
+def render(blob_text: str, *, source_kind: str = "transcript",
+           origin: dict | None = None) -> RenderedDoc:
+    """Active path → one linear, speaker-tagged cleaned document with per-turn char spans.
+
+    Mode dispatches on `source_kind` (the raw meta's): a `document` takes the line-preserving
+    passthrough (`render_document`; `origin` — the raw's origin_ref — supplies the header's path),
+    everything else the transcript reconstruction below."""
+    if source_kind == "document":
+        o = origin or {}
+        return render_document(blob_text, title=o.get("path") or o.get("session_id"))
     records = parse(blob_text)
     spine = active_path(records)
     tool_results = _index_tool_results(records)
@@ -308,7 +386,8 @@ def tags_from_meta(m: dict) -> dict:
 
 def render_blob(raw_hash: str, root: Path | None = None) -> RenderedDoc:
     m = blobstore.get_meta(raw_hash, root)
-    return render(blobstore.get(raw_hash, root), source_kind=m.get("source_kind", "transcript"))
+    return render(blobstore.get(raw_hash, root), source_kind=m.get("source_kind", "transcript"),
+                  origin=m.get("origin_ref"))
 
 
 def materialize(raw_hash: str, *, expires_at: str | None = None,
@@ -319,10 +398,11 @@ def materialize(raw_hash: str, *, expires_at: str | None = None,
     instead of weave's provenance being reissued downstream."""
     root = root or config.data_root()
     m = blobstore.get_meta(raw_hash, root)
-    doc = render(blobstore.get(raw_hash, root), source_kind=m.get("source_kind", "transcript"))
+    doc = render(blobstore.get(raw_hash, root), source_kind=m.get("source_kind", "transcript"),
+                 origin=m.get("origin_ref"))
     h, written = blobstore.put_derived(doc.text, source_kind=doc.source_kind, derived_from=raw_hash,
                                        produced_by="weave", render_version=doc.render_version,
-                                       fmt=RENDER_FORMAT, tags=tags_from_meta(m),
+                                       fmt=render_format(doc.source_kind), tags=tags_from_meta(m),
                                        expires_at=expires_at, h=doc.cleaned_hash, root=root)
     return h, written, doc
 
@@ -351,15 +431,17 @@ class WeaveBlock:
         self.params: tuple[tuple[str, str], ...] = (("render_version", RENDER_VERSION),)
 
     def items(self, root: Path, *, source_id: str | None = None):
-        """Enumerate raw transcript blobs to render. --all → every transcript source's LATEST raw
-        version (a superseded snapshot need not be re-rendered: it is content-addressed and its
-        cleaned blob already exists if ever rendered). --source-id → just that session's latest."""
+        """Enumerate raw blobs to render. --all → every transcript AND document source's LATEST raw
+        version (the two rendered source kinds; a superseded snapshot need not be re-rendered: it is
+        content-addressed and its cleaned blob already exists if ever rendered). --source-id → just
+        that source's latest (a session id, or a document's path)."""
         if source_id is not None:
             h = blobstore.latest_version(source_id, root)
             if h is not None:
                 yield h
             return
-        yield from blobstore.latest_by_kind("transcript", root).values()
+        for kind in ("transcript", "document"):
+            yield from blobstore.latest_by_kind(kind, root).values()
 
     def key(self, raw_hash: str) -> str:
         """The raw blob hash — content-addressed and stable; the cleaned blob is a deterministic
@@ -391,7 +473,8 @@ def main(argv=None) -> None:
                                  description="Render transcript blobs into cleaned documents.")
     ap.add_argument("hash", nargs="?", help="raw blob hash (else --source-id / --all)")
     ap.add_argument("--source-id", help="this logical source's latest blob")
-    ap.add_argument("--all", action="store_true", help="materialize every transcript's latest raw")
+    ap.add_argument("--all", action="store_true",
+                    help="materialize every transcript's and document's latest raw")
     ap.add_argument("--render", action="store_true", help="print the full cleaned document (one blob)")
     ap.add_argument("--inspect", action="store_true",
                     help="print the turn summary of one blob (no materialize)")

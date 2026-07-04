@@ -30,6 +30,13 @@ on a transient outage or kill — only the in-flight chunk re-does (the heart of
 The LLM call is the only impure step, so it is injected as a `Completer`; the core (prompt build,
 parse, quote verification, span math, cost, idempotency) is pure and tested offline. The shipped
 default shells out to the authed `claude` CLI (ADR-0004).
+
+DOCUMENT MODE (ADR-0031): a chunk from a `document` chunkset (tap `--file` → weave's passthrough
+render) is a curated rules file the owner WROTE, not a session — most of it IS durable signal. The
+mode swaps the system prompt (`DOC_SYSTEM_PROMPT`: extract each rule, restate it) and relaxes the
+speaker-tag pre-filter; the trust anchor is UNCHANGED — the model still points at numbered lines
+and the system copies bytes (ADR-0026). Mode is read off the chunkset SIDECAR (no content read),
+and the done-key carries `DOC_PROMPT_VERSION` so the two extractions version independently.
 """
 from __future__ import annotations
 
@@ -47,6 +54,13 @@ from .completer import Completer  # the LLM seam (Completion + the default bindi
 PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks (idempotency key);
                                # glean/4: the model POINTS at numbered lines, it no longer retypes a quote
                                # (ADR-0026) — evidence is copy-pasted from the blob, never transcribed
+DOC_PROMPT_VERSION = "glean-doc/1"   # DOCUMENT mode's own version knob (ADR-0031). It rides in the
+                               # done-KEY (GleanBlock.key), not params — params is a run-level constant
+                               # and one --all run mixes modes. Bumping it re-extracts documents only.
+                               # Known asymmetry, accepted: bumping PROMPT_VERSION (in params) re-keys
+                               # doc chunks too; their re-extraction re-ingests byte-identically, so a
+                               # transcript prompt bump wastes a few LLM calls on the (small) document
+                               # corpus, never duplicates data.
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
 OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
 
@@ -142,6 +156,36 @@ SYSTEM_PROMPT = (
     "holds nothing durable, output {\"events\": []}."
 )
 
+# The DOCUMENT-mode variant (ADR-0031): same JSON contract, same pointing discipline (ADR-0026),
+# inverted prior. A transcript excerpt is mostly noise (the empty list is the expected answer); a
+# curated rules document the owner WROTE is mostly signal — each stated rule/directive/preference
+# is one event, and the summary RESTATES the rule rather than inferring a lesson from behavior.
+DOC_SYSTEM_PROMPT = (
+    "You extract the durable rules from an excerpt of a curated rules/notes document its owner "
+    "WROTE (a CLAUDE.md, a preferences file, working notes), for a system that folds the owner's "
+    "written configuration into its reviewed knowledge layer.\n\n"
+    "Unlike a session transcript, this document is already distilled: expect MOST of it to be "
+    "deliberate, durable directives. Extract each distinct rule, directive, or stated preference "
+    "as one event; skip only headings, decorative structure, and prose that states no rule.\n\n"
+    "The excerpt is shown with a line number on every line (`12| ...`). You do NOT retype the "
+    "document — you POINT at it by line number, and the system copies those exact bytes as the "
+    "evidence. Pick the tightest line range that carries each whole rule.\n\n"
+    "For each rule, return:\n"
+    "- \"lines\": {\"from\": N, \"to\": M} — the inclusive line numbers (read from the `N|` "
+    "prefixes) whose text IS the rule. A single line is {\"from\": N, \"to\": N}.\n"
+    "- \"summary\": one imperative sentence (<= 200 chars) that RESTATES the rule faithfully — "
+    "restate, do not embellish, generalize, or merge neighboring rules.\n"
+    "- \"markers\": an object scoring 0-1 on surprise / insight / research — usually all LOW for "
+    "a stated rule (nothing broke an expectation; it is a directive, not a discovery).\n"
+    "- \"confidence\": a number 0-1, how durable and actionable the rule is.\n"
+    "- \"relevance\": judge the rule against WHAT WE ALREADY KNOW (the catalog below the excerpt): "
+    "\"novel\" (nothing covers it), \"known\" (a concept already states it), or \"contradicts\" "
+    "(it overturns a known concept). When the catalog is empty or you are unsure, answer "
+    "\"novel\".\n\n"
+    "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
+    "holds no rules (pure boilerplate), output {\"events\": []}."
+)
+
 # Cheap, no-LLM structural priors fed to the model so it weighs the most extraction-worthy cues. They
 # nudge the markers; they NEVER gate (the prior-art warning: a regex marker alone fires on quoted
 # errors / rhetorical "no"s — high recall, low precision, so the LLM adjudicates). Surprise = a
@@ -156,13 +200,16 @@ _REDIRECT_CUES = (  # deliberately loose substrings ("no " fires on "another") �
 
 # --- filter + parse + verify ----------------------------------------------------------------
 
-def has_signal_potential(text: str, *, min_chars: int = 80) -> bool:
+def has_signal_potential(text: str, *, min_chars: int = 80, mode: str = "transcript") -> bool:
     """A cheap, conservative pre-filter — skip the LLM call for excerpts that *cannot* carry a
     durable learning (too small, or no human/assistant turn — pure tool noise or a lone compact
-    marker). The model is the real filter; this only spares obvious junk an API call."""
+    marker). The model is the real filter; this only spares obvious junk an API call.
+
+    DOCUMENT mode has no speaker structure to require — a curated rules file is almost all signal
+    — so only the size floor applies (ADR-0031)."""
     if len(text) < min_chars:
         return False
-    return "[user]" in text or "[assistant]" in text
+    return mode == "document" or "[user]" in text or "[assistant]" in text
 
 
 def structural_cues(text: str) -> list[str]:
@@ -276,7 +323,8 @@ def resolve_lines(candidate: dict, line_spans: list[tuple[int, int]],
 
 def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
                 model: str, run_id: str, root: Path | None = None,
-                subject_cache: dict | None = None) -> dict:
+                subject_cache: dict | None = None,
+                prompt_version: str = PROMPT_VERSION) -> dict:
     """Assemble the event record for a verified span — the event FORMAT lives here (ADR-0004/0005). An
     event is a thin pointer (the span, never the quote text) + the untrusted, hygiene-cleaned model
     fields (summary, markers, confidence) + intrinsic provenance. It stays a plain dict, deliberately:
@@ -307,7 +355,7 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
         "markers": _clean_markers(candidate.get("markers")),
         "relevance": clean_relevance(candidate.get("relevance")),   # novelty vs the store (unknown → novel)
         "confidence": _clean_score(candidate.get("confidence"), 0.5),
-        "producer": {"stage": "glean", "model": model, "prompt_version": PROMPT_VERSION,
+        "producer": {"stage": "glean", "model": model, "prompt_version": prompt_version,
                      "run_id": run_id, "cost_usd": None},
         "supersedes": None,
     }
@@ -353,13 +401,13 @@ def event_content(ev: dict) -> dict:
 
 
 def _ingest_event(ev: dict, *, model: str, run_id: str, chunkset_hash: str,
-                  root: Path | None) -> None:
+                  root: Path | None, prompt_version: str = PROMPT_VERSION) -> None:
     """Freeze one event as a RAW blob VERSION keyed on its span-derived `event_id` (ADR-0007). The
     content is `event_content(ev)` (run-invariant => byte-identical re-extraction no-ops); `producer`
     is mirrored into `origin_ref` so provenance is answerable from meta alone."""
     blobstore.ingest(
         blobstore.canonical_json(event_content(ev)), source_kind="event", source_id=ev["id"],
-        origin_ref={"stage": "glean", "model": model, "prompt_version": PROMPT_VERSION,
+        origin_ref={"stage": "glean", "model": model, "prompt_version": prompt_version,
                     "run_id": run_id, "cost_usd": ev["producer"].get("cost_usd"),
                     "cleaned_hash": ev["cleaned_hash"], "chunkset_hash": chunkset_hash},
         root=root)
@@ -371,9 +419,12 @@ def _ingest_event(ev: dict, *, model: str, run_id: str, chunkset_hash: str,
 class ChunkItem:
     """One enumerated unit of work — a single chunk plus the chunkset it came from. The chunkset is
     carried only for the event's lineage `origin_ref` (which chunkset produced this event); the unit
-    of persistence and idempotency is the CHUNK, not the chunkset (ADR-0009)."""
+    of persistence and idempotency is the CHUNK, not the chunkset (ADR-0009). `mode` is the
+    extraction variant (ADR-0031) — "document" for a chunk of a document chunkset, read once per
+    chunkset off its SIDECAR in items(), so key()/process() never pay a lookup."""
     chunk: chunk.Chunk
     chunkset_hash: str
+    mode: str = "transcript"
 
 
 def chunk_key(ch: chunk.Chunk) -> str:
@@ -494,15 +545,29 @@ class GleanBlock:
                 chunks = chunk.load(cs, root)
             except FileNotFoundError:
                 continue                          # the chunkset blob itself is gone — nothing to enumerate
+            # the extraction MODE (ADR-0031), one sidecar read per chunkset — never a content read.
+            # An unreadable sidecar degrades to transcript mode (the recall-safe default: the strict
+            # transcript prior under-extracts a document; it never fabricates).
+            try:
+                kind = blobstore.get_meta(cs, root).get("source_kind")
+            except (OSError, json.JSONDecodeError):
+                kind = None
+            mode = "document" if kind == "document" else "transcript"
             for ch in chunks:
                 if topic is not None:
                     proj = blobstore.project_of(ch.cleaned_hash, root, proj_cache)
                     if not proj or topic not in proj.lower():
                         continue
-                yield ChunkItem(chunk=ch, chunkset_hash=cs)
+                yield ChunkItem(chunk=ch, chunkset_hash=cs, mode=mode)
 
     def key(self, item: ChunkItem) -> str:
-        return chunk_key(item.chunk)
+        """The done-key target. A DOCUMENT chunk's key carries DOC_PROMPT_VERSION so the two modes
+        stay independently versioned — bumping the document prompt re-extracts documents without
+        touching the transcript done-set (ADR-0031). The chunk keys themselves can never collide
+        across modes (a chunk belongs to exactly one cleaned blob, which has exactly one source
+        kind); the suffix exists purely to give document extraction its own version knob."""
+        k = chunk_key(item.chunk)
+        return k if item.mode != "document" else f"{k}:{DOC_PROMPT_VERSION}"
 
     def priority(self, item: ChunkItem) -> float:
         """Pre-LLM salience for the amortized queue (ADR-0010 §8): order chunks by LIKELY durable yield
@@ -645,9 +710,10 @@ class GleanBlock:
         completer (or an absent cleaned blob) propagates — the driver isolates it as
         `errored`, writes no marker, and the chunk is retried next run (per-chunk retry, ADR-0009)."""
         ch = item.chunk
+        doc_mode = item.mode == "document"
         cleaned_bytes = blobstore.get(ch.cleaned_hash, root).encode("utf-8")   # FileNotFoundError → errored
         text = cleaned_bytes[ch.byte_start:ch.byte_end].decode("utf-8")
-        if not has_signal_potential(text):
+        if not has_signal_potential(text, mode=item.mode):
             self._last.d = {"n_rejected": 0, "n_calls": 0, "cleaned_hash": ch.cleaned_hash}
             return (0, 0.0)                       # filter-skip: still marked done (0-output marker)
 
@@ -655,8 +721,13 @@ class GleanBlock:
         # the per-chunk digest build is glean's DELIBERATE advisory exception — a bug there is ISOLATED +
         # recall-first (swallowed → empty sentinel, latched off; see `_relevant_digest`), NOT surfaced.
         numbered, line_spans = number_lines(cleaned_bytes, ch)  # the model points at these lines; we copy bytes
-        prompt = _user_prompt(numbered, structural_cues(text), known)  # our code; a bug HERE surfaces (driver errored)
-        comp = self.complete(SYSTEM_PROMPT, prompt)           # the sole LLM call; raising → driver errored
+        # DOCUMENT mode (ADR-0031): the rules-document system prompt, and no structural cues — the
+        # cues are transcript-shaped (speaker tags, tool errors); on a rules file they'd only misfire.
+        cues = [] if doc_mode else structural_cues(text)
+        pv = DOC_PROMPT_VERSION if doc_mode else PROMPT_VERSION
+        prompt = _user_prompt(numbered, cues, known)          # our code; a bug HERE surfaces (driver errored)
+        comp = self.complete(DOC_SYSTEM_PROMPT if doc_mode else SYSTEM_PROMPT,
+                             prompt)                          # the sole LLM call; raising → driver errored
         with self._tally_lock:                    # shared int += — a lost increment is wrong audit data
             self.calls += 1
         call_cost = completer.cost_of(comp)
@@ -670,7 +741,8 @@ class GleanBlock:
                 rejected += 1
                 continue
             ev = build_event(cand, ch, span, model=self.model, run_id=run_id,   # ... then the record
-                             root=root, subject_cache=self._subject_cache)      # (stamps ride along, §2.1)
+                             root=root, subject_cache=self._subject_cache,      # (stamps ride along, §2.1)
+                             prompt_version=pv)
             if ev["id"] not in seen:              # same span twice in this chunk → one event
                 seen.add(ev["id"])
                 accepted.append(ev)
@@ -678,7 +750,7 @@ class GleanBlock:
         for ev in accepted:                       # event blobs committed durable first (the driver writes
             ev["producer"]["cost_usd"] = share    # the chunk's marker LAST, after this returns)
             _ingest_event(ev, model=self.model, run_id=run_id,
-                          chunkset_hash=item.chunkset_hash, root=root)
+                          chunkset_hash=item.chunkset_hash, root=root, prompt_version=pv)
 
         with self._tally_lock:                    # see __init__: the tallies lock, the caches don't
             self.events += len(accepted)
@@ -732,9 +804,10 @@ def run(chunkset_hashes: list[str], complete: Completer, *, model: str = complet
 # --- target resolution: glean consumes existing chunksets (never re-chunks) -----------------
 
 def all_chunksets(root: Path | None = None) -> list[str]:
-    """Every materialized chunkset in the store, by one scan over the derived sidecars."""
+    """Every materialized chunkset in the store (transcript AND document shapes, ADR-0031), by one
+    scan over the derived sidecars."""
     return [m["content_hash"] for m in blobstore.iter_meta(root)
-            if m.get("format") == chunk.CHUNKSET_FORMAT]
+            if m.get("format") in chunk.CHUNKSET_FORMATS]
 
 
 def chunkset_for_source(source_id: str, root: Path | None = None) -> str | None:
@@ -743,7 +816,8 @@ def chunkset_for_source(source_id: str, root: Path | None = None) -> str | None:
     raw = blobstore.latest_version(source_id, root)
     if not raw:
         return None
-    cleaned = next(blobstore.derived_for(raw, root, fmt=weave.RENDER_FORMAT), None)
+    cleaned = next((m for m in blobstore.derived_for(raw, root)
+                    if m.get("format") in weave.RENDER_FORMATS), None)
     if not cleaned:
         return None
     return chunk.chunkset_for(cleaned["content_hash"], root)

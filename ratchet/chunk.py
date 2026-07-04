@@ -22,8 +22,16 @@ from pathlib import Path
 from . import blobstore, block, config, weave
 
 CHUNKSET_FORMAT = "transcript.chunkset/1"  # source-kind . shape . PACKING version (bump if `_group` changes)
+DOC_CHUNKSET_FORMAT = "document.chunkset/1"   # the document render's chunkset (same packing, ADR-0031)
+CHUNKSET_FORMATS = (CHUNKSET_FORMAT, DOC_CHUNKSET_FORMAT)   # every chunkset shape glean enumerates over
 DEFAULT_BUDGET = 12000   # chars per chunk (~3k tokens); a single larger turn stands alone
 OUT_NOUN = "chunksets"   # the per-item output noun the Progress bar/line shows
+
+
+def chunkset_format(source_kind: str) -> str:
+    """The chunkset format for a source kind — the sidecar-visible mirror of `weave.render_format`,
+    so a consumer (glean's document-mode switch) can pick a prompt WITHOUT reading blob content."""
+    return DOC_CHUNKSET_FORMAT if source_kind == "document" else CHUNKSET_FORMAT
 
 
 @dataclass
@@ -121,7 +129,9 @@ def chunkset_for(cleaned_hash: str, root: Path | None = None, *,
     """The chunkset hash derived from a cleaned blob. A cleaned blob may have several chunksets
     (one per budget); pass `budget` to pick one, else the first found is returned (arbitrary
     across budgets)."""
-    for m in blobstore.derived_for(cleaned_hash, root, fmt=CHUNKSET_FORMAT):
+    for m in blobstore.derived_for(cleaned_hash, root):
+        if m.get("format") not in CHUNKSET_FORMATS:
+            continue
         if budget is None or m.get("tags", {}).get("budget") == budget:
             return m["content_hash"]
     return None
@@ -135,15 +145,16 @@ def materialize(raw_hash: str, *, budget: int = DEFAULT_BUDGET,
     root = root or config.data_root()
     cleaned_hash, _, doc = weave.materialize(raw_hash, root=root)
     chunks = build(doc, budget=budget)
+    fmt = chunkset_format(doc.source_kind)
     payload = json.dumps({"cleaned_hash": cleaned_hash, "render_version": doc.render_version,
-                          "format": CHUNKSET_FORMAT, "budget": budget,
+                          "format": fmt, "budget": budget,
                           "chunks": [asdict(c) for c in chunks]},
                          ensure_ascii=False, indent=2)
     tags = weave.tags_from_meta(blobstore.get_meta(raw_hash, root))
     cs_hash, written = blobstore.put_derived(
         payload, source_kind=doc.source_kind, derived_from=cleaned_hash, produced_by="chunk",
         render_version=doc.render_version,   # inherited: pins which render the offsets index into
-        fmt=CHUNKSET_FORMAT, tags={**tags, "budget": budget}, root=root)
+        fmt=fmt, tags={**tags, "budget": budget}, root=root)
     return cs_hash, written, chunks
 
 
@@ -172,17 +183,19 @@ class ChunkBlock:
             ("render_version", weave.RENDER_VERSION), ("budget", str(budget)))
 
     def items(self, root: Path, *, source_id: str | None = None):
-        """Enumerate cleaned blobs to chunk. --all → every derived blob of the cleaned-doc format
-        (one scan of iter_meta). --source-id → walk the source's latest raw → its cleaned blob(s)."""
+        """Enumerate cleaned blobs to chunk. --all → every derived blob of a cleaned-doc format
+        (transcript or document render, one scan of iter_meta). --source-id → walk the source's
+        latest raw → its cleaned blob(s)."""
         if source_id is not None:
             raw = blobstore.latest_version(source_id, root)
             if raw is None:
                 return
-            for m in blobstore.derived_for(raw, root, fmt=weave.RENDER_FORMAT):
-                yield m["content_hash"]
+            for m in blobstore.derived_for(raw, root):
+                if m.get("format") in weave.RENDER_FORMATS:
+                    yield m["content_hash"]
             return
         for m in blobstore.iter_meta(root):
-            if m.get("kind") == "derived" and m.get("format") == weave.RENDER_FORMAT:
+            if m.get("kind") == "derived" and m.get("format") in weave.RENDER_FORMATS:
                 yield m["content_hash"]
 
     def key(self, cleaned_hash: str) -> str:
