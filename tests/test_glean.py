@@ -615,7 +615,11 @@ cs_v6, ch_v6 = _vt_source("vt-60d", (_now_dt - timedelta(days=60)).isoformat()) 
 cs_v2, ch_v2 = _vt_source("vt-240", (_now_dt - timedelta(days=240)).isoformat()) # four half-lives ago
 cs_vx, ch_vx = _vt_source("vt-non", None)                                        # undated (no origin mtime)
 
-vblk = glean.GleanBlock(FakeCompleter([]), model="vt", targets=[cs_vn, cs_v6, cs_v2, cs_vx])
+# STRICT clock ("valid") isolates the valid-time decay curve: the undated fixture is the
+# pure-structural baseline here, which the default fallback clock would (correctly) date by arrival.
+# The RECENT_CLOCK policies themselves are pinned right below the curve.
+vblk = glean.GleanBlock(FakeCompleter([]), model="vt", targets=[cs_vn, cs_v6, cs_v2, cs_vx],
+                        recent_clock="valid")
 vlist = list(vblk.items(config.data_root()))            # items() captures _root, as the driver does
 it_now, it_60, it_240, it_non = (next(it for it in vlist if it.chunk == chs[0])
                                  for chs in (ch_vn, ch_v6, ch_v2, ch_vx))
@@ -654,8 +658,36 @@ ordered_v = block.priority_strategy("greedy").order([it_240, it_non, it_now, it_
                                                     vblk.priority, vblk.age)
 assert ordered_v == [it_now, it_60, it_240, it_non], \
     "given equal structural scores, valid-time recency alone sets the drain order (newest first)"
-print("OK — recency (valid-time): +W_RECENT today, half at one half-life, 1/16 at four; undated/broken")
-print("     lineage → +0.0 exactly (never the age-0 max); Greedy drains the recent session first.")
+
+# --- the RECENT_CLOCK policies (sulin, 2026-07-03): valid-then-arrival default, per-mode pins -------
+# Default ("valid-then-arrival"): an undated source is dated by ARRIVAL — these fixtures were just
+# ingested (fetched_at ≈ now), so the undated chunk earns ≈ the full bonus instead of +0.0. The
+# fallback exists for conversation-less sources (fetched PDFs/pages: arrival IS their honest date).
+fb_blk = glean.GleanBlock(FakeCompleter([]), model="vt", targets=[cs_vn, cs_v6, cs_v2, cs_vx])
+assert fb_blk.recent_clock == glean.RECENT_CLOCK == "valid-then-arrival", "the fallback is the default"
+list(fb_blk.items(config.data_root()))
+fb_non = fb_blk.priority(it_non)
+assert abs((fb_non - p_non) - glean.W_RECENT) < 0.02, \
+    f"default clock dates the undated fixture by its (fresh) arrival: {fb_non - p_non}"
+assert abs(fb_blk.priority(it_60) - p_60) < 1e-9, "a dated source ignores the fallback (valid wins)"
+# "arrival": the tap date ONLY — the 240d-old session was fetched today, so it reads fresh.
+ar_blk = glean.GleanBlock(FakeCompleter([]), model="vt", targets=[cs_vn, cs_v6, cs_v2, cs_vx],
+                          recent_clock="arrival")
+list(ar_blk.items(config.data_root()))
+assert abs((ar_blk.priority(it_240) - p_non) - glean.W_RECENT) < 0.02, \
+    "arrival clock: an old conversation fetched today reads fresh (a fetched-corpus policy)"
+# a broken lineage has NO stamp under ANY policy → still +0.0
+assert fb_blk.priority(ghost_v) == gp_on, "no stamp under any clock → no bonus"
+# constructor refuses an unknown policy (a typo must not silently become a behavior)
+try:
+    glean.GleanBlock(FakeCompleter([]), model="vt", targets=[], recent_clock="mtime")
+    raise AssertionError("unknown recent_clock must raise")
+except ValueError:
+    pass
+
+print("OK — recency (valid-time): +W_RECENT today, half at one half-life, 1/16 at four; strict clock")
+print("     → undated/broken lineage +0.0 exactly; default clock dates undated sources by ARRIVAL")
+print("     (PDF/webpage policy), 'arrival' uses the tap date only; unknown clock refused.")
 
 
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------

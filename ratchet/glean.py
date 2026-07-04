@@ -62,6 +62,19 @@ OUT_NOUN = "events"            # the per-item output noun the Progress bar/line 
 # session recedes), aging reads how long it has WAITED in the queue (a boost that grows) — so recent
 # sessions drain first today, and anti-starvation still guarantees the old tail surfaces eventually.
 # Escape hatch: W_RECENT = 0 restores the pure-structural score, bit-for-bit.
+#
+# WHICH CLOCK dates the material — `RECENT_CLOCK`, sulin's knob (2026-07-03):
+#   "valid-then-arrival" (default) — the conversation's own date (`origin_ref.mtime`) when it exists,
+#       else FALL BACK to `fetched_at` (when tap pulled it). The fallback exists for source kinds with
+#       no conversation clock at all: a PDF or fetched webpage (the future researcher pre-tap source)
+#       enters the owner's life when it is PULLED — arrival IS its honest date. Transcripts virtually
+#       always carry mtime (measured: 0 undated of 252 real sessions), so the fallback is rare there
+#       and its one distortion (old conversation + fresh arrival → full bonus) correspondingly rare.
+#   "valid"   — strict: no conversation date, no bonus (unknown never outranks known-recent).
+#   "arrival" — the tap date only (what a pure fetched-material corpus would want).
+# Per-source-kind clock mapping is the natural upgrade when non-transcript sources land (backlog).
+RECENT_CLOCK = "valid-then-arrival"   # --recent-clock overrides per run
+RECENT_CLOCKS = ("valid-then-arrival", "valid", "arrival")
 W_RECENT = 1.0                  # UNTUNED — the full-freshness bonus, sized against the ~0.5-4.0
                                 # structural envelope (1.0 ≈ half a "user turn present"); a defensible
                                 # default, not a fitted one — wants a gold set
@@ -397,11 +410,15 @@ class GleanBlock:
     finalize = block.no_finalize
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
-                 targets: list[str] | None = None, topic: str | None = None) -> None:
+                 targets: list[str] | None = None, topic: str | None = None,
+                 recent_clock: str = RECENT_CLOCK) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
         self.topic = topic        # PROCESSING FOCUS: extract only this project's chunks (ADR-0022)
+        if recent_clock not in RECENT_CLOCKS:
+            raise ValueError(f"recent_clock must be one of {RECENT_CLOCKS}, got {recent_clock!r}")
+        self.recent_clock = recent_clock   # which stamp dates the material (see the RECENT_CLOCK knob)
         self.params: tuple[tuple[str, str], ...] = (
             ("prompt_version", PROMPT_VERSION), ("model", model))
         # run-total tallies (instance-scoped; the Report stays uniform). `_tally_lock` guards them
@@ -509,8 +526,10 @@ class GleanBlock:
         term: recency decays as the session recedes (happened-recently drains first), aging grows as the
         queue-wait lengthens (the old tail is guaranteed to surface) — the two clocks deliberately pull
         at different items. Costs two meta reads per cleaned BLOB (shared by its chunks via `_vt_cache`;
-        still never a content read); an UNDATED chunk earns NO bonus rather than the age-0 maximum (see
-        below). W_RECENT = 0 restores the pure-structural score."""
+        still never a content read). WHICH stamp dates the material is the RECENT_CLOCK policy
+        (default: the conversation's own date, arrival as the fallback for conversation-less sources);
+        an item with no usable stamp earns NO bonus rather than the age-0 maximum (see below).
+        W_RECENT = 0 restores the pure-structural score."""
         ch = item.chunk
         kinds = set(ch.kinds or [])
         has_user = 2.0 if "user" in kinds else 0.0
@@ -518,12 +537,20 @@ class GleanBlock:
         interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
         if ch.cleaned_hash not in self._vt_cache:
             self._fill_stamps(ch.cleaned_hash)
-        vt = self._vt_cache[ch.cleaned_hash]
-        # A missing/unreadable session date earns NO bonus (0.0), NOT the age-0 maximum: an unknown
-        # date must never outrank known-recent material. This deliberately INVERTS `config.age_days`'s
-        # missing-stamp degrade (0.0 = "treat as fresh") — safe for age(), where 0.0 merely WITHHOLDS
-        # the anti-starvation boost, but here age-0 would GRANT the full bonus, the wrong direction.
-        recency = W_RECENT * 0.5 ** (config.age_days(vt) / RECENT_HALF_LIFE_DAYS) if vt else 0.0
+        # Pick the material's date by the RECENT_CLOCK policy: the conversation's own date when the
+        # source has one, else (default policy) the ARRIVAL stamp — a PDF/webpage-style source has no
+        # conversation clock, and "when it entered the owner's life" is its honest date (sulin,
+        # 2026-07-03). An item with NO usable stamp under the policy earns NO bonus (0.0), never the
+        # age-0 maximum: unknown must not outrank known-recent. This deliberately INVERTS
+        # `config.age_days`'s missing-stamp degrade (0.0 = "treat as fresh") — safe for age(), where
+        # 0.0 merely WITHHOLDS the anti-starvation boost, but here age-0 would GRANT the full bonus.
+        if self.recent_clock == "arrival":
+            stamp = self._age_cache[ch.cleaned_hash]
+        elif self.recent_clock == "valid":
+            stamp = self._vt_cache[ch.cleaned_hash]
+        else:                                          # "valid-then-arrival" (default)
+            stamp = self._vt_cache[ch.cleaned_hash] or self._age_cache[ch.cleaned_hash]
+        recency = W_RECENT * 0.5 ** (config.age_days(stamp) / RECENT_HALF_LIFE_DAYS) if stamp else 0.0
         return has_user + diversity + interaction + recency
 
     def _fill_stamps(self, cleaned_hash: str) -> None:
@@ -750,6 +777,11 @@ def main(argv=None) -> None:
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
                     help="ordering policy over enumerated chunks (default: greedy = highest-yield first)")
+    ap.add_argument("--recent-clock", choices=RECENT_CLOCKS, default=RECENT_CLOCK,
+                    help="which stamp dates material for the recency bonus: the conversation's own date "
+                         "with arrival as fallback (default — conversation-less sources like fetched "
+                         "PDFs/pages are dated by when they were pulled), strict 'valid' (no date, no "
+                         "bonus), or 'arrival' (tap date only)")
     args = ap.parse_args(argv)
 
     # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
@@ -769,12 +801,14 @@ def main(argv=None) -> None:
 
     if args.scores:                               # read-only early-return, --dry-run's sibling: the
         blk = GleanBlock(completer.make_cli_completer(args.model), model=args.model,   # completer is
-                         targets=targets, topic=args.topic)          # bound but never called (no LLM)
+                         targets=targets, topic=args.topic,          # bound but never called (no LLM)
+                         recent_clock=args.recent_clock)
         print(block.scores_report(blk, root=config.ensure_layout(), priority=args.priority))
         return
 
     complete = completer.make_cli_completer(args.model)
-    blk = GleanBlock(complete, model=args.model, targets=targets, topic=args.topic)
+    blk = GleanBlock(complete, model=args.model, targets=targets, topic=args.topic,
+                     recent_clock=args.recent_clock)
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
     progress = None if (args.quiet or args.dry_run) else block.Progress(
