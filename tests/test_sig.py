@@ -167,41 +167,55 @@ print("OK — band_histogram: synthetic pairs land in exact bands; projected adj
       "the subject proxy AND the entropy gate; overrides flow through")
 
 
-# --- 11. stratified_sample: label budget weighted toward the residue + the edges ---------------
+# --- 11. stratified_sample: band × session-relation cells, budget toward residue/edges/cross ---
 
 recs = []
 for band, sims in (("non", [0.01 + 0.015 * i for i in range(10)]),
                    ("residue", [0.26 + 0.028 * i for i in range(10)]),
                    ("high", [0.555 + 0.014 * i for i in range(10)]),
                    ("cross", [0.71 + 0.028 * i for i in range(10)])):
-    recs += [{"id": f"{band}{i}", "stmt_sim": round(s, 4)} for i, s in enumerate(sims)]
-picked = sig.stratified_sample(recs, 10)
-assert len(picked) == 10 and len({r["id"] for r in picked}) == 10, "n unique pairs"
-by_band = {}
+    for i, s in enumerate(sims):
+        recs.append({"id": f"{band}-x{i}", "stmt_sim": round(s, 4), "same_session": False})
+        recs.append({"id": f"{band}-s{i}", "stmt_sim": round(s, 4), "same_session": True})
+picked = sig.stratified_sample(recs, 20)
+assert len(picked) == 20 and len({r["id"] for r in picked}) == 20, "n unique pairs"
+cells = {}
 for r in picked:
-    by_band.setdefault(sig.sim_band(r["stmt_sim"]), []).append(r["id"])
-assert {k: len(v) for k, v in by_band.items()} == {"residue": 5, "high": 2, "cross": 1, "non": 2}, \
-    f"quota follows SAMPLE_WEIGHTS: {by_band}"
-assert picked == sig.stratified_sample(recs, 10), "seeded → a re-run drafts the identical file"
-# a starved band spills its quota to the others (edge-nearest first) — the sample stays full-size
-thin = [r for r in recs if sig.sim_band(r["stmt_sim"]) != "residue"][:12] + \
-       [{"id": "residue0", "stmt_sim": 0.3}]
-spill = sig.stratified_sample(thin, 10)
-assert len(spill) == 10, "shortfall in one band spills — the label budget is spent, not wasted"
+    cells.setdefault((sig.sim_band(r["stmt_sim"]), r["same_session"]), []).append(r["id"])
+# band quotas (SAMPLE_WEIGHTS × 20): residue 10, high 4, cross 2, non 4; CROSS_WEIGHT=0.7 splits
+# each into round(quota·0.7) cross-session + remainder same-session — cells sum to the band quota.
+assert {k: len(v) for k, v in cells.items()} == {
+    ("residue", False): 7, ("residue", True): 3,
+    ("high", False): 3, ("high", True): 1,
+    ("cross", False): 1, ("cross", True): 1,
+    ("non", False): 3, ("non", True): 1}, cells
+assert sum(1 for r in picked if not r["same_session"]) == 14, "70% of the draw is cross-session"
+assert picked == sig.stratified_sample(recs, 20), "seeded → a re-run drafts the identical file"
+# the knob: cross_weight=1.0 spends every band's whole quota on cross-session pairs
+allx = sig.stratified_sample(recs, 20, cross_weight=1.0)
+assert len(allx) == 20 and all(not r["same_session"] for r in allx), "--cross-weight owns the split"
+# records WITHOUT the tag (a pre-round-2 fixture) count as cross-session and still sample
+legacy_recs = [{"id": f"L{i}", "stmt_sim": round(0.26 + 0.028 * i, 4)} for i in range(10)]
+assert len(sig.stratified_sample(legacy_recs, 4)) == 4, "untagged records sample (counted cross-session)"
+# a starved cell spills its quota to the pool (edge-nearest first) — the sample stays full-size
+one_cell = [{"id": f"c{i}", "stmt_sim": 0.30, "same_session": False} for i in range(20)]
+assert len(sig.stratified_sample(one_cell, 10)) == 10, \
+    "shortfall in a cell spills — the label budget is spent, not wasted"
 
-print("OK — stratified_sample: SAMPLE_WEIGHTS quotas, deterministic under the seed, "
-      "starved bands spill")
+print("OK — stratified_sample: band × session-relation quotas (CROSS_WEIGHT default, "
+      "--cross-weight override), deterministic, untagged counts cross, starved cells spill")
 
 
 # --- 12. the CLI over a seeded temp store: READ-ONLY band report / sample / score --------------
 
-def seed_event(eid: str, project: str, summary: str, quote: str) -> None:
+def seed_event(eid: str, project: str, summary: str, quote: str, session: str | None = None) -> None:
     """One event the way the pipeline lays it down: raw transcript (origin_ref.project — what
-    `project_of` resolves) → derived cleaned blob → event blob whose evidence span points at the
-    quote's bytes (what `--sample-pairs` resolves as quote_a/b)."""
+    `project_of` resolves; source_id — what `session_of` resolves) → derived cleaned blob → event
+    blob whose evidence span points at the quote's bytes (what `--sample-pairs` resolves as
+    quote_a/b). `session` lets two events share one originating session."""
+    sid = session or f"sess-{eid}"
     raw_h, _ = blobstore.ingest(f"transcript for {eid}\n{quote}\n", source_kind="transcript",
-                                source_id=f"sess-{eid}", origin_ref={"project": project,
-                                                                     "session_id": f"sess-{eid}"})
+                                source_id=sid, origin_ref={"project": project, "session_id": sid})
     cleaned = f"[assistant]\n{quote}\n"
     ch, _ = blobstore.put_derived(cleaned, source_kind="transcript", derived_from=raw_h,
                                   produced_by="weave", render_version="r1", fmt="text/cleaned")
@@ -214,15 +228,21 @@ def seed_event(eid: str, project: str, summary: str, quote: str) -> None:
                      origin_ref={"stage": "test"})
 
 
-Q1, Q2, Q3 = "use jj here, not git", "jj not git, again", "autodiff needs purity"
-seed_event("e1", "projA", S1, Q1)
-seed_event("e2", "projA", S2, Q2)
+# quotes must CLEAR the noise floor (resolve.thin_quote: >= 40 chars, entropy >= H_MIN) or the
+# sampler rightly excludes their pairs — the thin-quote path gets its own event (e4, below)
+Q1 = "always describe the change with jj describe before pushing, never git commit --amend"
+Q2 = "jj log shows the change graph; reaching for git log is the wrong habit in this repo"
+Q3 = "jax autodiff silently returns wrong gradients when the function mutates hidden state"
+seed_event("e1", "projA", S1, Q1, session="sess-shared")   # e1+e2: ONE working session
+seed_event("e2", "projA", S2, Q2, session="sess-shared")
 seed_event("e3", "projB", S3, Q3)
 
 corpus = sig.load_corpus()
 assert [e["id"] for e in corpus] == ["e1", "e2", "e3"], "latest_by_kind('event'), sorted by id"
 assert [e["project"] for e in corpus] == ["projA", "projA", "projB"], \
     "the subject proxy resolves through cleaned→raw origin_ref.project (ADR-0022)"
+assert [e["session"] for e in corpus] == ["sess-shared", "sess-shared", "sess-e3"], \
+    "session identity resolves through the same cleaned→raw lineage (session_of)"
 assert corpus[0]["shingles"] == sh1 and corpus[0]["entropy"] == sig.entropy(S1), \
     "signatures computed fresh from the summary"
 
@@ -249,42 +269,83 @@ report_hi = run_cli(["--band-report", "--j-cross", "0.9"])
 rows_hi = next(l for l in report_hi.splitlines() if sig.BAND_LABELS["high"] in l)
 assert rows_hi.split()[-3:] == ["1", "1", "0"], "an override re-bands the pair (the escape hatch works)"
 
-# the report never writes: blob count unchanged (READ-ONLY is the contract)
+# NOISE-FLOOR EXCLUSION: e4's quote fails resolve.thin_quote (too short), so every e4 pair is
+# excluded from the draft — those pairs never reach adjudication, and labeling them wastes gold
+# budget. Seeded AFTER the band report so the report's counts above stay exact.
+from ratchet import resolve  # noqa: E402
+
+assert resolve.thin_quote("ok") and not any(resolve.thin_quote(q) for q in (Q1, Q2, Q3)), \
+    "the fixture ties to the PRODUCTION gate: e4's quote fails it, e1-e3's clear it"
+seed_event("e4", "projC", "Zig comptime dispatch tables beat runtime reflection for kernels.", "ok")
+
+# the sampler never writes a blob: count them before (READ-ONLY is the contract)
 n_blobs_before = sum(1 for _ in blobstore.iter_meta())
 
-# sample-pairs: drafts the hand-label file with the full schema; quotes resolve from spans
+# sample-pairs: drafts the hand-label file with the full schema; quotes resolve from spans;
+# session-relation + repo provenance ride each pair; thin-quote pairs are excluded and counted
 out_path = Path(os.environ["RATCHET_DATA_DIR"]) / "tuning" / "pairs_to_label.json"
-msg = run_cli(["--sample-pairs", "3"])
+msg = run_cli(["--sample-pairs", "6"])
 assert str(out_path) in msg and out_path.exists(), "default out = <data_root>/tuning/pairs_to_label.json"
+assert "wrote 3 pair(s)" in msg, msg
+assert "excluded 3 pair(s) touching 1 thin-quote event(s)" in msg, msg
+assert "session-relation: 2 cross-session / 1 same-session" in msg, msg
 payload = json.loads(out_path.read_text())
 assert payload["thresholds"] == {"j_maybe": sig.J_MAYBE, "j_high": sig.J_HIGH,
                                  "j_cross": sig.J_CROSS, "h_min": sig.H_MIN}
-assert len(payload["pairs"]) == 3, "all 3 pairs fit the budget"
+assert payload["sampling"]["cross_weight"] == sig.CROSS_WEIGHT
+assert payload["sampling"]["noise_floor_excluded_pairs"] == 3
+assert payload["sampling"]["thin_quote_events"] == 1
+assert len(payload["pairs"]) == 3, "the 3 above-floor pairs fit the budget; every e4 pair is gone"
+pair_by = {}
 for p in payload["pairs"]:
     assert set(p) == {"event_a", "event_b", "summary_a", "summary_b", "quote_a", "quote_b",
-                      "stmt_sim", "same_project", "label"}
-    assert p["label"] is None and isinstance(p["same_project"], bool)
+                      "stmt_sim", "same_project", "same_session", "repo_a", "repo_b", "label"}
+    assert p["label"] is None and isinstance(p["same_project"], bool) \
+        and isinstance(p["same_session"], bool)
+    assert "e4" not in (p["event_a"], p["event_b"]), "a thin-quote event never enters the draft"
     assert p["quote_a"] in (Q1, Q2, Q3) and p["quote_b"] in (Q1, Q2, Q3), \
         "quotes resolve VERBATIM from the evidence spans (never stored on the event)"
+    pair_by[frozenset((p["event_a"], p["event_b"]))] = p
+p12 = pair_by[frozenset(("e1", "e2"))]
+p13 = pair_by[frozenset(("e1", "e3"))]
+assert p12["same_session"] is True and p13["same_session"] is False, \
+    "the session-relation tag rides each event's cleaned→raw session identity"
+assert p12["repo_a"] == p12["repo_b"] == "projA" and {p13["repo_a"], p13["repo_b"]} == {"projA", "projB"}
 assert sum(1 for _ in blobstore.iter_meta()) == n_blobs_before, "the CLI wrote NO blob (read-only)"
 
-# score-gold: label the drafted pairs, score the default thresholds, then a candidate override
+# score-gold: label the drafted pairs, then read the SPLIT tables — cross-session is the headline
 for p in payload["pairs"]:
     p["label"] = "same" if p["stmt_sim"] >= 0.7 else "different"
 out_path.write_text(json.dumps(payload))
 score = run_cli(["--score-gold", str(out_path)])
-assert "3 labeled pair(s)" in score
-assert "deterministic recall of `same` (match|match-cross): 1/1 = 1.00" in score, score
-assert "STRANDED in non-match (the silent-duplicate error): 0/1 = 0.00" in score
-assert "residue fraction (pairs an LLM must adjudicate): 0/3 = 0.00" in score
-# a candidate that drags the residue floor to ~0: the two `different` pairs become LLM residue
+assert "3 labeled pair(s)" in score and "UNTAGGED" not in score, score
+cross_part = score.split("== CROSS-SESSION")[1].split("== SAME-SESSION")[0]
+same_part = score.split("== SAME-SESSION")[1]
+assert "2 labeled pair(s)" in cross_part.splitlines()[0], cross_part
+assert "deterministic recall of `same` (match|match-cross): 0/0" in cross_part, \
+    "no `same` labels landed cross-session in this fixture — the ratio is honestly absent"
+assert "residue fraction (pairs an LLM must adjudicate): 0/2 = 0.00" in cross_part
+assert "deterministic recall of `same` (match|match-cross): 1/1 = 1.00" in same_part, same_part
+assert "STRANDED in non-match (the silent-duplicate error): 0/1 = 0.00" in same_part
+# a candidate that drags the residue floor to ~0: BOTH cross-session pairs become LLM residue,
+# and the split re-scores under the SAME labels — the tuning loop, per session-relation
 score2 = run_cli(["--score-gold", str(out_path), "--j-maybe", "0.01", "--j-high", "0.02"])
-assert "residue fraction (pairs an LLM must adjudicate): 2/3 = 0.67" in score2, \
-    "threshold candidates re-band the SAME labels — the tuning loop"
+cross2 = score2.split("== CROSS-SESSION")[1].split("== SAME-SESSION")[0]
+assert "residue fraction (pairs an LLM must adjudicate): 2/2 = 1.00" in cross2, score2
+# a label file that PREDATES session tagging: pairs land in UNTAGGED (never pollute a split), and
+# the empty cross-session headline stays LOUD
+legacy_path = Path(os.environ["RATCHET_DATA_DIR"]) / "tuning" / "legacy_pairs.json"
+legacy_pairs = [{k: v for k, v in p.items() if k != "same_session"} for p in payload["pairs"]]
+legacy_path.write_text(json.dumps({"pairs": legacy_pairs}))
+score3 = run_cli(["--score-gold", str(legacy_path)])
+assert "UNTAGGED" in score3 and "3 labeled pair(s)" in score3, score3
+assert "== CROSS-SESSION" in score3 and "the headline recall is UNMEASURED" in score3, \
+    "an all-untagged file still surfaces the missing cross-session headline"
 
-# guard rails: exactly one mode; the knob ordering J_MAYBE < J_HIGH < J_CROSS is enforced
+# guard rails: exactly one mode; J_MAYBE < J_HIGH < J_CROSS; --cross-weight is a fraction
 for bad in ([], ["--band-report", "--score-gold", str(out_path)],
-            ["--band-report", "--j-high", "0.9"]):
+            ["--band-report", "--j-high", "0.9"],
+            ["--sample-pairs", "3", "--cross-weight", "1.5"]):
     try:
         with redirect_stderr(io.StringIO()):
             sig.main(bad)
@@ -293,7 +354,8 @@ for bad in ([], ["--band-report", "--score-gold", str(out_path)],
         pass
 
 print("OK — CLI over a seeded store: band report exact (split by project proxy), overrides re-band,")
-print("     sample-pairs drafts the label schema with span-resolved quotes (no blob written),")
-print("     score-gold reports recall/stranded/residue and re-scores under threshold candidates.")
+print("     sample-pairs drafts the tagged schema (session-relation, repos) with span-resolved quotes,")
+print("     excludes noise-floor pairs with a count, writes NO blob; score-gold splits its tables")
+print("     by session-relation (cross-session headline, loud when empty) and re-scores candidates.")
 
 print("\nall sig tests passed.")

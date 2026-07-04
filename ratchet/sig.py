@@ -25,7 +25,10 @@ Honesty about limits: even char-shingles are lexical. The matcher is trusted onl
 bands; genuine paraphrase lands in the residue and the LLM owns it. The thresholds below are
 UNTUNED (design §Open-questions) — this module's CLI is the measuring instrument that earns them:
 `--band-report` shows where the real corpus's pairs fall, `--sample-pairs` drafts a hand-label
-file, `--score-gold` scores threshold candidates against the labels. The CLI never writes a blob.
+file (stratified band × session-relation, noise-floor pairs excluded), `--score-gold` scores
+threshold candidates against the labels, split by session-relation — the CROSS-session rows are
+the headline, because post-gates that is the only place adjudication acts. The CLI never writes a
+blob.
 """
 from __future__ import annotations
 
@@ -81,6 +84,16 @@ J_CROSS = 0.70                # UNTUNED — the stricter statement bar when subj
 # rest to the band edges, where a threshold nudge flips verdicts. Named so a different budget split
 # is one edit; the within-band edge-first rule lives in `stratified_sample`.
 SAMPLE_WEIGHTS = {"residue": 0.5, "high": 0.2, "cross": 0.1, "non": 0.2}
+CROSS_WEIGHT = 0.7            # the SECOND stratification axis: the fraction of each band's quota
+                              # drawn from CROSS-session pairs. Post-gates the adjudicator only
+                              # ever sees cross-session pairs (resolve's same-session gate skips
+                              # the rest) and maturity counts DISTINCT sessions — so cross-session
+                              # recall is the only recall that feeds maturity, and it earns the
+                              # label majority. Same-session pairs keep the remainder: they never
+                              # reach the LLM, but they exercise the gates themselves (dup
+                              # fast-path, same-session skip). Round 1 ignored this axis on a
+                              # single-project-era corpus and left the headline cross-session
+                              # recall resting on n=4. Reviewer's knob: --cross-weight.
 
 
 # --- pure signature math ----------------------------------------------------------------------
@@ -251,38 +264,52 @@ def band_histogram(pairs, *, j_maybe: float | None = None, j_high: float | None 
 
 def stratified_sample(pair_records: list[dict], n: int, *, j_maybe: float | None = None,
                       j_high: float | None = None, j_cross: float | None = None,
-                      seed: int = 0) -> list[dict]:
-    """Draw ≤ n pairs for hand-labeling, stratified by band with `SAMPLE_WEIGHTS`, each band's
-    quota EDGE-FIRST: within a band, the pairs nearest a threshold are the informative ones (a
-    small threshold move flips their verdict), so half the quota takes edge-nearest and the rest
-    is a seeded-random draw from the band's remainder (deterministic — a re-run drafts the same
-    file). Shortfall in one band (fewer pairs than quota) spills to the others by edge-nearness.
-    Each record needs a `stmt_sim`; everything else rides through untouched."""
+                      cross_weight: float | None = None, seed: int = 0) -> list[dict]:
+    """Draw ≤ n pairs for hand-labeling, stratified on TWO axes: band × session-relation.
+
+    Band quotas follow `SAMPLE_WEIGHTS` (residue-heavy — that band is the open question); within
+    each band, `cross_weight` of the quota comes from CROSS-session pairs and the remainder from
+    same-session ones (see CROSS_WEIGHT: cross-session recall is the only recall that feeds
+    maturity, same-session pairs merely exercise the gates). Each cell's quota is spent
+    EDGE-FIRST: the pairs nearest a threshold are the informative ones (a small threshold move
+    flips their verdict), so half the cell takes edge-nearest and the rest is a seeded-random draw
+    from the cell's remainder (deterministic — a re-run drafts the same file). Shortfall in any
+    cell (fewer pairs than quota) spills to the whole pool by edge-nearness, so the label budget
+    is spent even on a lopsided corpus. Each record needs a `stmt_sim`; `same_session` is read if
+    present — a record without the tag counts as cross-session, the axis's conservative direction
+    (an unknowable session cannot demonstrate sameness) — and everything else rides through
+    untouched."""
     j_maybe = J_MAYBE if j_maybe is None else j_maybe
     j_high = J_HIGH if j_high is None else j_high
     j_cross = J_CROSS if j_cross is None else j_cross
+    cross_weight = CROSS_WEIGHT if cross_weight is None else cross_weight
     rng = random.Random(seed)
     edges = (j_maybe, j_high, j_cross)
 
     def edge_dist(r: dict) -> float:
         return min(abs(r["stmt_sim"] - e) for e in edges)
 
-    by_band: dict[str, list[dict]] = {b: [] for b in BAND_ORDER}
+    by_cell: dict[tuple[str, bool], list[dict]] = {}
     for r in pair_records:
-        by_band[sim_band(r["stmt_sim"], j_maybe=j_maybe, j_high=j_high, j_cross=j_cross)].append(r)
+        band = sim_band(r["stmt_sim"], j_maybe=j_maybe, j_high=j_high, j_cross=j_cross)
+        by_cell.setdefault((band, bool(r.get("same_session"))), []).append(r)
 
     chosen: list[dict] = []
     leftover: list[dict] = []
     for band in BAND_ORDER:
-        quota = min(round(n * SAMPLE_WEIGHTS[band]), len(by_band[band]))
-        ranked = sorted(by_band[band], key=edge_dist)
-        take_edge = min((quota + 1) // 2, quota)
-        picked = ranked[:take_edge]
-        rest = ranked[take_edge:]
-        rng.shuffle(rest)
-        picked += rest[:quota - take_edge]
-        chosen += picked
-        leftover += rest[quota - take_edge:]
+        band_quota = round(n * SAMPLE_WEIGHTS[band])
+        cross_quota = round(band_quota * cross_weight)   # cell split; cells sum to the band quota
+        for same_session, cell_quota in ((False, cross_quota), (True, band_quota - cross_quota)):
+            pool = by_cell.get((band, same_session), [])
+            take = min(cell_quota, len(pool))
+            ranked = sorted(pool, key=edge_dist)
+            take_edge = min((take + 1) // 2, take)
+            picked = ranked[:take_edge]
+            rest = ranked[take_edge:]
+            rng.shuffle(rest)
+            picked += rest[:take - take_edge]
+            chosen += picked
+            leftover += rest[take - take_edge:]
     if len(chosen) < n and leftover:                    # spill unused quota, edge-nearest first
         leftover.sort(key=edge_dist)
         chosen += leftover[:n - len(chosen)]
@@ -293,12 +320,15 @@ def stratified_sample(pair_records: list[dict], n: int, *, j_maybe: float | None
 
 def load_corpus(root: Path | None = None) -> list[dict]:
     """Every current event (latest version per event_id, `latest_by_kind`) with its signature
-    computed FRESH from the summary and its PROJECT resolved as the subject proxy — the same
-    `blobstore.project_of` lineage hop the --topic filters ride (ADR-0022). Fresh-computed, not
+    computed FRESH from the summary, its PROJECT resolved as the subject proxy — the same
+    `blobstore.project_of` lineage hop the --topic filters ride (ADR-0022) — and its SESSION
+    resolved via the same cleaned→raw lineage (`blobstore.session_of`, the hop resolve's
+    same-session gate keys on): the sampler's second stratification axis. Fresh-computed, not
     read off the blob: pre-S1 events carry no stmt_sig, and the measuring instrument must see the
     whole corpus either way. Malformed/absent blobs are skipped, never fatal."""
     root = root or config.data_root()
-    cache: dict = {}
+    proj_cache: dict = {}
+    sess_cache: dict = {}     # separate caches: both key on cleaned_hash, but hold different values
     out: list[dict] = []
     for sid, h in sorted(blobstore.latest_by_kind("event", root).items()):
         try:
@@ -313,7 +343,8 @@ def load_corpus(root: Path | None = None) -> list[dict]:
             "summary": summary,
             "shingles": char_shingles(summary),
             "entropy": entropy(summary),
-            "project": blobstore.project_of(ev.get("cleaned_hash"), root, cache),
+            "project": blobstore.project_of(ev.get("cleaned_hash"), root, proj_cache),
+            "session": blobstore.session_of(ev.get("cleaned_hash"), root, sess_cache),
             "cleaned_hash": ev.get("cleaned_hash"),
             "evidence": ev.get("evidence") or [],
         })
@@ -390,18 +421,36 @@ def _band_report(root: Path, *, j_maybe: float, j_high: float, j_cross: float,
 
 
 def _sample_pairs(root: Path, n: int, out: Path, *, j_maybe: float, j_high: float,
-                  j_cross: float, h_min: float) -> None:
+                  j_cross: float, h_min: float, cross_weight: float) -> None:
+    from . import resolve   # lazy: resolve imports sig at module load; both are settled here
+
     corpus = load_corpus(root)
     blobs: dict[str, bytes] = {}
+    # Resolve each event's quote ONCE, then apply the production noise floor (`resolve.thin_quote`
+    # — the same gate resolve runs): a thin-quote event is seed-only and NEVER reaches
+    # adjudication, so labeling its pairs would spend gold-set budget on verdicts the resolver
+    # never asks for. Excluded up front and counted, so the draft says what it left out.
+    quotes = {e["id"]: _quote_of(e, blobs, root) for e in corpus}
+    thin = {eid for eid, q in quotes.items() if resolve.thin_quote(q)}
     records = []
+    excluded = 0
     for a, b, sim, same in _all_pairs(corpus):
+        if a["id"] in thin or b["id"] in thin:
+            excluded += 1
+            continue
         records.append({
             "event_a": a["id"], "event_b": b["id"],
             "summary_a": a["summary"], "summary_b": b["summary"],
-            "quote_a": _quote_of(a, blobs, root), "quote_b": _quote_of(b, blobs, root),
-            "stmt_sim": round(sim, 4), "same_project": same, "label": None,
+            "quote_a": quotes[a["id"]], "quote_b": quotes[b["id"]],
+            "stmt_sim": round(sim, 4), "same_project": same,
+            # the session-relation tag (each side's cleaned→raw session identity): an unresolvable
+            # session on either side counts as CROSS — the same discipline as `_all_pairs`' project
+            "same_session": a["session"] is not None and a["session"] == b["session"],
+            "repo_a": a["project"], "repo_b": b["project"],
+            "label": None,
         })
-    sample = stratified_sample(records, n, j_maybe=j_maybe, j_high=j_high, j_cross=j_cross)
+    sample = stratified_sample(records, n, j_maybe=j_maybe, j_high=j_high, j_cross=j_cross,
+                               cross_weight=cross_weight)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "_comment": ("Hand-label each pair's `label`: 'same' (the same underlying lesson), "
@@ -409,21 +458,31 @@ def _sample_pairs(root: Path, n: int, out: Path, *, j_maybe: float, j_high: floa
                      "Leave null to skip. Score candidates with `python -m ratchet.sig "
                      "--score-gold <this file>` (+ --j-* overrides)."),
         "thresholds": {"j_maybe": j_maybe, "j_high": j_high, "j_cross": j_cross, "h_min": h_min},
+        "sampling": {"cross_weight": cross_weight, "weights": SAMPLE_WEIGHTS,
+                     "noise_floor_excluded_pairs": excluded,
+                     "thin_quote_events": len(thin)},
         "pairs": sample,
     }
     out.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
-    print(f"wrote {len(sample)} pair(s) to {out} "
-          f"(stratified {SAMPLE_WEIGHTS}, edge-weighted; {_thresholds_line(j_maybe, j_high, j_cross, h_min)})")
+    n_same = sum(1 for p in sample if p["same_session"])
+    by_band = Counter(sim_band(p["stmt_sim"], j_maybe=j_maybe, j_high=j_high, j_cross=j_cross)
+                      for p in sample)
+    repos = {r for p in sample for r in (p["repo_a"], p["repo_b"]) if r}
+    print(f"wrote {len(sample)} pair(s) to {out}")
+    print(f"  stratified band x session-relation (weights {SAMPLE_WEIGHTS}, "
+          f"cross_weight={cross_weight:g}, edge-first; "
+          f"{_thresholds_line(j_maybe, j_high, j_cross, h_min)})")
+    print(f"  session-relation: {len(sample) - n_same} cross-session / {n_same} same-session")
+    print("  bands: " + "  ".join(f"{band}={by_band.get(band, 0)}" for band in BAND_ORDER))
+    print(f"  distinct repos touched: {len(repos)}")
+    print(f"  noise floor: excluded {excluded} pair(s) touching {len(thin)} thin-quote event(s) "
+          f"(resolve.thin_quote — those never reach adjudication)")
 
 
-def _score_gold(path: Path, *, j_maybe: float, j_high: float, j_cross: float,
-                h_min: float) -> None:
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    pairs = obj["pairs"] if isinstance(obj, dict) else obj
-    labeled = [p for p in pairs if p.get("label") in GOLD_LABELS]
-    if not labeled:
-        print(f"no labeled pairs in {path} (label each pair 'same'/'different'/'contradicts')")
-        return
+def _score_split(labeled: list[dict], *, j_maybe: float, j_high: float, j_cross: float,
+                 h_min: float) -> None:
+    """Print the recall/precision table + summary lines for ONE session-relation split of the
+    labeled pairs — the body `_score_gold` runs per split."""
     per_band: dict[str, Counter] = {b: Counter() for b in ("match", "match-cross", "possible", "non-match")}
     same_total = 0
     same_blocked = 0
@@ -437,8 +496,6 @@ def _score_gold(path: Path, *, j_maybe: float, j_high: float, j_cross: float,
             # side is stranded by the triviality gate, not the thresholds; surface it separately.
             if min(entropy(p.get("summary_a", "")), entropy(p.get("summary_b", ""))) < h_min:
                 same_blocked += 1
-    print(f"gold scoring — {len(labeled)} labeled pair(s) "
-          f"({_thresholds_line(j_maybe, j_high, j_cross, h_min)})\n")
     print(f"  {'band':12s} {'n':>5s} {'same':>6s} {'diff':>6s} {'contra':>7s} {'precision(same)':>16s}")
     for band in ("match", "match-cross", "possible", "non-match"):
         c = per_band[band]
@@ -449,13 +506,49 @@ def _score_gold(path: Path, *, j_maybe: float, j_high: float, j_cross: float,
     det_same = per_band["match"]["same"] + per_band["match-cross"]["same"]
     stranded = per_band["non-match"]["same"]
     residue = sum(per_band["possible"].values())
-    print(f"\n  deterministic recall of `same` (match|match-cross): "
+    print(f"  deterministic recall of `same` (match|match-cross): "
           f"{det_same}/{same_total}" + (f" = {det_same / same_total:.2f}" if same_total else ""))
     print(f"  `same` STRANDED in non-match (the silent-duplicate error): "
           f"{stranded}/{same_total}" + (f" = {stranded / same_total:.2f}" if same_total else ""))
     print(f"  residue fraction (pairs an LLM must adjudicate): {residue}/{len(labeled)} "
           f"= {residue / len(labeled):.2f}")
     print(f"  `same` pairs blocked by the entropy gate (either side < H_MIN): {same_blocked}")
+
+
+def _score_gold(path: Path, *, j_maybe: float, j_high: float, j_cross: float,
+                h_min: float) -> None:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    pairs = obj["pairs"] if isinstance(obj, dict) else obj
+    labeled = [p for p in pairs if p.get("label") in GOLD_LABELS]
+    if not labeled:
+        print(f"no labeled pairs in {path} (label each pair 'same'/'different'/'contradicts')")
+        return
+    # Split by session-relation: post-gates the adjudicator only ever sees CROSS-session pairs
+    # (resolve's same-session gate), and maturity counts distinct sessions — so the cross-session
+    # table is the headline; same-session rows measure the gates, not the adjudicator. A pair
+    # without the tag (a pre-round-2 label file) lands in UNTAGGED rather than polluting either.
+    groups: dict[bool | None, list[dict]] = {False: [], True: [], None: []}
+    for p in labeled:
+        tag = p.get("same_session")
+        groups[tag if isinstance(tag, bool) else None].append(p)
+    print(f"gold scoring — {len(labeled)} labeled pair(s) "
+          f"({_thresholds_line(j_maybe, j_high, j_cross, h_min)})")
+    sections = (
+        (False, "CROSS-SESSION — the headline: the only pairs adjudication acts on post-gates"),
+        (True, "SAME-SESSION — exercises the gates (dup fast-path / same-session skip), "
+               "never adjudicated"),
+        (None, "UNTAGGED — file predates session tagging (resample to tag)"),
+    )
+    for tag, title in sections:
+        rows = groups[tag]
+        if not rows and tag is not False:
+            continue                  # an empty same-session/untagged split has nothing to say; an
+                                      # empty CROSS-SESSION split stays LOUD — the headline is missing
+        print(f"\n  == {title} — {len(rows)} labeled pair(s)")
+        if not rows:
+            print("     (none — the headline recall is UNMEASURED; resample with --cross-weight)")
+            continue
+        _score_split(rows, j_maybe=j_maybe, j_high=j_high, j_cross=j_cross, h_min=h_min)
 
 
 def main(argv=None) -> None:
@@ -467,8 +560,13 @@ def main(argv=None) -> None:
                     help="all-pairs Jaccard histogram over the current events' summaries, split "
                          "same/cross-project, + the projected LLM-residue adjudications")
     ap.add_argument("--sample-pairs", type=int, metavar="N",
-                    help="draft N pairs for hand-labeling, stratified toward the residue band and "
-                         "the threshold edges")
+                    help="draft N pairs for hand-labeling, stratified band x session-relation "
+                         "(toward the residue band, the threshold edges, and cross-session pairs); "
+                         "pairs failing the noise floor (resolve.thin_quote) are excluded")
+    ap.add_argument("--cross-weight", type=float, default=CROSS_WEIGHT,
+                    help=f"--sample-pairs only: fraction of each band's quota drawn from "
+                         f"CROSS-session pairs (default {CROSS_WEIGHT}) — post-gates, adjudication "
+                         f"only acts cross-session, so that recall is the headline")
     ap.add_argument("--out", type=Path,
                     help="label-file path for --sample-pairs "
                          "(default: <data_root>/tuning/pairs_to_label.json)")
@@ -490,6 +588,9 @@ def main(argv=None) -> None:
     if not (args.j_maybe < args.j_high < args.j_cross):
         ap.error(f"thresholds must order J_MAYBE < J_HIGH < J_CROSS (§3.1) — got "
                  f"{args.j_maybe} / {args.j_high} / {args.j_cross}")
+    if not (0.0 <= args.cross_weight <= 1.0):
+        ap.error(f"--cross-weight is a fraction of each band's quota — must be in [0, 1], "
+                 f"got {args.cross_weight}")
     modes = sum(bool(m) for m in (args.band_report, args.sample_pairs is not None,
                                   args.score_gold is not None))
     if modes != 1:
@@ -501,7 +602,7 @@ def main(argv=None) -> None:
         _band_report(root, **kw)
     elif args.sample_pairs is not None:
         out = args.out or (root / "tuning" / "pairs_to_label.json")
-        _sample_pairs(root, args.sample_pairs, out, **kw)
+        _sample_pairs(root, args.sample_pairs, out, cross_weight=args.cross_weight, **kw)
     else:
         _score_gold(args.score_gold, **kw)
 
