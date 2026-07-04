@@ -486,14 +486,20 @@ class Progress:
     never a running total — so a log survives reordering and a future PARALLEL run needs no format
     change. The aggregate counters live behind a lock, so worker threads may `tick()` concurrently:
     multithreading-ready (ADR-0009). `skip`/`err` show only when nonzero (a clean first run is
-    uncluttered). `--quiet` → no Progress; `--verbose` → the per-item lines also print above the bar."""
+    uncluttered). `--quiet` → no Progress; `--verbose` → the per-item lines also print above the bar.
 
-    def __init__(self, stage: str, *, cap: float | None = None, params: dict | None = None,
-                 out_noun: str = "out", verbose: bool = False, stream=None):
+    THE BAR TRACKS WHAT ENDS THE TICK (see _draw_bar): unleashed, the item walk; under `cap`
+    (--max-usd), spend/cap labeled `$so-far/$cap`; under `limit` (--limit), processed/limit labeled
+    `n/limit lim`; both → whichever leash is closer to tripping. Skips never drive a leashed bar —
+    they keep their own `· N skip` counter."""
+
+    def __init__(self, stage: str, *, cap: float | None = None, limit: int | None = None,
+                 params: dict | None = None, out_noun: str = "out", verbose: bool = False,
+                 stream=None):
         # `total` is NOT here: the driver owns enumeration, so it knows the count only at start() time
         # (after items() + --limit). The stage builds this Progress from its args BEFORE the driver
         # enumerates, so total cannot be a constructor arg — it arrives in start().
-        self.stage, self.cap, self.out_noun = stage, cap, out_noun
+        self.stage, self.cap, self.limit, self.out_noun = stage, cap, limit, out_noun
         self.params, self.verbose = params or {}, verbose
         self.stream = stream if stream is not None else sys.stderr
         self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
@@ -559,17 +565,42 @@ class Progress:
                 self._draw_bar()
 
     def _draw_bar(self) -> None:
+        # The bar answers ONE question: "how close is this tick to ending?" — so its fraction must
+        # track whatever ENDS the tick. Unleashed, that is the full drain: the item walk (seen/total,
+        # skips included — a skip IS walked). But a leashed run ends at the leash, not the drain: a
+        # --max-usd tick stops at the cap and a --limit tick at its cap of processed calls, so the
+        # item-walk fraction can never approach 100% there (and its numerator quietly disagrees with
+        # the done/total counter beside it). Under a leash the bar tracks the leash instead — spend/cap
+        # for the budget, processed/limit for the limit — labeled so the reader knows which. Skips
+        # never drive a leashed bar (they cost nothing against either leash); they keep their own
+        # `· N skip` counter. PRECEDENCE when both leashes are set: the run ends at the FIRST leash to
+        # trip, so the one CLOSER to tripping — the max of the two fractions — drives the bar; the
+        # label names the driving leash. Fractions clamp at 1.0: the last call may overshoot the cap
+        # (the gate checks spend BEFORE a call), and 100% must mean "this tick is done", not 104%.
         seen = self.done + self.skipped + self.errored
-        frac = seen / self.total if self.total else 1.0
+        budget_frac = min(self.cost / self.cap, 1.0) if self.cap else None
+        limit_frac = min(self.done / self.limit, 1.0) if self.limit else None
+        budget_drives = budget_frac is not None and (limit_frac is None or budget_frac >= limit_frac)
+        if budget_frac is None and limit_frac is None:
+            frac = seen / self.total if self.total else 1.0        # unleashed: the item walk, as ever
+            label = ""
+        elif budget_drives:
+            frac = budget_frac
+            label = self._c(_YEL, f"${self.cost:.2f}/${self.cap:.2f}") + " "
+        else:
+            frac = limit_frac                                      # the limit leash drives
+            label = f"{self.done}/{self.limit} lim "
         width = 24
         filled = int(round(width * frac))
         bar = _GRN + "▰" * filled + _DIM + "▱" * (width - filled) + _RESET
         skip = f" · {self.skipped} skip" if self.skipped else ""
         err = f" · {self._c(_RED, f'{self.errored} err')}" if self.errored else ""
-        spend = self._c(_YEL, f"${self.cost:.2f}") + (f"/${self.cap:.2f}" if self.cap is not None else "")
-        self.stream.write(f"\r\x1b[2K{self._c(_CYN, _SPIN[self._frame])} {self.stage} {bar} "
+        # the trailing spend stays UNLESS the budget label already shows it beside the bar.
+        spend = "" if budget_drives else \
+            " · " + self._c(_YEL, f"${self.cost:.2f}") + (f"/${self.cap:.2f}" if self.cap is not None else "")
+        self.stream.write(f"\r\x1b[2K{self._c(_CYN, _SPIN[self._frame])} {self.stage} {label}{bar} "
                           f"{int(frac * 100)}% · {self.done}/{self.total} · "
-                          f"{self.outputs} {self.out_noun}{skip}{err} · {spend}")
+                          f"{self.outputs} {self.out_noun}{skip}{err}{spend}")
         self.stream.flush()
 
     def _erase(self) -> None:

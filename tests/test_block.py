@@ -21,6 +21,10 @@ substrate's cross-cutting guarantees are pinned independent of any stage. The lo
     the count (scattered failures never trip); the pool stops dispatch and drains in-flight (bounded
     extra collections); `breaker_errors=0` disables (the escape hatch). Loud: one stderr line + the
     Report's `breaker_tripped`.
+  LEASHED BAR — the TTY bar's fraction tracks what ENDS the tick: spend/cap under --max-usd (labeled
+    `$so-far/$cap`, reaching 100% exactly when the run stops on budget), processed/limit under
+    --limit, the CLOSER leash when both are set; unleashed rendering pinned byte-identical to the
+    historical item walk; skips never drive a leashed bar (their own `· N skip` counter).
 
 Run: `python tests/test_block.py`."""
 import os
@@ -700,8 +704,111 @@ print("OK §18 — scores_report: pinned histogram math, all-equal + empty degra
       "twin re-orders, pure string (no writes)")
 
 
+# === 19. the leashed bar: the fraction tracks what ENDS the tick (budget / limit / neither) ============
+# The lie this closes: on a --max-usd tick the old bar was items-walked / all-enumerated, so a budget
+# stop left it stranded at 2% — and its numerator (done+skip+err) disagreed with the `done/total`
+# counter beside it. Now the bar tracks the leash that will end the tick: spend/cap under --max-usd
+# (labeled `$so-far/$cap`, beside the bar), processed/limit under --limit (labeled `n/limit lim`), and
+# when BOTH are set, whichever leash is CLOSER to tripping (max of the fractions — the run ends at the
+# FIRST leash to trip). Unleashed rendering is pinned BYTE-IDENTICAL to the historical item walk. Skips
+# never drive a leashed bar (they cost nothing against either leash) — they keep the `· N skip` counter.
+# The bar is TTY-only, so a fake-TTY stream captures it; the test never start()s the animator thread
+# (nondeterministic frames) — it sets the driver-computed total, drives tick(), and renders ONE frame.
+
+class _TTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def _frame(prog):
+    """Render one controlled frame (frame 0 — the animator never runs) and return its exact bytes."""
+    prog.stream.seek(0)
+    prog.stream.truncate(0)
+    prog._draw_bar()
+    return prog.stream.getvalue()
+
+
+GRN, DIM, RST, CYN, YEL = block._GRN, block._DIM, block._RESET, block._CYN, block._YEL
+
+
+def _bar19(filled):
+    return GRN + "▰" * filled + DIM + "▱" * (24 - filled) + RST
+
+
+def _leash_prog(**kw):
+    """A captured Progress mid-tick: 812 enumerated, 205 skipped, 47 processed → 96 events, $3.33."""
+    p = block.Progress("glean", out_noun="events", stream=_TTY(), **kw)
+    p.total = 812                # the driver-computed count start() would carry (sans animator thread)
+    for i in range(205):
+        p.tick(f"s{i}", "skipped")
+    for i in range(46):
+        p.tick(f"d{i}", "done", outputs=2, cost=0.07)
+    p.tick("d46", "done", outputs=4, cost=0.11)
+    p.cost = 3.33                # exact float for the byte pin (the ticks accumulate ≈3.33 with FP noise)
+    return p
+
+
+# NEITHER leash — the historical item walk, pinned byte-identical: percent numerator is seen
+# (done+skip+err = 252 → 31%) while the counter shows done/total (47/812); a full drain reaches 100%.
+line19n = _frame(_leash_prog())
+assert line19n == ("\r\x1b[2K" + f"{CYN}⠋{RST} glean {_bar19(7)} 31% · 47/812 · 96 events"
+                   " · 205 skip · " + f"{YEL}$3.33{RST}"), repr(line19n)
+
+# BUDGET (--max-usd 10) — the bar is spend/cap, labeled beside it; the items counter stays as-is; the
+# trailing spend is gone (the label IS the spend); skips keep their own counter.
+p19b = _leash_prog(cap=10.0)
+line19b = _frame(p19b)
+assert line19b == ("\r\x1b[2K" + f"{CYN}⠋{RST} glean {YEL}$3.33/$10.00{RST} {_bar19(8)} 33%"
+                   " · 47/812 · 96 events · 205 skip"), repr(line19b)
+
+# skips NEVER drive a leashed bar: 400 more done-skips move only the `· N skip` counter, nothing else.
+for i in range(400):
+    p19b.tick(f"s2{i}", "skipped")
+assert _frame(p19b) == line19b.replace("205 skip", "605 skip"), \
+    "400 more skips moved ONLY the skip counter — never the budget bar"
+
+# the budget bar reaches 100% exactly when the run stops on budget — §3's tick stream (cost 0.10/item,
+# cap 0.25): the gate lets item 3 through (spend 0.20 < 0.25 → 80%), then trips at 0.30 → clamp → 100%.
+p19e = block.Progress("fake", cap=0.25, stream=_TTY())
+p19e.total = 5
+p19e.tick("i1", "done", outputs=1, cost=0.10)
+p19e.tick("i2", "done", outputs=1, cost=0.10)
+assert f"{YEL}$0.20/$0.25{RST} {_bar19(19)} 80%" in _frame(p19e), repr(_frame(p19e))
+p19e.tick("i3", "done", outputs=1, cost=0.10)     # the call the gate let through overshoots the cap ...
+assert f"{YEL}$0.30/$0.25{RST} {_bar19(24)} 100%" in _frame(p19e), \
+    "... so the label shows the honest overshoot while the bar clamps at 100% (the tick IS over)"
+
+# LIMIT only (--limit 50) — the bar is processed/limit, labeled `n/limit lim`; spend trails as before.
+p19c = block.Progress("glean", limit=50, out_noun="events", stream=_TTY())
+p19c.total = 50
+for i in range(5):
+    p19c.tick(f"s{i}", "skipped")
+for i in range(12):
+    p19c.tick(f"d{i}", "done", outputs=3, cost=0.10)
+p19c.cost = 1.20
+line19l = _frame(p19c)
+assert line19l == ("\r\x1b[2K" + f"{CYN}⠋{RST} glean 12/50 lim {_bar19(6)} 24% · 12/50 · "
+                   "36 events · 5 skip · " + f"{YEL}$1.20{RST}"), repr(line19l)
+
+# BOTH leashes — precedence: whichever is CLOSER to tripping drives (max of the fractions), and the
+# label names the driving leash. Same counters, only the spend moves the verdict.
+p19d = block.Progress("glean", cap=10.0, limit=50, out_noun="events", stream=_TTY())
+p19d.total = 50
+p19d.done, p19d.outputs, p19d.cost = 12, 36, 3.33     # budget 33% > limit 24% → the budget drives
+both_b = _frame(p19d)
+assert f"{YEL}$3.33/$10.00{RST} {_bar19(8)} 33%" in both_b and " lim " not in both_b, repr(both_b)
+p19d.cost = 1.00                                      # budget 10% < limit 24% → the limit drives
+both_l = _frame(p19d)
+assert f"12/50 lim {_bar19(6)} 24%" in both_l, repr(both_l)
+assert both_l.endswith(f" · {YEL}$1.00{RST}/$10.00"), \
+    "when the limit drives, the OTHER leash's spend/cap stays as the trailing counter"
+print("OK §19 — leashed bar: budget=spend/cap (100% exactly at the budget stop), limit=processed/limit, "
+      "both=closest leash drives, unleashed pinned byte-identical, skips never drive a leashed bar")
+
+
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
       "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol "
       "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps), the "
       "consecutive-failure breaker (K unbroken failures abort the tick; success/skip resets; 0 disables), "
-      "and the read-only scores report (--scores: the pending queue's value curve)")
+      "the read-only scores report (--scores: the pending queue's value curve), and the leashed bar "
+      "(the fraction tracks what ends the tick: budget/limit/item-walk)")

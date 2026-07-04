@@ -817,7 +817,8 @@ def main(argv=None) -> None:
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
     progress = None if (args.quiet or args.dry_run) else block.Progress(
-        blk.name, cap=args.max_usd, params=dict(blk.params), out_noun=OUT_NOUN, verbose=args.verbose)
+        blk.name, cap=args.max_usd, limit=args.limit, params=dict(blk.params), out_noun=OUT_NOUN,
+        verbose=args.verbose)
     report = block.run(blk, max_usd=args.max_usd, limit=args.limit, dry_run=args.dry_run,
                        priority=block.priority_strategy(args.priority), progress=progress,
                        parallel=args.parallel, breaker_errors=args.breaker_errors)
