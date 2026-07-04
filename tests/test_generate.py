@@ -8,7 +8,11 @@ byte-identical (idempotent), the empty store yields a clear empty projection, th
 (ADR-0029) keeps `reference` concepts out of the default projection — stated in the region's kinds note
 — while `--kinds behavioral,reference` widens, and the SCOPE filter (ADR-0030) keeps repo-scoped
 concepts out of the global projection — stated in the region's scope note — while `--repo X` projects
-exactly that repo's behavioral concepts and an unknown `--repo` is refused with the scopes present.
+exactly that repo's behavioral concepts and an unknown `--repo` is refused with the scopes present,
+and the REFERENCE SHEET (`--reference`, the ADR-0029 follow-up surface) projects exactly the
+kind==reference concepts of EVERY scope — grouped by scope, global first, each entry a title fact
+line + the why beneath + the id marker — into its own staged sibling target: it round-trips through
+the same apply/diff machinery, leaves the rules projection unchanged, and refuses `--kinds`/`--repo`.
 
 generate is the mechanical projection that CLOSES THE LOOP (concept → CLAUDE.md); no LLM, so this whole suite
 runs offline.
@@ -304,5 +308,106 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     generate.main(["--dry-run", "--repo", "beta"])
 assert "<!-- c-g -->" in buf.getvalue(), "the CLI --repo routing reaches the projection"
+
+
+# === 9. the REFERENCE SHEET (--reference): the surface the kind filter left reference concepts without =
+# Exactly the kind==reference concepts, EVERY scope, grouped by scope (global first) — a lookup sheet
+# (title fact line, the why beneath, the id marker), not rules. Same markers, same apply/diff machinery,
+# its own staged sibling target. Standing cast: c-f is reference/global; mint a reference/beta sibling
+# so the scope grouping has two groups.
+
+mint_concept("c-h", "beta harness port", "The beta harness listens on port 7070.", [ch3])
+review.set_kind("c-h", "reference", R, reason="a fact you'd look up, not conduct")
+review.set_scope("c-h", "beta", R, reason="a beta-local fact")
+
+rp = generate.project_reference(R)
+assert rp.startswith(generate.START) and rp.endswith(generate.END), f"same marked-region machinery:\n{rp}"
+assert generate.REFERENCE_NOTE in rp, f"the header note says what the sheet IS and where rules live:\n{rp}"
+
+# EXACTLY the reference concepts — both scopes in — and NO behavioral concept leaks onto the sheet.
+assert "<!-- c-f -->" in rp and "<!-- c-h -->" in rp, f"reference concepts of every scope land:\n{rp}"
+for cid in ("c-a", "c-d", "c-e", "c-g"):
+    assert f"<!-- {cid} -->" not in rp, f"behavioral {cid} must NOT leak onto the reference sheet:\n{rp}"
+assert rp.count("<!-- c-") == 2, f"two reference concepts, two provenance markers:\n{rp}"
+
+# ENTRY SHAPE: the title is the fact line (the lookup key), the statement (the concept's why) beneath.
+assert "- **an effort fact** <!-- c-f -->" in rp, f"the title fact line carries the id marker:\n{rp}"
+assert "\n  ultracode is an effort level, not a model tier." in rp, f"the why sits beneath, indented:\n{rp}"
+
+# SCOPE grouping, global first — the lookup axis is WHERE a fact applies.
+assert "## global" in rp and "## beta" in rp, f"scope headings partition the sheet:\n{rp}"
+assert rp.index("## global") < rp.index("## beta"), f"global leads, repo scopes follow sorted:\n{rp}"
+assert rp.index("<!-- c-f -->") < rp.index("## beta") < rp.index("<!-- c-h -->"), \
+    f"each fact sits under ITS scope heading:\n{rp}"
+assert generate.project_reference(R) == rp, "the sheet is deterministic (order-stable)"
+
+# The RULES projection is UNCHANGED by the sheet's existence: reference concepts still sit out,
+# the kinds note still states the exclusion (now pointing at the sheet). The scope filter partitions
+# FIRST, so beta-scoped c-h counts in the scope note and only global c-f in the kinds note.
+p9 = generate.project(R)
+assert "<!-- c-f -->" not in p9 and "<!-- c-h -->" not in p9, \
+    "the rules projection still excludes reference concepts — the sheet is a second surface, not a widening"
+assert "1 reference concept(s) excluded" in p9 and "--reference" in p9, \
+    f"the kinds note counts the global exclusion and points at the sheet:\n{p9}"
+assert "beta×2" in p9, f"the beta-scoped reference concept falls to the scope note (scope filters first):\n{p9}"
+
+# ROUND-TRIP: apply into a fresh target, then diff == empty; re-apply is a byte-identical no-op.
+ref_target = Path(tempfile.mkdtemp(prefix="ratchet-target-ref-")) / "reference.md"
+resr = generate.apply(R, target=ref_target, reference=True)
+assert resr["changed"] and resr["action"] == "created", resr
+assert generate.diff(R, target=ref_target, reference=True) == "", \
+    "apply then diff round-trips to empty — the sheet region matches the projection"
+resr2 = generate.apply(R, target=ref_target, reference=True)
+assert not resr2["changed"], f"re-apply with unchanged concepts is a no-op: {resr2}"
+
+# The staged DEFAULT target is the rules projection's sibling — reference.md under generated/.
+assert generate.default_reference_target(R) == R / generate.GENERATED_SUBDIR / "reference.md", \
+    "the sheet's staged default sits beside the rules one, never beside real code"
+buf = io.StringIO()
+with redirect_stdout(buf):
+    generate.main(["--apply", "--reference"])
+assert generate.default_reference_target(R).exists(), "--reference --apply lands in the staged sibling"
+assert "<!-- c-h -->" in generate.default_reference_target(R).read_text()
+buf = io.StringIO()
+with redirect_stdout(buf):
+    generate.main(["--diff", "--reference"])
+assert "no changes" in buf.getvalue(), "--reference --diff reads the sheet's own default target"
+
+# REFUSALS (ADR-0027): --reference composed with --kinds or --repo contradicts the sheet's filter —
+# refused loudly at the CLI, and the API guard refuses a non-default kinds/scope the same way.
+for combo in (["--kinds", "behavioral"], ["--kinds", "behavioral,reference"], ["--repo", "beta"]):
+    raised = False
+    try:
+        generate.main(["--dry-run", "--reference"] + combo)
+    except SystemExit:
+        raised = True
+    assert raised, f"--reference with {combo} must be refused — the flags contradict"
+try:
+    generate.apply(R, target=ref_target, kinds=("behavioral", "reference"), reference=True)
+    assert False, "the API guard refuses reference=True with non-default kinds (no silent reinterpretation)"
+except ValueError:
+    pass
+try:
+    generate.diff(R, target=ref_target, scope="beta", reference=True)
+    assert False, "…and with a non-default scope"
+except ValueError:
+    pass
+
+# The CLI dry-run prints the sheet; --concepts serves the sheet's faithfulness context (reference rows only).
+buf = io.StringIO()
+with redirect_stdout(buf):
+    generate.main(["--dry-run", "--reference"])
+assert "<!-- c-f -->" in buf.getvalue() and "<!-- c-h -->" in buf.getvalue()
+ref_rows = generate.projected_concepts(R, reference=True)
+assert [c["id"] for c in ref_rows] == ["c-f", "c-h"] and all(c["kind"] == "reference" for c in ref_rows), \
+    "the reference faithfulness context is exactly the sheet's concepts, every scope"
+assert {c["scope"] for c in ref_rows} == {"global", "beta"}, "each row carries its scope"
+
+# RETRACTION-FOR-FREE on the sheet too: re-kind c-h behavioral → it moves surfaces on the next render.
+review.set_kind("c-h", "behavioral", R, reason="turned out to shape conduct after all")
+rp_after = generate.project_reference(R)
+assert "<!-- c-h -->" not in rp_after and "## beta" not in rp_after, \
+    "a re-kinded concept drops off the sheet (and its now-empty scope group with it)"
+assert "<!-- c-h -->" in generate.project(R, scope="beta"), "…and lands in its repo's rules projection"
 
 print("test_generate: all assertions passed")

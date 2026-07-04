@@ -24,7 +24,9 @@ could desync):
   CONCEPTS  the valid set, split by kind (behavioral — the generate surface — vs reference,
             ADR-0029) and by scope (repo-scoped concepts route to their repo's CLAUDE.md via
             `generate --repo`, ADR-0030 — counted per repo when any exist).
-  GENERATE  would the projected region be non-empty (generate's own `project`, never written).
+  GENERATE  would the projected region be non-empty (generate's own `project`, never written) —
+            plus the reference sheet's fact count (`generate --reference`), mentioned only when
+            any reference concept exists.
 
 Every section DEGRADES to zeros: a stage with no data (or a mid-edit module) prints a zero-line,
 never a traceback — a census must always answer. The maturity bar is the reviewer's knob here
@@ -52,7 +54,7 @@ ZEROS: dict[str, dict] = {
                "accepted": 0, "contested": 0, "edges": 0, "llm_edges": 0},
     "review": {"pending": 0, "incubating": 0, "proposals": 0},
     "concepts": {"valid": 0, "behavioral": 0, "reference": 0, "scoped": 0, "scopes": {}},
-    "generate": {"region_nonempty": False, "rules": 0},
+    "generate": {"region_nonempty": False, "rules": 0, "reference_facts": 0},
 }
 
 
@@ -169,14 +171,16 @@ def _concepts(root: Path) -> dict:
 
 
 def _generate(root: Path) -> dict:
-    """Would the projection land anything? Reuses generate's OWN `project` (the mechanical render,
-    no write, no target touched), so this answer and a later `--apply` can never disagree. `rules`
-    counts the region's bullet lines — one per projected concept."""
+    """Would the projection land anything? Reuses generate's OWN `project`/`project_reference` (the
+    mechanical renders, no write, no target touched), so this answer and a later `--apply` can never
+    disagree. `rules` counts the region's bullet lines — one per projected concept — and
+    `reference_facts` the sheet's (its why lines are indented, so `- ` counts entries exactly)."""
     from . import generate
     region = generate.project(root)
     nonempty = generate.EMPTY_BODY not in region
     rules = sum(1 for ln in region.splitlines() if ln.startswith("- "))
-    return {"region_nonempty": nonempty, "rules": rules}
+    facts = sum(1 for ln in generate.project_reference(root).splitlines() if ln.startswith("- "))
+    return {"region_nonempty": nonempty, "rules": rules, "reference_facts": facts}
 
 
 def census(root: Path | None = None, *, datastore: Path = tap.DEFAULT_DATASTORE,
@@ -216,7 +220,9 @@ def render(c: dict, *, datastore: Path, maturity: float) -> str:
            + " · ".join(f"{r}×{n}" for r, n in co["scopes"].items()) if co["scoped"] else "")
         + ")",
         f"GENERATE  region would be {'NON-EMPTY' if g['region_nonempty'] else 'empty'}"
-        + (f" ({g['rules']} rule(s))" if g["region_nonempty"] else ""),
+        + (f" ({g['rules']} rule(s))" if g["region_nonempty"] else "")
+        + (f" · reference sheet: {g['reference_facts']} fact(s)"
+           if g["reference_facts"] else ""),      # mentioned only when any reference concept exists
     ]
     return "\n".join(lines)
 

@@ -163,13 +163,14 @@ assert rv["proposals"] == 0, rv                                     # a moving s
 
 assert c["concepts"] == {"valid": 3, "behavioral": 2, "reference": 1,
                          "scoped": 1, "scopes": {"claude-bus": 1}}, c["concepts"]
-assert c["generate"] == {"region_nonempty": True, "rules": 1}, \
+assert c["generate"] == {"region_nonempty": True, "rules": 1, "reference_facts": 1}, \
     f"the census projects generate's OWN default view — behavioral ∧ global, the reference rule and " \
-    f"the repo-scoped rule both held out: {c['generate']}"
+    f"the repo-scoped rule both held out of the rules count, the reference one counted on ITS " \
+    f"surface (the sheet, `generate --reference`): {c['generate']}"
 
 print("OK census — 3 tapped, all chunks gleaned, 1 event awaiting resolve, 1 mature claim awaiting")
 print("            synthesize (why=null), accepted+edge counts exact, concepts split by kind+scope,")
-print("            and the generate line counts only the behavioral global rule.")
+print("            the generate line counts only the behavioral global rule + 1 reference fact.")
 
 
 # === 2. --json emits the census object; the text render carries every section ======================
@@ -190,7 +191,10 @@ for head in ("SOURCES", "PREP", "EVENTS", "CLAIMS", "REVIEW", "CONCEPTS", "GENER
 assert "1 awaiting synthesize (why=null)" in text, text
 assert "3 valid (2 behavioral · 1 reference; 1 scoped: claude-bus×1)" in text, \
     f"the CONCEPTS line carries the kind split AND the scope split (only when any exist):\n{text}"
-print("OK json+text — --json == census(); every section renders one line, CONCEPTS split by kind+scope.")
+assert "reference sheet: 1 fact(s)" in text, \
+    f"the GENERATE line mentions the sheet's readiness when reference concepts exist:\n{text}"
+print("OK json+text — --json == census(); every section renders one line, CONCEPTS split by kind+scope,")
+print("               GENERATE mentions the reference sheet (1 fact).")
 
 
 # === 3. the empty store: zeros everywhere, no traceback ============================================
@@ -203,6 +207,8 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     status.main(["--datastore", str(EMPTY_DATASTORE)])
 assert "0 tapped" in buf.getvalue() and "region would be empty" in buf.getvalue()
+assert "reference sheet" not in buf.getvalue(), \
+    "no reference concepts → the GENERATE line stays silent about the sheet (readiness, not noise)"
 print("OK empty — a data-less store answers with clean zeros, text and JSON alike.")
 
 print("\nall status tests passed")
