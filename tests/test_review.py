@@ -18,11 +18,13 @@ changed and what review must still guarantee:
 The seeded takeaways use the v2 shape (stable minted id == source_id; sessions_seen + last_seen; NO
 cluster_signature/member_events/supersedes). `review.py` itself is unchanged downstream of the gate.
 Run: `python tests/test_review.py`."""
+import io
 import json
 import os
 import re
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -380,5 +382,61 @@ assert acc not in pending_ids(), \
     "a later 'processed' marker must NOT resurrect an accepted takeaway (the queue fold excludes producer markers)"
 print("OK 11 — regression: accept re-validates evidence into the concept; no-evidence refused; stale")
 print("        concept_id mints fresh; a producer 'processed' marker can't resurrect a reviewed takeaway.")
+
+# --- 12. THE SITTING DEFAULT (CLI): --pending is a bounded top-10 slice; --limit 0 = everything ------
+# A growing backlog must never load whole into a sitting: the CLI defaults to the top SITTING_LIMIT by
+# importance, the header states "top N of M" (the backlog depth without loading it), and --limit 0 is
+# the explicit escape hatch. The LIBRARY default stays unlimited (status counts the full queue with it).
+
+def run_cli(argv):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        review.main(argv)
+    return buf.getvalue()
+
+
+for i in range(12):                                # a backlog wider than one sitting
+    seed_takeaway(id=f"bulk-{i:02d}", title=f"bulk takeaway {i}", why="a sitting-slice fixture.",
+                  relation={"kind": "new", "concept_id": None}, evidence=jj_tk["evidence"],
+                  support={"events": 2, "sessions": 2})
+full = review.pending(ROOT)                        # the library default: EVERYTHING (no hidden cap)
+total = len(full)
+assert total > review.SITTING_LIMIT == 10, f"the backlog exceeds one sitting ({total})"
+
+q10 = json.loads(run_cli(["--pending", "--json"]))
+assert len(q10) == review.SITTING_LIMIT, f"the CLI sitting default is a top-{review.SITTING_LIMIT} slice"
+assert [t["takeaway_id"] for t in q10] == [t["takeaway_id"] for t in full[:review.SITTING_LIMIT]], \
+    "the slice is the TOP of the importance order — never an arbitrary ten"
+assert len(json.loads(run_cli(["--pending", "--json", "--limit", "3"]))) == 3, "--limit N still narrows"
+assert len(json.loads(run_cli(["--pending", "--json", "--limit", "0"]))) == total, \
+    "--limit 0 = everything (the explicit escape hatch)"
+
+head = run_cli(["--pending"]).splitlines()[0]
+assert head == f"showing top {review.SITTING_LIMIT} of {total} pending (by importance) — --limit to widen", \
+    f"the header states the slice honestly, with the backlog depth: {head!r}"
+head_all = run_cli(["--pending", "--limit", "0"]).splitlines()[0]
+assert head_all == f"showing all {total} pending (by importance)", \
+    f"an unsliced render still states the total: {head_all!r}"
+
+cards, t2 = review.pending(ROOT, limit=2, with_total=True)
+assert len(cards) == 2 and t2 == total, "with_total returns the backlog depth beside the slice"
+assert len(review.pending(ROOT, limit=0)) == total, "limit 0 is unlimited at the function level too"
+
+# --incubating shares the sitting default and the honest header (nearest the bar first).
+for i in range(11):
+    seed_takeaway(id=f"inc-{i:02d}", title=f"incubating {i}", why="below the bar.",
+                  relation={"kind": "new", "concept_id": None}, evidence=jj_tk["evidence"],
+                  support={"events": 1, "sessions": 1})
+inc_total = len(review.incubating(ROOT))
+assert inc_total > review.SITTING_LIMIT, f"the incubating backlog exceeds one sitting ({inc_total})"
+assert len(json.loads(run_cli(["--incubating", "--json"]))) == review.SITTING_LIMIT, \
+    "--incubating defaults to the same sitting slice"
+inc_head = run_cli(["--incubating"]).splitlines()[0]
+assert inc_head.startswith(f"showing {review.SITTING_LIMIT} of {inc_total} takeaway(s) below the maturity bar"), \
+    f"the incubating header states its slice too: {inc_head!r}"
+assert len(json.loads(run_cli(["--incubating", "--json", "--limit", "0"]))) == inc_total
+print("OK 12 — the sitting default: --pending/--incubating load a bounded top-10 slice (importance-"
+      "ordered), the header says 'top N of M' so the backlog depth is always visible, and --limit 0")
+print("        is the explicit everything escape hatch (the library functions stay unlimited by default).")
 
 print("\nall review tests passed.")

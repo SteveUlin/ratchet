@@ -255,6 +255,10 @@ assert ordered == ["A", "B", "C", "D"], f"pending() is ORDERED by importance des
 assert [t["takeaway_id"] for t in review.pending(R4, limit=2)] == ["A", "B"], "--limit N returns the top-N by importance"
 assert [t["takeaway_id"] for t in review.pending(R4, limit=1)] == ["A"], "--limit 1 returns the single most-important"
 assert len(review.pending(R4, limit=99)) == 4, "a limit above the queue size returns all (no padding)"
+assert len(review.pending(R4, limit=0)) == 4, "limit 0 = EVERYTHING — the explicit escape hatch, never []"
+cards, total = review.pending(R4, limit=2, with_total=True)
+assert [t["takeaway_id"] for t in cards] == ["A", "B"] and total == 4, \
+    "with_total carries the FULL backlog depth beside the slice (the honest 'top N of M' header)"
 
 # determinism + stability: a re-query is byte-identical, and equal-importance ties keep derivation order.
 assert [t["takeaway_id"] for t in review.pending(R4)] == ordered, "ordering is deterministic across calls"

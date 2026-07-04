@@ -59,6 +59,12 @@ SUGGEST_TTL_DAYS = 30.0    # UNTUNED — a suggested pair folds out after this l
 CONTESTED_WINDOW = 1.0     # one fresh session's weight — a claim carrying a live contradicts edge
                            # within this of the bar is CONTESTED-near-bar (§6.6): a wrong llm
                            # CONTRADICTS verdict must not silently suppress an almost-mature claim.
+SITTING_LIMIT = 10         # the CLI's default --pending/--incubating slice — a sitting's worth: review
+                           # fatigue collapses past ~10-20 careful verdicts, and the queue is importance-
+                           # ordered, so the top slice is always the most valuable. Never a hidden cap:
+                           # the header states "top N of M" and --limit 0 loads everything (ADR-0027's
+                           # explained-knob discipline). The LIBRARY default stays unlimited — status
+                           # counts the full backlog through pending()/incubating().
 
 
 # --- resolve evidence: the trust chain reaches the reviewer ("verified real") --------------------
@@ -251,8 +257,9 @@ def _corroboration_story(corro: list[dict], subj_by_event: dict, valid_times: di
     gap since the first ("recurred after N days"). Recurrence-across-time is WHY the claim earned the
     queue, so the card says it in sulin's terms — the pattern in his work, not a bare count. An
     undated session reads as "undated" and skips the gap (never a fabricated number)."""
-    rows = sorted((str(valid_times.get(e.get("session_id")) or ""), e.get("session_id") or "?",
-                   subj_by_event.get(e.get("event_id")) or {}) for e in corro)
+    rows = sorted(((str(valid_times.get(e.get("session_id")) or ""), e.get("session_id") or "?",
+                    subj_by_event.get(e.get("event_id")) or {}) for e in corro),
+                  key=lambda r: (r[0], r[1]))  # order by (valid-time, session); the subject dict is payload, never a tiebreaker
     out: list[str] = []
     first_vt: str | None = None
     first_key: dict = {}
@@ -519,7 +526,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             limit: int | None = None, topic: str | None = None,
-            maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
+            maturity: float = dream.MATURITY_WEIGHT, with_total: bool = False):
     """The review queue: every takeaway AT/ABOVE the maturity bar with no terminal decision and no live
     snooze, ORDERED by IMPORTANCE descending and presented with its verified evidence + its bar standing.
     Derived from references — stores nothing (ADR-0007).
@@ -536,8 +543,10 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
 
     ORDERING + the operator knobs (ADR-0022): `importance` (net entrenchment × confidence) sorts DESCENDING —
     highest-leverage first. `--topic` filters to a PROJECT (substring over cited evidence); `--limit N` returns
-    the top-N. Filter + sort run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`)
-    is paid only for the survivors the human will see.
+    the top-N (`0`/`None` = everything — the escape hatch; the CLI defaults to `SITTING_LIMIT`). Filter + sort
+    run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`) is paid only for the
+    survivors the human will see. `with_total=True` returns `(cards, total)` — the backlog depth BEFORE the
+    slice — so a bounded render can still state honestly what it was cut from.
 
     THE FEED IS A UNION (dream v3, §6/ADR-0028): v3 CLAIMS over the same bar queue beside the legacy v2
     takeaways — claims PREFERRED when an id exists in both feeds (the id space is shared:
@@ -571,8 +580,10 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             continue                               # FOCUS: drop takeaways with no evidence from the topic project
         rows.append((tk, "takeaway"))
     rows.sort(key=lambda r: importance(r[0], valid_times=valid_times), reverse=True)  # IMPORTANCE desc; stable
-    if limit is not None:
-        rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering)
+    total = len(rows)                              # the backlog depth, counted BEFORE the sitting slice
+    if limit is not None and limit > 0:
+        rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering);
+                                                   # 0/None = everything, so the escape hatch can't return []
     mats = _claim_materials(root) if any(k == "claim" for _, k in rows) else None
     sugg = (_suggestions_by_claim(merge_suggestions(root, now=now, pool=pool,
                                                     valid_times=valid_times, rm=mats["rm"]))
@@ -588,7 +599,7 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             card = {**_present(view, root, context_bytes=context_bytes),
                     **bar_status(view, maturity, valid_times=valid_times)}
         out.append(card)
-    return out
+    return (out, total) if with_total else out
 
 
 def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT) -> list[dict]:
@@ -601,7 +612,9 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     projection (no evidence resolution); `needs` is the human-legible RAW distinct-session shortfall
     (`MATURITY_SESSIONS - net_sessions`), complemented by `needs_recent` for the AGED case (enough sessions,
     but their evidence decayed below the weighted bar — the honest signal is "needs RECENT corroboration").
-    The same UNION as `pending` (v3 claims beside legacy takeaways, claims preferred), tagged by `kind`."""
+    The same UNION as `pending` (v3 claims beside legacy takeaways, claims preferred), tagged by `kind`.
+    ORDERED by entrenchment DESCENDING — nearest the bar first, so the CLI's bounded slice (SITTING_LIMIT)
+    shows the takeaways closest to graduating, the ones a sitting can actually act on."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     valid_times = dream._session_valid_times(root)
@@ -636,6 +649,7 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
         if d and _is_out_of_queue(d):              # accepted/rejected/etc. directly — no longer accruing
             continue
         out.append(row(tk, "takeaway"))
+    out.sort(key=lambda r: -r["entrenchment"])     # nearest the bar first; stable → ties keep derivation order
     return out
 
 
@@ -994,7 +1008,11 @@ def main(argv=None) -> None:
     ap.add_argument("--json", action="store_true", help="machine-readable output (the skill uses this)")
     # the operator knobs (ADR-0022) — apply to --pending and --proposals: a PRIORITIZED, SCOPED subset.
     ap.add_argument("--limit", type=int, metavar="N",
-                    help="review the top-N only (by importance for takeaways, stakes for proposals)")
+                    help=f"how many items a sitting loads (by importance for takeaways, stakes for "
+                         f"proposals). --pending/--incubating default to {SITTING_LIMIT} — a sitting's "
+                         f"worth: review fatigue collapses past ~10-20 careful verdicts, and the queue "
+                         f"is importance-ordered so the top slice is always the most valuable. "
+                         f"--limit 0 = everything (the escape hatch).")
     ap.add_argument("--topic", help="filter the queue to a PROJECT whose name contains this substring")
     ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT, metavar="BAR",
                     help=f"the maturity BAR a takeaway's recency-weighted corroboration must cross to surface "
@@ -1016,19 +1034,28 @@ def main(argv=None) -> None:
     ap.add_argument("--until", help="snooze re-surface time (ISO)")
     args = ap.parse_args(argv)
 
+    # the sitting default (--pending/--incubating only): a bounded, importance-ordered slice.
+    # None → SITTING_LIMIT; an explicit 0 → everything (pending()/the slices treat 0 as no-limit).
+    sitting_limit = SITTING_LIMIT if args.limit is None else args.limit
+
     if args.pending:
-        q = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
-                    limit=args.limit, topic=args.topic, maturity=args.maturity)
+        q, total = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
+                           limit=sitting_limit, topic=args.topic, maturity=args.maturity,
+                           with_total=True)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
-            _print_queue(q, incubating_count=len(incubating(maturity=args.maturity)), bar=args.maturity)
+            _print_queue(q, total=total, incubating_count=len(incubating(maturity=args.maturity)),
+                         bar=args.maturity)
     elif args.incubating:
-        inc = incubating(maturity=args.maturity)
+        inc = incubating(maturity=args.maturity)                 # cheap (no evidence resolution) — count
+        total = len(inc)                                         # the full depth, then slice for the sitting
+        if sitting_limit > 0:
+            inc = inc[:sitting_limit]
         if args.json:
             print(json.dumps(inc, ensure_ascii=False, indent=2))
         else:
-            _print_incubating(inc)
+            _print_incubating(inc, total=total)
     elif args.contested:
         rows = contested(maturity=args.maturity)
         if args.json:
@@ -1079,7 +1106,7 @@ def main(argv=None) -> None:
               else "\n".join(f"  {c['id']}  {c.get('title', '')}" for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
         q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
-                              limit=args.limit, topic=args.topic)
+                              limit=args.limit or None, topic=args.topic)   # 0 = everything here too
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:
@@ -1108,11 +1135,19 @@ def _incubating_tail(incubating_count: int, *, bar: float | None = None) -> str:
             f"for each with its score and why)")
 
 
-def _print_queue(q: list[dict], *, incubating_count: int = 0, bar: float | None = None) -> None:
+def _print_queue(q: list[dict], *, total: int | None = None, incubating_count: int = 0,
+                 bar: float | None = None) -> None:
+    """`total` is the backlog depth BEFORE the sitting slice (pending's with_total) — the header states
+    the slice honestly ("top N of M"), so the operator always knows what the slice was cut from without
+    loading it. Absent (a full render), the header simply counts what is shown."""
     if not q:
         print("review queue empty — nothing over the maturity bar yet." + _incubating_tail(incubating_count, bar=bar))
         return
-    print(f"{len(q)} item(s) to review:\n")
+    total = len(q) if total is None else total
+    if len(q) < total:
+        print(f"showing top {len(q)} of {total} pending (by importance) — --limit to widen\n")
+    else:
+        print(f"showing all {total} pending (by importance)\n")
     for i, t in enumerate(q, 1):
         sup, rel = t["support"], t["relation"]["kind"]
         head = f"{i}/{len(q)} · {t['title']}  [{rel} · {sup['events']}ev/{sup['sessions']}sess"
@@ -1216,11 +1251,16 @@ def _print_proposals(q: list[dict]) -> None:
         print()
 
 
-def _print_incubating(inc: list[dict]) -> None:
+def _print_incubating(inc: list[dict], *, total: int | None = None) -> None:
     if not inc:
         print("nothing incubating — every live takeaway has reached the maturity bar.")
         return
-    print(f"{len(inc)} takeaway(s) below the maturity bar (accruing toward review):\n")
+    total = len(inc) if total is None else total
+    if len(inc) < total:
+        print(f"showing {len(inc)} of {total} takeaway(s) below the maturity bar "
+              f"(nearest the bar first) — --limit to widen\n")
+    else:
+        print(f"{total} takeaway(s) below the maturity bar (accruing toward review):\n")
     for t in inc:
         sup = t["support"]
         score = t.get("entrenchment")

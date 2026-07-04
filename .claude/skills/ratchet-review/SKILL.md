@@ -16,19 +16,29 @@ The trust chain guarantees each evidence quote is *copied verbatim from an immut
 
 All commands below run from anywhere — `nix run ~/ratchet#review -- …` needs no cwd.
 
-## The loop
+## The sitting
 
-Fetch the queue:
+A review sitting is a **conversation, not a report**. Careful verdicts are expensive — review fatigue collapses past ten or twenty of them — so the CLI already bounds the queue to a sitting's worth (the default `--pending` is the **top 10 by importance**, and its header says "top N of M" so the backlog depth is always visible; `--limit N` widens, `--limit 0` loads everything). Your presentation must be bounded the same way: sulin sees **one claim, gives one verdict, sees the next**. Never a wall of cards, never a map of the whole queue.
 
-```
-nix run ~/ratchet#review -- --pending --json
-```
+### Open the sitting (this order, every time)
 
-Each claim carries its **maturity standing**: `entrenchment` (recency-weighted corroboration score), the `bar` it cleared, `mature`, and a plain `rationale`. The bar is sulin's knob, not a fixed rule — pass `--maturity <N>` to lower it (review more) or raise it (only the most-corroborated). A claim earns the queue by *recurring* across distinct, recent sessions; that is evidence of durability, not a quota.
+1. **Orient** — `nix run ~/ratchet#status`. Give sulin ONE line: the counts that matter (pending, incubating, contested, proposals, thin seeds).
+2. **Contested** — `nix run ~/ratchet#review -- --contested`. These are claims being knocked down near the bar — one wrong LLM CONTRADICTS verdict must not silently suppress a good claim. Surface the **count**, and if a contradiction is holding down something that looks durable, say so *now*: it is the one thing that must not wait at the back of a queue.
+3. **Hygiene** — `nix run ~/ratchet#resolve -- --audit-thin`. The pre-gate noise-seed backlog. Report the **count only**, unless items are new since the last sitting — then name them and offer the bulk retire.
+4. **The queue** — `nix run ~/ratchet#review -- --pending --json`. The default top-10 slice, importance-ordered. Pass the backlog depth on ("top 10 of 23") so sulin always knows what the slice was cut from — and can ask to widen or `--topic`-narrow it.
 
-If the queue is empty, **don't just say "nothing to review."** Run `nix run ~/ratchet#review -- --incubating` to show what's accruing and *why* it's below the bar (each with its score), check `nix run ~/ratchet#review -- --contested` for near-bar claims a contradicts edge is holding down (one wrong LLM CONTRADICTS verdict must not silently suppress a good claim — surface these for sulin's judgment), and offer sulin the choice to lower `--maturity` for this sitting if something looks durable enough already. Otherwise, take the claims **one at a time**, and for each:
+If the slice is empty, **don't just say "nothing to review."** The opener already surfaced contested; also run `nix run ~/ratchet#review -- --incubating` to show what's accruing and *why* it's below the bar (each with its score), and offer to lower `--maturity` for this sitting if something looks durable enough already. The bar is sulin's knob, not a fixed rule — a claim earns the queue by *recurring* across distinct, recent sessions; that is evidence of durability, not a quota.
 
-### 1. Assess before you present (this decides fast vs deep)
+### Assess privately, present incrementally
+
+Do your reading **up front, before presenting anything**: the full queue JSON, every audit card, the merge suggestions riding the cards, `--context` on anything that smells (capturing notes to scratch files is fine). Run the per-claim faithfulness pass below on *everything* first, so each verdict question comes pre-checked and the sitting never stalls mid-claim.
+
+What sulin sees is only:
+
+- **One orientation paragraph** — 5 lines max: how many claims and of what ("top 10 of 23 pending"), any clusters ("four are jj lessons"), anything unusual you'll flag when its turn comes (a contested claim, a suspect merge). **NO per-claim tables, no summary map of the queue.**
+- **Then the claims, ONE AT A TIME, in importance order.** Never present claim N+1's content before claim N has its verdict.
+
+### The private pass, per claim (this decides fast vs deep)
 
 Two checks, in order — the merge, then the prose:
 
@@ -50,34 +60,61 @@ then re-fetch. Never treat a missing `why` as a defect — prose is deferred by 
 
 Then decide which way to go:
 
-- **Solid → fast path.** The quotes teach one lesson, the `why` (if present) follows from them, support is decent (multiple `events`/`sessions`), nothing high-stakes. Present it compactly with the verified quotes and say it looks well-supported — sulin can just approve.
-- **Risky → deep path. Escalate *yourself*, before asking.** Trigger on any of:
+- **Solid → fast path.** The quotes teach one lesson, the `why` (if present) follows from them, support is decent (multiple `events`/`sessions`), nothing high-stakes. The card gets a one-line "looks well-supported" read — sulin can just approve.
+- **Risky → deep path. Escalate *yourself*, before its turn comes.** Trigger on any of:
   - **suspect merge** — audit-card quotes about different things, a ⚠ disjoint-subject line, or a merge at low `stmt_sim` where only the model's judgment connects them,
   - **thin support** — 1 event / 1 session but a confident, broad claim,
   - **why-drift** — the `why` asserts more than the quotes actually support,
   - **high stakes** — `relation.kind` is `contradicts`, or the claim is `contested`,
   - or sulin asks "why do you believe this?".
 
-  On the deep path, pull the surrounding transcript with `nix run ~/ratchet#review -- --context <claim_id>` (a wider window around each quote, audit card included), read what actually happened, and **show sulin the discrepancy** before asking — e.g. "the why claims he *always* prefers X, but the only evidence is one session under deadline; here's that moment." That is the point: a research-and-learning moment, not a rubber stamp.
+  On the deep path, pull the surrounding transcript with `nix run ~/ratchet#review -- --context <claim_id>` (a wider window around each quote, audit card included), read what actually happened, and **show sulin the discrepancy** on that claim's card before asking — e.g. "the why claims he *always* prefers X, but the only evidence is one session under deadline; here's that moment." That is the point: a research-and-learning moment, not a rubber stamp.
 
-### 2. Present with zero-click evidence
+### The card, then ONE question
 
-Always show the verbatim quotes inline, marked verified (✓) — sulin judges *interpretation*, never whether a quote is real. Show the title, the why (or the why-pending badge), support (events/sessions), the corroboration story (when and where the lesson recurred), the relation, the scope (`cross-cutting` claims span subjects — that's what a global CLAUDE.md is *for*, not a defect), the maturity `rationale` (score vs bar), the audit card when present, and your own one-line faithfulness read.
+Present each claim as a compact, **wrap-safe** card — short labeled lines, **never a wide table** (tables clip in terminals). Always show the verbatim quotes inline, marked verified (✓) — sulin judges *interpretation*, never whether a quote is real. The shape:
 
-**Merge suggestions** ride the cards (derived at render time, stored nowhere, TTL'd): two claims' quotes side by side, no similarity score — the human judges words, not numbers. Present them as a question, and record sulin's answer:
+```
+[3/10] t-4f2a — prefer jj over git for version control
+maturity: 2.3 ≥ bar 1.5 — corroborated across 3 recent sessions
+✓ "always commit with jj and never use git for version control"
+✓ "version control goes through jj, so avoid reaching for git"
+audit: llm merge, stmt_sim 0.21, 2 candidates — quotes agree; same repo
+merge? t-9c01 "jj commit descriptions…" is residue-similar — same lesson?
+read: the why follows the quotes; support is solid.
+```
 
-- **confirm** (same lesson — fold the loser into the winner): `nix run ~/ratchet#review -- --merge-claims <loser> <winner> --reason "…"`
-- **dismiss** (distinct lessons — never asked again): `nix run ~/ratchet#review -- --reject-merge <loserId>,<winnerId> --reason "…"`
+- **title + maturity line** always; add the why (or the `why-pending` badge), the relation, and scope only when they carry information (`cross-cutting` claims span subjects — that's what a global CLAUDE.md is *for*, not a defect).
+- **audit / match-key lines only when `by:llm` edges or flags exist** — a seed-only claim has nothing to audit; don't pad the card. A ⚠ or a discrepancy you found in the private pass goes here, quoted.
+- **its merge suggestion, if any** (they ride the cards, derived at render time, TTL'd, stored nowhere): both claims' quotes side by side, no similarity score — the human judges words, not numbers.
+- **your read, ≤ 2 lines** — the faithfulness verdict from the private pass.
 
-### 3. Record sulin's call (pass your assessment as provenance)
+Then ask **ONE question** with the verdict options:
+
+> **Verdict?** accept · edit-accept · reject · merge-with-suggested · skip-for-now · stop sitting
+
+(offer *merge-with-suggested* only when the card carries a suggestion). **Execute the chosen verb immediately** (commands below), **confirm in one line** ("accepted → concept c-ab12"), and move to the next claim. *skip-for-now* records nothing — the claim just stays queued for a later sitting. *stop sitting* jumps to the close.
+
+**The batch escape hatch.** If sulin says "accept the rest of the cluster", "reject all the nix ones", or anything similarly explicit — honor it: run the verbs, confirm each in one line, then resume one-at-a-time with whatever remains. The one-at-a-time default bends to explicit instruction, never the reverse.
+
+### Record sulin's call (pass your assessment as provenance)
 
 - **accept:** `nix run ~/ratchet#review -- --accept <claim_id> --assessment "<your faithfulness check>"` (add `--note "..."` for anything else worth recording).
-- **edit** (sulin corrects the title/why first — the highest-value signal): `--accept <id> --edit-title "..." --edit-why "..." --assessment "..."`
+- **edit-accept** (sulin corrects the title/why first — the highest-value signal): `--accept <id> --edit-title "..." --edit-why "..." --assessment "..."`
 - **reject:** `--reject <id> --reason "<sulin's reason>"`
+- **merge** (confirm a suggestion — fold the loser into the winner): `--merge-claims <loser> <winner> --reason "…"`; **dismiss** it (distinct lessons — never asked again): `--reject-merge <loserId>,<winnerId> --reason "…"`
 - **snooze** (defer until a date — required): `--snooze <id> --until 2026-07-15 --reason "..."`. ("Wait for more evidence" is *not* a snooze — more sessions corroborate the claim on their own; just reject or skip.)
 - **contradicts** — if the claim's `relation.kind` is `contradicts`, accepting it affirms the new view; **also ask sulin whether to retire the concept it contradicts** (`relation.concept_id`), and if yes run `--retire <concept_id> --reason "..."`. Two decisions, one human judgment — don't auto-retire without asking.
 
-Accept refuses a claim whose evidence no longer resolves (a concept needs verifiable backing) — if that happens, investigate rather than forcing it. On accept, confirm the concept was written; the concept digest feeds glean, so future events arrive labeled `strengthens`/`refines`/`contradicts` instead of `new`. Then move to the next claim.
+Accept refuses a claim whose evidence no longer resolves (a concept needs verifiable backing) — if that happens, investigate rather than forcing it. On accept, confirm the concept was written; the concept digest feeds glean, so future events arrive labeled `strengthens`/`refines`/`contradicts` instead of `new`.
+
+### Sibling observations become decisions
+
+Anything you notice about a claim **not** in this slice — a twin of one under review, a stale-looking concept, a suggestion pairing with an unqueued claim — must leave the sitting as one of exactly two things: an **executed verb** (`--reject-merge`, `--merge-claims`, `--retire`, a `--note` on an accept) or an **explicit deferred item you name at the close**. Never prose that dies with the session.
+
+### Close the sitting
+
+One paragraph: the tally (accepted / rejected / merged / skipped), what entered the concept layer, and every deferred item **by name**. If anything was accepted, remind sulin that `nix run ~/ratchet#generate -- --diff` shows what the new concepts change in CLAUDE.md — the loop's last gate.
 
 ## Tier 2 — the structural-op proposal queue
 
@@ -87,7 +124,7 @@ Beside the claim queue is a second one: the gardener's **queued structural ops**
 nix run ~/ratchet#review -- --proposals --json
 ```
 
-If empty, say so and stop. Otherwise take them **one at a time**. Each proposal carries an `op`, its `params`, an untrusted `rationale`, a `stakes` score, and the **cited concepts** — each with its title, statement, a `valid` flag, and its **re-validated evidence** (the same verified quotes the trust chain serves the human). The op is one of: `merge` (fold concepts that say the same thing), `split` (divide one conflating two lessons), `abstract` (name a shared parent), `reparent`, `retire` (drop a stale concept), `merge_tags`/`retire_tag`.
+If empty, say so and stop. Otherwise the same discipline as tier 1: assess them all privately, then present **one at a time** — card, ONE question, execute, confirm, next. Each proposal carries an `op`, its `params`, an untrusted `rationale`, a `stakes` score, and the **cited concepts** — each with its title, statement, a `valid` flag, and its **re-validated evidence** (the same verified quotes the trust chain serves the human). The op is one of: `merge` (fold concepts that say the same thing), `split` (divide one conflating two lessons), `abstract` (name a shared parent), `reparent`, `retire` (drop a stale concept), `merge_tags`/`retire_tag`.
 
 ### The check is the same `why ⊨ evidence` gate, one level up
 
@@ -113,7 +150,10 @@ Two-speed, same as tier 1:
 ## Rules
 
 - **Never decide.** Recommend, surface evidence and discrepancies, but the verdict is sulin's.
+- **One claim, one verdict, then the next.** Assess everything privately up front, but never show claim N+1 before claim N is decided — and never a per-claim table of the queue. Explicit batch instructions ("accept the rest") override this; nothing else does.
+- **Wrap-safe rendering.** No wide tables — they clip in terminals. Short labeled lines.
 - **Don't widen scope.** Review the queue; don't go re-mine sessions or edit CLAUDE.md here.
 - **Prefer the surgical verb.** A foreign quote in a good claim → `--reject-merge` the edge, not `--reject` the claim; a wrong wording → `--edit-title`/`--edit-why` on accept.
 - **Capture the reasoning.** Always pass `--assessment` so an accept records *why* it was trustworthy (audited later as "verified by Claude, approved by sulin").
-- Keep the queue clearable in one sitting — it's small by design (the maturity bar is the noise filter). If it's large, surface the highest-stakes first.
+- **Everything noticed becomes a decision** — an executed verb or a named deferred item at the close, never loose prose.
+- The queue is bounded by design: the maturity bar filters noise and the default slice is a sitting's worth. If sulin wants more, widen with `--limit` (0 = everything) or focus with `--topic` — his call, not yours.

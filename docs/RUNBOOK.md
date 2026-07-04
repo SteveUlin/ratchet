@@ -72,8 +72,8 @@ ratchet synthesize --claim <id>                    # review demand — bypasses 
 **6 · Review¹ — claims → concepts** *(your judgment).* Only **mature** claims surface — corroborated across distinct, *recent* sessions — ordered by importance. The bar is your knob (`--maturity`; `--incubating` shows what sits below, with the reason). Do a sitting's worth.
 
 ```
-ratchet review --pending --limit 20                # the top-N most important
-/ratchet-review                                    # or guided: Claude faithfulness-checks the evidence
+ratchet review --pending                           # a sitting: the top 10 by importance ("top N of M" header; --limit widens, 0 = everything)
+/ratchet-review                                    # or guided: Claude faithfulness-checks the evidence, one claim at a time
 ratchet review --accept <claim> --assessment "…"
 ratchet review --reject <claim> --reason "…"
 ```
