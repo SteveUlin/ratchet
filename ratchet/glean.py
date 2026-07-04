@@ -38,6 +38,7 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import blobstore, block, chunk, completer, config, sig, subject, weave
@@ -48,6 +49,25 @@ PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks 
                                # (ADR-0026) — evidence is copy-pasted from the blob, never transcribed
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
 OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
+
+# The VALID-TIME recency term of priority(): a BONUS of `W_RECENT · 0.5^(material_age_days /
+# RECENT_HALF_LIFE_DAYS)` added to the structural score, where material age counts from when the
+# session ACTUALLY HAPPENED — the raw transcript's `origin_ref.mtime` (the valid-time clock,
+# ADR-0023 / dream._session_valid_times), NOT `fetched_at` (when ratchet ingested it). The split is
+# the whole point under a backfill: hundreds of transcripts ARRIVE in one week, so arrival-time is a
+# flat cohort with nothing to order by, while their session dates spread over months — valid-time is
+# the only clock that can say "mine the owner's recent life first", so the concept layer reflects NOW
+# sooner instead of spending the first budget-capped ticks on archaeology. It COMPOSES with the Aging
+# term rather than fighting it: recency reads when the material HAPPENED (a bonus that decays as the
+# session recedes), aging reads how long it has WAITED in the queue (a boost that grows) — so recent
+# sessions drain first today, and anti-starvation still guarantees the old tail surfaces eventually.
+# Escape hatch: W_RECENT = 0 restores the pure-structural score, bit-for-bit.
+W_RECENT = 1.0                  # UNTUNED — the full-freshness bonus, sized against the ~0.5-4.0
+                                # structural envelope (1.0 ≈ half a "user turn present"); a defensible
+                                # default, not a fitted one — wants a gold set
+RECENT_HALF_LIFE_DAYS = 60.0    # UNTUNED — a two-month-old session carries half the bonus; the scale
+                                # of "current life" vs archaeology, chosen to spread a months-wide
+                                # backfill, not fitted
 
 # Markers are the FILTER classification (ADR-0005): each learning is scored 0-1 on several salience
 # axes (multi-label, not one bucket) so a downstream synthesis ("dream") layer can route and cluster.
@@ -400,7 +420,7 @@ class GleanBlock:
         self._digest_ctx: dict | None = None
         self._facet_cache: dict = {}
         # LOCK-FREE by design under `--parallel` (this and every cache below: _facet_cache, _age_cache,
-        # _subject_cache, and the lazy _digest_ctx/_digest_failed latch): each memoizes a DETERMINISTIC
+        # _vt_cache, _subject_cache, and the lazy _digest_ctx/_digest_failed latch): each memoizes a DETERMINISTIC
         # derivation keyed by content hash, so the worst a race can do is build the same value twice —
         # duplicated work, idempotent and content-addressed, never wrong data. A lock would buy nothing.
         # The digest-disable latch (4b/ADR-0019): a persistent build failure (a bug in `digest_context`/
@@ -414,13 +434,17 @@ class GleanBlock:
         # marker. The driver reads marker_extra in the SAME thread that ran process (serial: the main
         # loop; parallel: the worker, see block._run_pool), so a thread-local is exact in both lanes.
         self._last = threading.local()
-        # the Aging seam (ADR-0021): `age` needs the run's root + a recency read. `_root` is captured in
-        # items() (the driver's root, set before ordering calls age); `_age_cache` memoizes each cleaned
-        # blob's SOURCE stamp (the raw transcript's `fetched_at`, via the lineage hop) so the many chunks
-        # SHARING one cleaned_hash pay the two meta reads once, not per chunk. Only the Aging strategy
-        # calls age() — Greedy ignores it, so a non-aging run touches neither.
+        # the TWO-CLOCK stamp seam (ADR-0021 aging + the valid-time recency term): `_root` is captured
+        # in items() (the driver's root, set before ordering calls priority/age); the caches memoize the
+        # RAW transcript's stamps behind each cleaned blob — `_age_cache` its `fetched_at` (TRANSACTION
+        # time: when the material arrived, age()'s wait-clock) and `_vt_cache` its `origin_ref.mtime`
+        # (VALID time: when the session happened, priority()'s recency clock, ADR-0023). Both live on
+        # the same raw meta, so ONE `_fill_stamps` hop (cleaned → derived_from → raw, two meta reads)
+        # fills both per cleaned blob: the many chunks SHARING one cleaned_hash pay the read pair once,
+        # and an Aging run pays nothing beyond what priority() already paid.
         self._root: Path | None = None
-        self._age_cache: dict[str, str | None] = {}
+        self._age_cache: dict[str, str | None] = {}   # cleaned_hash → raw fetched_at (None = unknown)
+        self._vt_cache: dict[str, str | None] = {}    # cleaned_hash → raw origin_ref.mtime (None = undated)
         # The subject-stamp seam (dream-v3 §2.1, S1): `subject_key` derivation parses the cleaned blob
         # once (meta hop + write-line scan, maybe a raw re-parse) — shared across the many events of one
         # session's chunks, keyed by cleaned_hash. The `_facet_cache`/`_age_cache` idiom.
@@ -473,41 +497,84 @@ class GleanBlock:
         learnings), speaker-kind diversity (a real exchange beats a tool-output monologue), and a small
         interaction-count term. Deliberately NOT byte length — a long tool dump is bytes-heavy but
         low-yield. Recall-first: this only ORDERS, never gates; a richer content-salience hint computed
-        once at chunk-time is the deferred upgrade."""
+        once at chunk-time is the deferred upgrade.
+
+        A VALID-TIME recency bonus rides on top of the structural score (see W_RECENT):
+        `W_RECENT · 0.5^(material_age / RECENT_HALF_LIFE_DAYS)`, where material age counts from the raw
+        transcript's `origin_ref.mtime` — when the session HAPPENED, not when it arrived. The structural
+        cues are date-blind, so under a backfill (every transcript sharing one arrival week) hundreds of
+        chunks tie at the structural ceiling and the tick's pick among them is arbitrary; the session
+        dates spread over months, and the bonus breaks the tie toward the owner's RECENT life — current
+        lessons reach review first, the concept layer reflects NOW sooner. It composes with the Aging
+        term: recency decays as the session recedes (happened-recently drains first), aging grows as the
+        queue-wait lengthens (the old tail is guaranteed to surface) — the two clocks deliberately pull
+        at different items. Costs two meta reads per cleaned BLOB (shared by its chunks via `_vt_cache`;
+        still never a content read); an UNDATED chunk earns NO bonus rather than the age-0 maximum (see
+        below). W_RECENT = 0 restores the pure-structural score."""
         ch = item.chunk
         kinds = set(ch.kinds or [])
         has_user = 2.0 if "user" in kinds else 0.0
         diversity = 0.5 * len(kinds)
         interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
-        return has_user + diversity + interaction
+        if ch.cleaned_hash not in self._vt_cache:
+            self._fill_stamps(ch.cleaned_hash)
+        vt = self._vt_cache[ch.cleaned_hash]
+        # A missing/unreadable session date earns NO bonus (0.0), NOT the age-0 maximum: an unknown
+        # date must never outrank known-recent material. This deliberately INVERTS `config.age_days`'s
+        # missing-stamp degrade (0.0 = "treat as fresh") — safe for age(), where 0.0 merely WITHHOLDS
+        # the anti-starvation boost, but here age-0 would GRANT the full bonus, the wrong direction.
+        recency = W_RECENT * 0.5 ** (config.age_days(vt) / RECENT_HALF_LIFE_DAYS) if vt else 0.0
+        return has_user + diversity + interaction + recency
+
+    def _fill_stamps(self, cleaned_hash: str) -> None:
+        """Fill BOTH stamp caches for one cleaned blob in ONE lineage hop. The cleaned blob is a render —
+        derived meta carries `created_at` (resettable by any re-render), never its source's stamps — so
+        both clocks hop cleaned → `derived_from` → raw meta (recompute-on-read, ADR-0013; the same hop
+        `session_of`/`project_of` walk) and read the raw transcript's `fetched_at` (transaction time,
+        age()'s clock) and `origin_ref.mtime` (valid time, priority()'s clock) off the SAME meta — two
+        reads fill two caches. Degrades to None on absent/unreadable lineage, never raises (a missing
+        stamp must not crash ordering). An mtime that does not PARSE normalizes to None here: downstream
+        None means "undated → no bonus", whereas letting `config.age_days` degrade it (0.0 = fresh)
+        would award the MAXIMUM bonus to an unreadable date — the wrong direction (see priority())."""
+        fetched = mtime = None
+        try:
+            raw = blobstore.get_meta(cleaned_hash, self._root).get("derived_from")
+            if raw:
+                m = blobstore.get_meta(raw, self._root)
+                fetched = m.get("fetched_at")
+                mtime = (m.get("origin_ref") or {}).get("mtime")
+        except (OSError, json.JSONDecodeError):
+            pass                              # absent/unreadable lineage → both stamps unknown, never raise
+        if mtime is not None:
+            try:
+                datetime.fromisoformat(str(mtime))
+            except (TypeError, ValueError):
+                mtime = None                  # an unparseable date IS an unknown date — no bonus
+        self._age_cache[cleaned_hash] = fetched
+        self._vt_cache[cleaned_hash] = mtime
 
     def age(self, item: ChunkItem) -> float:
         """The chunk's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the RAW
         transcript BEHIND the chunk's cleaned blob — how long this material has waited un-gleaned. The
         cleaned blob is a render, so its age is its SOURCE's age: derived meta carries `created_at`
         (when the render ran — resettable by any re-render), never `fetched_at` (when the material
-        arrived), so age hops the lineage `derived_from` cleaned → raw and reads the raw's stamp —
-        recompute-on-read (ADR-0013), the same hop `session_of`/`subject` walk. Reading the cleaned
-        meta directly finds no stamp on any weave-derived blob and silently flattens every age to 0.0,
-        never firing aging's anti-starvation term.
+        arrived), so age reads the raw's stamp through the `_fill_stamps` lineage hop. Reading the
+        cleaned meta directly finds no stamp on any weave-derived blob and silently flattens every age
+        to 0.0, never firing aging's anti-starvation term.
 
         glean is budget-gated (LLM + `--max-usd`), so under a months-long backlog Greedy's lowest-yield
         chunks could starve forever; aging lets an old chunk's `score + λ·age` eventually overtake
         fresher richer ones (bounded latency). CHEAP — two meta reads, cached per cleaned_hash (no
         content slice, no LLM), so it keeps the amortized-queue O(1)-per-item promise: chunks share a
-        cleaned_hash, so `_age_cache` pays the hop once per blob. Degrades to 0.0 ("fresh") when the
-        lineage or stamp is gone/unparseable — never raises (a missing recency must not crash
-        ordering). Only Aging calls this; Greedy ignores age, so glean stays byte-identical."""
+        cleaned_hash, so `_age_cache` pays the hop once per blob (and priority()'s valid-time read rides
+        the same hop — an Aging run pays no extra reads over a Greedy one). Degrades to 0.0 ("fresh")
+        when the lineage or stamp is gone/unparseable — never raises (a missing recency must not crash
+        ordering). Only Aging calls this; Greedy ignores age. NOTE the deliberate asymmetry with
+        priority()'s recency term: a missing stamp here reads as FRESH (0.0 merely withholds the aging
+        boost), there as UNDATED (no bonus) — each is the conservative direction for its own term."""
         ch = item.chunk.cleaned_hash
         if ch not in self._age_cache:
-            stamp = None
-            try:
-                raw = blobstore.get_meta(ch, self._root).get("derived_from")
-                if raw:
-                    stamp = blobstore.get_meta(raw, self._root).get("fetched_at")
-            except (OSError, json.JSONDecodeError):
-                pass                              # absent/unreadable lineage → treat as fresh (0.0), never raise
-            self._age_cache[ch] = stamp
+            self._fill_stamps(ch)
         return config.age_days(self._age_cache[ch])
 
     # -- the concept digest seam: "what we already know", provenance-relevant to THIS chunk --------

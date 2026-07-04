@@ -591,6 +591,73 @@ print("OK — age (ADR-0021): the lineage hop reads the RAW transcript's fetched
 print("     cached per cleaned blob; missing stamp or broken lineage degrades to 0.0, never raises.")
 
 
+# --- 8e. priority(): the VALID-TIME recency bonus — mine the owner's recent life first (§8d's twin) ---
+# The structural score is date-blind: under a backfill every transcript ARRIVES the same week (the
+# fetched_at clock age() reads is one flat cohort), but the sessions' `origin_ref.mtime` dates spread
+# over months. priority() must add W_RECENT · 0.5^(mtime_age / RECENT_HALF_LIFE_DAYS) read through the
+# SAME cleaned→derived_from→raw hop — and a chunk with NO readable date must earn NO bonus (an unknown
+# date never outranks known-recent material; contrast age(), where missing → "fresh" is the safe side).
+# Four same-SHAPE sources (the 6-char tags keep byte lengths — hence chunk boundaries and structural
+# scores — identical) differ ONLY in their origin mtime, so every score delta below is pure recency.
+_now_dt = datetime.now(timezone.utc)
+
+def _vt_source(tag, mtime):
+    origin = {"session_id": f"glean-{tag}"}
+    if mtime is not None:
+        origin["mtime"] = mtime
+    raw_v, _ = blobstore.ingest(blob.replace("kick off", f"kick {tag}"), source_kind="transcript",
+                                source_id=f"glean-{tag}", origin_ref=origin)
+    cs_v, _, vchunks = chunk.materialize(raw_v, budget=600)
+    return cs_v, vchunks
+
+cs_vn, ch_vn = _vt_source("vt-now", _now_dt.isoformat())                        # a session from today
+cs_v6, ch_v6 = _vt_source("vt-60d", (_now_dt - timedelta(days=60)).isoformat())  # one half-life ago
+cs_v2, ch_v2 = _vt_source("vt-240", (_now_dt - timedelta(days=240)).isoformat()) # four half-lives ago
+cs_vx, ch_vx = _vt_source("vt-non", None)                                        # undated (no origin mtime)
+
+vblk = glean.GleanBlock(FakeCompleter([]), model="vt", targets=[cs_vn, cs_v6, cs_v2, cs_vx])
+vlist = list(vblk.items(config.data_root()))            # items() captures _root, as the driver does
+it_now, it_60, it_240, it_non = (next(it for it in vlist if it.chunk == chs[0])
+                                 for chs in (ch_vn, ch_v6, ch_v2, ch_vx))
+p_now, p_60, p_240, p_non = (vblk.priority(it) for it in (it_now, it_60, it_240, it_non))
+
+# the decay curve, pinned against the undated baseline (pure-structural — proven exactly below)
+assert abs((p_now - p_non) - glean.W_RECENT) < 0.02, f"a today session earns ≈ the full bonus: {p_now - p_non}"
+assert abs((p_60 - p_non) - glean.W_RECENT / 2) < 0.02, f"one half-life old → half the bonus: {p_60 - p_non}"
+assert abs((p_240 - p_non) - glean.W_RECENT / 16) < 0.02, f"four half-lives → a sixteenth: {p_240 - p_non}"
+
+# ONE hop fills BOTH clocks: priority()'s valid-time read also populated age()'s fetched_at cache,
+# and the valid-time itself is cached per cleaned blob (the §8d idiom), None for the undated source.
+assert vblk._vt_cache[ch_vn[0].cleaned_hash] == _now_dt.isoformat(), "the hop's valid-time cached per cleaned blob"
+assert vblk._vt_cache[ch_vx[0].cleaned_hash] is None, "no origin mtime → cached as undated (None)"
+assert ch_vn[0].cleaned_hash in vblk._age_cache, "one read pair fills BOTH stamp caches (fetched_at rides along)"
+
+# the escape hatch doubles as the exactness pin: W_RECENT=0 restores the pure-structural score, and
+# the undated chunk must ALREADY sit there (missing date → +0.0 exactly, never the age-0 maximum);
+# a broken-lineage chunk (§8d's ghost) likewise earns nothing — its score is identical term-on/off.
+ghost_v = glean.ChunkItem(chunk=chunk.Chunk(cleaned_hash="f" * 64, byte_start=0, byte_end=1,
+                                            turn_start=0, turn_end=1, segment=0, kinds=["user"]),
+                          chunkset_hash="cs")
+gp_on = vblk.priority(ghost_v)
+_w = glean.W_RECENT
+try:
+    glean.W_RECENT = 0.0
+    assert vblk.priority(it_now) == p_non == vblk.priority(it_non), \
+        "W_RECENT=0 restores pure-structural; the undated chunk was already there (+0.0 exactly)"
+    assert vblk.priority(ghost_v) == gp_on, "broken lineage → no bonus (score identical with the term off)"
+finally:
+    glean.W_RECENT = _w
+
+# the payoff, end-to-end: equal structural scores → Greedy drains the RECENT session first (the
+# backfill order becomes newest-life-first; aging's wait-clock still guarantees the old tail later).
+ordered_v = block.priority_strategy("greedy").order([it_240, it_non, it_now, it_60],
+                                                    vblk.priority, vblk.age)
+assert ordered_v == [it_now, it_60, it_240, it_non], \
+    "given equal structural scores, valid-time recency alone sets the drain order (newest first)"
+print("OK — recency (valid-time): +W_RECENT today, half at one half-life, 1/16 at four; undated/broken")
+print("     lineage → +0.0 exactly (never the age-0 max); Greedy drains the recent session first.")
+
+
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------
 
 if os.environ.get("RATCHET_LIVE_TEST") == "1":
