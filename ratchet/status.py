@@ -1,6 +1,6 @@
 """status — the operator's read-only pipeline census: where does the backlog sit?
 
-    tap → weave → chunk → glean → resolve → review → garden → generate
+    tap → weave → chunk → glean → resolve → synthesize → review → garden → generate
 
 The pipeline is hand-run (cadence is documentation, not a typed API — design doc §8), so the
 operator's scheduling signal is a QUESTION, not a scheduler: which stage has un-drained work?
@@ -85,7 +85,7 @@ def _prep(root: Path) -> dict:
     `processed` marker exists for its key under the CURRENT `glean.PROMPT_VERSION` (any model) —
     the same done-index the driver skips on, so a prompt bump honestly re-opens the backlog."""
     woven = sum(1 for m in blobstore.iter_meta(root)
-                if m.get("kind") == "derived" and m.get("format") == weave.RENDER_FORMAT)
+                if m.get("kind") == "derived" and m.get("format") in weave.RENDER_FORMATS)
     chunksets = glean.all_chunksets(root)
     keys: set[str] = set()
     for cs in chunksets:
@@ -141,10 +141,7 @@ def _review(root: Path, maturity: float) -> dict:
     out = dict(ZEROS["review"])
     try:
         from . import review
-        try:
-            out["pending"] = len(review.pending(root, context_bytes=0, maturity=maturity))
-        except TypeError:                          # a signature drift — fall back to the defaults
-            out["pending"] = len(review.pending(root))
+        out["pending"] = len(review.pending(root, context_bytes=0, maturity=maturity))
         out["incubating"] = len(review.incubating(root, maturity=maturity))
     except Exception:
         pass

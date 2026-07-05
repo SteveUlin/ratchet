@@ -1,5 +1,5 @@
 """resolve — dream v3's statement-first entity resolver (design doc `dream-v3-design-2026-07-01.md`
-§1–§3/§7, superseding dream v2's route+apply; ADR-0028 pending).
+§1–§3/§7, superseding dream v2's route+apply; ADR-0028).
 
     … glean → events → RESOLVE → claims + corroborates/contradicts edges → [review] → concepts …
 
@@ -264,7 +264,7 @@ def retract_edge(event_id: str, verb: str, claim_id: str, *, root: Path | None =
                       match=obj.get("match") or {}, active=False, root=root, run_id=run_id)
 
 
-def reject_merge(event_id: str | None = None, *, edge_id: str | None = None,
+def reject_merge(event_id: str | None = None, *, edge: str | None = None,
                  pair: list[str] | None = None,
                  reason: str = "", reviewer: str = "sulin", root: Path | None = None,
                  run_id: str | None = None) -> dict:
@@ -276,19 +276,20 @@ def reject_merge(event_id: str | None = None, *, edge_id: str | None = None,
     no crash window can strand the event or let the next tick re-form the torn-out merge. REVIEW-only
     by policy (ADR-0008): a permanent negative constraint is a trust-boundary artifact.
 
-    Two forms: with an `edge_id` the event is implied (derived when `event_id` is omitted) and all
-    three folds fire; PAIR-ONLY (a dismissed merge SUGGESTION between two live claims, §6.5) carries
-    no event — target is None, nothing retracts or reopens, and only the pair-block fold reads it
-    (the suggestion query stops asking, resolve never pairs them)."""
-    if not edge_id and not pair:
-        raise ValueError("reject_merge needs an edge_id and/or a pair to block")
-    if event_id is None and edge_id:
-        parts = edge_id.split(EDGE_SEP)
+    Two forms: with an `edge` (an edge id) the event is implied (derived when `event_id` is omitted)
+    and all three folds fire; PAIR-ONLY (a dismissed merge SUGGESTION between two live claims, §6.5)
+    carries no event — target is None, nothing retracts or reopens, and only the pair-block fold reads
+    it (the suggestion query stops asking, resolve never pairs them)."""
+    if not edge and not pair:
+        raise ValueError("reject_merge needs an edge id and/or a pair to block")
+    if event_id is None and edge:
+        parts = edge.split(EDGE_SEP)
         event_id = parts[0] if len(parts) == 3 else None
     root = root or config.data_root()
     at = config.now()
     body = {"verb": VERB_REJECT_MERGE, "target": event_id, "event_id": event_id,
-            "edge_id": edge_id, "pair": sorted(pair) if pair else None,
+            "edge_id": edge, "pair": sorted(pair) if pair else None,   # the STORED field stays edge_id —
+            # persisted vocabulary three folds read; only the param avoids shadowing edge_id()
             "reason": str(reason)[:dream.NOTE_MAX], "reviewer": reviewer,
             "at": at, "run_id": run_id or config.run_id(),
             "producer": {"stage": "review", "at": at}}
@@ -366,7 +367,6 @@ def corro_fingerprint(claim_id: str, event_ids) -> str:
     staleness must be DETECTED here, not recomputed away."""
     ids = sorted(edge_id(e, "corroborates", claim_id) for e in set(event_ids))
     return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
-
 
 
 def _load_event(eid: str, ev_hashes: dict, cache: dict, root: Path) -> dict | None:
@@ -463,7 +463,7 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         confs.append(completer.clean_score(ev.get("confidence"), 0.5))
         rv = dream._resolve_event(ev, blobs, sessions, root)
         if rv is not None:
-            evidence.append(dream.evidence_entry(rv))
+            evidence.append(dream.evidence_entry(rv, root=root))
     # the seed event's re-validated verbatim quote — the residue prompt's candidate-side evidence
     # (prompt v2). Derived from the fold's own evidence entries (already validate_span-anchored);
     # None when the seed edge is retracted or the blob/span no longer resolves.
@@ -480,7 +480,7 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         ev = _load_event(eid, ev_hashes, ev_cache, root)
         rv = dream._resolve_event(ev, blobs, sessions, root) if ev else None
         if rv is not None:
-            entry = dream.evidence_entry(rv)
+            entry = dream.evidence_entry(rv, root=root)
             entry["session_id"] = e.get("session_id")
         s = e.get("session_id")
         if s and ev is not None and sess_repos.get(s) is None:
@@ -847,7 +847,6 @@ class ResolveBlock:
 
     def __init__(self, complete_resolve: Completer, *, model: str = RESOLVE_MODEL,
                  min_confidence: float = 0.0, source_filter: str | None = None,
-                 maturity: float = dream.MATURITY_WEIGHT,
                  j_maybe: float | None = None, h_min: float | None = None,
                  k_residue: int = K_RESIDUE, k_rare: int = K_RARE, rare_min: int = RARE_MIN,
                  facet_df_max: float = FACET_DF_MAX, active_floor: float = ACTIVE_FLOOR,
@@ -862,7 +861,6 @@ class ResolveBlock:
         self.model = model
         self.min_confidence = min_confidence
         self.source_filter = source_filter
-        self.maturity = maturity
         self.j_maybe = sig.J_MAYBE if j_maybe is None else j_maybe
         self.h_min = sig.H_MIN if h_min is None else h_min
         self.k_residue = k_residue
@@ -1087,7 +1085,7 @@ class ResolveBlock:
             "seed_quote": rv.quote,                    # the candidate-side evidence, already validated
             "thin_evidence": thin_quote(rv.quote),     # the derived noise-floor badge, exactly the fold's
             "born": content["born"],
-            "cites": [rv.id], "evidence": [dream.evidence_entry(rv)],
+            "cites": [rv.id], "evidence": [dream.evidence_entry(rv, root=root)],
             "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
             "sessions_seen": [rv.session_id] if rv.session_id else [],
             "contradicted_by": [], "contradiction_evidence": [],
@@ -1097,7 +1095,7 @@ class ResolveBlock:
             "subject": {"repos": [ev_subj["repo"]] if ev_subj.get("repo") else [],
                         "files": sorted(ev_subj.get("files") or ())},
             "scope": "local", "scope_repo": scope_repo_of([ev_subj]),
-            "stmt_shingles": frozenset(ev_sh) | sig.char_shingles(summary),
+            "stmt_shingles": ev_sh,                    # ev_sh IS char_shingles(summary) — process computed it once
             "stmt_entropy": ev_ent, "_subj_keys": [ev_subj],
             "_session_repos": {rv.session_id: ev_subj.get("repo")} if rv.session_id else {},
         }
@@ -1115,7 +1113,7 @@ class ResolveBlock:
         tick reads the updated signature/subject (read-your-writes)."""
         if rv.id not in view["cites"]:
             view["cites"].append(rv.id)
-            view["evidence"].append(dream.evidence_entry(rv))
+            view["evidence"].append(dream.evidence_entry(rv, root=self._root))
         if rv.session_id and rv.session_id not in view["sessions_seen"]:
             view["sessions_seen"].append(rv.session_id)
         if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
@@ -1145,7 +1143,7 @@ class ResolveBlock:
         if rv.id in view["contradicted_by"]:
             return
         view["contradicted_by"].append(rv.id)
-        entry = dream.evidence_entry(rv)
+        entry = dream.evidence_entry(rv, root=self._root)
         entry["session_id"] = rv.session_id
         view["contradiction_evidence"].append(entry)
         if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
@@ -1193,7 +1191,7 @@ class ResolveReport(block.ProxyReport):
 
 
 def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confidence: float = 0.0,
-        source_filter: str | None = None, maturity: float = dream.MATURITY_WEIGHT,
+        source_filter: str | None = None,
         j_maybe: float | None = None, h_min: float | None = None, k_residue: int = K_RESIDUE,
         k_rare: int = K_RARE, rare_min: int = RARE_MIN, facet_df_max: float = FACET_DF_MAX,
         active_floor: float = ACTIVE_FLOOR, active_days: float = ACTIVE_DAYS,
@@ -1206,7 +1204,7 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
     `max_usd` goes to the BLOCK (residue deferral, §7.2), never to the driver's break-on-budget:
     the tick always runs the full list, paying only what the cap allows."""
     blk = ResolveBlock(complete_resolve, model=model, min_confidence=min_confidence, source_filter=source_filter,
-                       maturity=maturity, j_maybe=j_maybe, h_min=h_min, k_residue=k_residue,
+                       j_maybe=j_maybe, h_min=h_min, k_residue=k_residue,
                        k_rare=k_rare, rare_min=rare_min, facet_df_max=facet_df_max,
                        active_floor=active_floor, active_days=active_days, dup_exact=dup_exact,
                        quote_min_chars=quote_min_chars,
@@ -1230,8 +1228,8 @@ def main(argv=None) -> None:
                     "this substring, case-insensitive — the originating project for transcripts (e.g. taro), "
                     "the file path for documents (e.g. CLAUDE.md); ADR-0022")
     ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT,
-                    help="recency-weighted net-entrenchment bar a claim must cross to reach review "
-                         "(the single bar, dream.MATURITY_WEIGHT — the reviewer's knob, ADR-0027)")
+                    help="shapes ONLY the --dry-run preview's mature-claim count; the bar itself is the "
+                         "reviewer's knob and lives with review/synthesize (ADR-0027)")
     ap.add_argument("--j-maybe", type=float, default=sig.J_MAYBE,
                     help=f"residue-band floor (default {sig.J_MAYBE}; below it a pair is non-match at $0)")
     ap.add_argument("--h-min", type=float, default=sig.H_MIN,
@@ -1350,7 +1348,7 @@ def main(argv=None) -> None:
         "resolve", cap=args.max_usd, params={"prompt_version": PROMPT_VERSION, "model": args.model},
         out_noun=OUT_NOUN, verbose=args.verbose)
     report = run(complete_resolve, model=args.model, min_confidence=args.min_confidence,
-                 source_filter=args.source, maturity=args.maturity, j_maybe=args.j_maybe, h_min=args.h_min,
+                 source_filter=args.source, j_maybe=args.j_maybe, h_min=args.h_min,
                  k_residue=args.k_residue, k_rare=args.k_rare, rare_min=args.rare_min,
                  facet_df_max=args.facet_df_max, active_floor=args.active_floor,
                  active_days=args.active_days, dup_exact=args.dup_exact,

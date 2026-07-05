@@ -806,6 +806,21 @@ print("OK §19 — leashed bar: budget=spend/cap (100% exactly at the budget sto
       "both=closest leash drives, unleashed pinned byte-identical, skips never drive a leashed bar")
 
 
+# === 20. ProxyReport forwards EVERY uniform Report field (the docstring's claim, enforced) =============
+# Generic over dataclasses.fields(Report), so a field added to Report later FAILS here until the proxy
+# forwards it — the anti-desync discipline the wrapper exists for.
+import dataclasses  # noqa: E402
+
+rep20 = block.Report(stage="probe", run_id="r-proxy", examined=7, processed=5, skipped=1, errored=1,
+                     outputs=9, cost_usd=1.25, stopped_on_budget=True, breaker_tripped=True,
+                     would_process=3, pending=2)
+proxy20 = block.ProxyReport(rep20, None)
+for f20 in dataclasses.fields(block.Report):
+    assert getattr(proxy20, f20.name) == getattr(rep20, f20.name), \
+        f"ProxyReport must forward Report.{f20.name} (it claims to forward every uniform field)"
+print("OK §20 — ProxyReport forwards every uniform Report field (checked generically over the dataclass)")
+
+
 print("\nOK — block driver: per-item commit/crash-safety, idempotency, budget/limit/dry-run, priority "
       "queue, DECOUPLED progress (start/tick(outcome)/stop protocol), dream's finalize exception, protocol "
       "structure, opt-in bounded parallelism (identical end-state, leashed budget, loud clamps), the "

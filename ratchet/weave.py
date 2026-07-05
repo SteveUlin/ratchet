@@ -178,8 +178,21 @@ def _drop_surrogates(s: str) -> str:
     return s.encode("utf-8", "replace").decode("utf-8") if s else s
 
 
+# Render truncation caps — how much of each block survives into the cleaned doc. A head/tail pair keeps
+# the START (the intent) and the END (the outcome/conclusion) and elides the middle with a counted marker.
+# subject.py's SPAN_WINDOW is sized off these caps — retune them together.
+THINKING_HEAD, THINKING_TAIL = 2000, 400   # thinking is context, not ground truth — keep its shape, shed bulk
+TEXT_HEAD, TEXT_TAIL = 4000, 1000          # the lesson-bearing prose — the render's largest caps; assistant
+                                           # text and user turns share them (both are the conversation itself)
+RESULT_HEAD, RESULT_TAIL = 1000, 300       # tool results are bulky + mechanical: head = what came back,
+                                           # tail = the exit/summary lines
+TOOL_LINE_CAP = 280                        # one single-line `→ name: arg` per tool call — a pointer, not a dump
+TRUNCATE_SLACK = 40                        # skip eliding when the marker costs about what it saves
+INSPECT_HEAD = 70                          # the --inspect debug listing's per-turn preview width
+
+
 def _truncate(s: str, head: int, tail: int = 0) -> str:
-    if len(s) <= head + tail + 40:   # +40: skip eliding when the marker costs about what it saves
+    if len(s) <= head + tail + TRUNCATE_SLACK:
         return s
     elided = len(s) - head - tail
     if tail:
@@ -200,7 +213,7 @@ def _tool_use_line(b: dict) -> str:
     if not arg and inp:
         arg = json.dumps({k: inp[k] for k in list(inp)[:4]}, ensure_ascii=False, default=str)
     line = f"→ {name}" + (f": {arg}" if arg else "")
-    return _truncate(line.replace("\n", " "), 280)
+    return _truncate(line.replace("\n", " "), TOOL_LINE_CAP)
 
 
 def _tool_result_text(block: dict) -> str:
@@ -216,7 +229,7 @@ def _tool_result_text(block: dict) -> str:
 
 
 def _indent_result(res: str) -> str:
-    res = _truncate(res.strip(), 1000, 300)
+    res = _truncate(res.strip(), RESULT_HEAD, RESULT_TAIL)
     return "  ⤷ " + res.replace("\n", "\n     ")
 
 
@@ -257,11 +270,11 @@ def _render_assistant(blocks: list, tool_results: dict[str, str]) -> str:
         if bt == "thinking":
             tk = (b.get("thinking") or "").strip()
             if tk:
-                lines.append("(thinking) " + _truncate(tk, 2000, 400))
+                lines.append("(thinking) " + _truncate(tk, THINKING_HEAD, THINKING_TAIL))
         elif bt == "text":
             tx = (b.get("text") or "").strip()
             if tx:
-                lines.append(_truncate(tx, 4000, 1000))
+                lines.append(_truncate(tx, TEXT_HEAD, TEXT_TAIL))
         elif bt == "tool_use":
             lines.append(_tool_use_line(b))
             res = tool_results.get(b.get("id"))
@@ -278,7 +291,7 @@ def _render_user(c) -> str:
                       if isinstance(b, dict) and b.get("type") == "text")
     else:
         s = ""
-    return _truncate(s.strip(), 4000, 1000)
+    return _truncate(s.strip(), TEXT_HEAD, TEXT_TAIL)
 
 
 def _spine_turns(spine: list[dict], tool_results: dict[str, str]) -> list[tuple[str, str, int]]:
@@ -465,7 +478,7 @@ def _inspect(h: str) -> None:
           f"{len(doc.text)} chars  segments {segs}")
     for t in doc.turns[:40]:
         head = doc.text[t.start:t.end].splitlines()[0] if t.end > t.start else ""
-        print(f"  [{t.index:>3}] seg{t.segment} {t.end - t.start:>6}c {_truncate(head, 70)}")
+        print(f"  [{t.index:>3}] seg{t.segment} {t.end - t.start:>6}c {_truncate(head, INSPECT_HEAD)}")
 
 
 def main(argv=None) -> None:

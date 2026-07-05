@@ -427,7 +427,7 @@ c5 = claim_pool(R5)[0]
 eid5 = [c for c in c5["cites"] if c != c5["seed_event"]][0]
 assert c5["support"]["sessions"] == 2 and working_set(R5) == []
 
-resolve.reject_merge(eid5, edge_id=resolve.edge_id(eid5, "corroborates", c5["id"]),
+resolve.reject_merge(eid5, edge=resolve.edge_id(eid5, "corroborates", c5["id"]),
                      reason="different lessons", root=R5)
 after = {c["id"]: c for c in claim_pool(R5)}[c5["id"]]
 assert after["support"] == {"events": 1, "sessions": 1}, "the edge fold reads the decision as retraction"
@@ -545,7 +545,7 @@ for rid in ("fr-1", "fr-2", "fr-3"):                    # three resolve-stage ru
 assert resolve.forget(R8, tau=2, run_id="fg-1") == [], \
     "FORGET_MIN_DAYS holds: cycle count alone never stales a fresh event (cheap ticks can't accelerate)"
 # a reopen AFTER those runs restarts the residency clock: only the never-reopened event may stale.
-resolve.reject_merge(re8.id, edge_id=f"{re8.id}|corroborates|t-x", reason="test reopen", root=R8)
+resolve.reject_merge(re8.id, edge=f"{re8.id}|corroborates|t-x", reason="test reopen", root=R8)
 staled8 = resolve.forget(R8, tau=2, min_days=0.0, run_id="fg-2")
 assert staled8 == [low8.id], \
     f"residency counts only runs postdating the reopen — the reopened event survives: {staled8}"

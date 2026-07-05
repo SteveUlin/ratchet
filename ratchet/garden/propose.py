@@ -281,6 +281,41 @@ def _op_stakes_of(desc: dict) -> float:
     return op_stakes(probe)
 
 
+# the ops `_apply_op` can auto-apply directly — every op the proposer emits EXCEPT `split` (whose per-part
+# EVIDENCE PARTITION is the 3d/human's to choose, never the machine's to guess). `process` auto-applies an op
+# ONLY when it is BOTH low-stakes AND in this set; anything else QUEUES unconditionally, so a non-auto-applicable
+# op — split, or a future kind `_apply_op` does not handle — at a deliberately-raised `--auto-max-stakes` is
+# QUEUED for 3d, never stranded on `_apply_op`'s raise (N1). Keep in lockstep with `_apply_op`'s branches.
+AUTO_APPLICABLE_OPS = frozenset({"merge", "abstract", "reparent", "retire", "relate", "merge_tags", "retire_tag"})
+
+
+def _apply_op(desc: dict, *, root: Path, run_id: str) -> None:
+    """AUTO-APPLY one op by calling its 3c-i fn directly (the trusted, append-only machinery). `process` routes
+    here ONLY ops in `AUTO_APPLICABLE_OPS`, and only when low-stakes — so under the default threshold just the
+    edge/tag/reparent ops land, while a deliberately-raised threshold lets the concept-altering branches
+    (merge/abstract/retire) fire too (all still wired). An auto-applied edge/curation carries the rationale as
+    its NOTE (provenance)."""
+    op, p, note = desc["op"], desc["params"], desc.get("rationale", "")
+    if op == "relate":
+        assert_edge(p["src"], "relates-to", p["dst"], note=note, root=root, run_id=run_id, op="propose")
+    elif op == "reparent":
+        reparent(p["concept_id"], p["parent_id"], root=root, run_id=run_id)
+    elif op == "merge_tags":
+        merge_tags(p["loser_slug"], p["winner_slug"], note=note, root=root, run_id=run_id)
+    elif op == "retire_tag":
+        retire_tag(p["slug"], note=note, root=root, run_id=run_id)
+    elif op == "merge":
+        merge(p["loser_ids"], p["winner_id"], root=root, run_id=run_id)
+    elif op == "abstract":
+        abstract(p["child_ids"], p["title"], p["statement"], root=root, run_id=run_id)
+    elif op == "retire":
+        retire(p["concept_id"], reason=note, root=root)
+    else:                                    # UNREACHABLE: `process` routes split (and any non-auto-applicable
+        # op) straight to the 3d queue, so this guards the AUTO_APPLICABLE_OPS invariant rather than handling a
+        # live case — a split's per-part evidence partition is the human's, never auto-guessed here.
+        raise AssertionError(f"op {op!r} reached _apply_op but is not auto-applicable — process must queue it")
+
+
 # ==================================================================================================
 # DECAY / STALENESS (3c-iii, ADR-0024): a DETERMINISTIC pass that surfaces QUIET concepts for review
 #
@@ -413,43 +448,6 @@ def propose_stale(root: Path | None = None, *, days: float = STALENESS_DAYS, now
     return out
 
 
-# --- route on stakes: auto-apply LOW, queue HIGH for 3d -------------------------------------------
-
-# the ops `_apply_op` can auto-apply directly — every op the proposer emits EXCEPT `split` (whose per-part
-# EVIDENCE PARTITION is the 3d/human's to choose, never the machine's to guess). `process` auto-applies an op
-# ONLY when it is BOTH low-stakes AND in this set; anything else QUEUES unconditionally, so a non-auto-applicable
-# op — split, or a future kind `_apply_op` does not handle — at a deliberately-raised `--auto-max-stakes` is
-# QUEUED for 3d, never stranded on `_apply_op`'s raise (N1). Keep in lockstep with `_apply_op`'s branches.
-AUTO_APPLICABLE_OPS = frozenset({"merge", "abstract", "reparent", "retire", "relate", "merge_tags", "retire_tag"})
-
-
-def _apply_op(desc: dict, *, root: Path, run_id: str) -> None:
-    """AUTO-APPLY one op by calling its 3c-i fn directly (the trusted, append-only machinery). `process` routes
-    here ONLY ops in `AUTO_APPLICABLE_OPS`, and only when low-stakes — so under the default threshold just the
-    edge/tag/reparent ops land, while a deliberately-raised threshold lets the concept-altering branches
-    (merge/abstract/retire) fire too (all still wired). An auto-applied edge/curation carries the rationale as
-    its NOTE (provenance)."""
-    op, p, note = desc["op"], desc["params"], desc.get("rationale", "")
-    if op == "relate":
-        assert_edge(p["src"], "relates-to", p["dst"], note=note, root=root, run_id=run_id, op="propose")
-    elif op == "reparent":
-        reparent(p["concept_id"], p["parent_id"], root=root, run_id=run_id)
-    elif op == "merge_tags":
-        merge_tags(p["loser_slug"], p["winner_slug"], note=note, root=root, run_id=run_id)
-    elif op == "retire_tag":
-        retire_tag(p["slug"], note=note, root=root, run_id=run_id)
-    elif op == "merge":
-        merge(p["loser_ids"], p["winner_id"], root=root, run_id=run_id)
-    elif op == "abstract":
-        abstract(p["child_ids"], p["title"], p["statement"], root=root, run_id=run_id)
-    elif op == "retire":
-        retire(p["concept_id"], reason=note, root=root)
-    else:                                    # UNREACHABLE: `process` routes split (and any non-auto-applicable
-        # op) straight to the 3d queue, so this guards the AUTO_APPLICABLE_OPS invariant rather than handling a
-        # live case — a split's per-part evidence partition is the human's, never auto-guessed here.
-        raise AssertionError(f"op {op!r} reached _apply_op but is not auto-applicable — process must queue it")
-
-
 # --- the Block: ONE sharp proposer call per high-tension cluster, per-cluster commit ---------------
 
 class GardenProposeBlock:
@@ -500,7 +498,8 @@ class GardenProposeBlock:
         self.n_applied = 0                              # auto-applied (low-stakes) ops
         self.n_queued = 0                               # proposals queued for the 3d gate
         self.applied: list[dict] = []                   # [{op, params, concept_ids, rationale, stakes}]
-        self.proposals: list[dict] = []                 # the queued proposal contents (for --show / tests)
+        self.proposals: list[dict] = []                 # [{op, params, concept_ids, rationale, stakes,
+                                                        #   proposal_id}] — the queued ops (--show / tests)
 
     def items(self, root: Path, *, source_id: str | None = None):
         """The concept CLUSTERS (3a facets + 3b tags), frozen at run start — `concept_graph` gives the
@@ -544,10 +543,11 @@ class GardenProposeBlock:
                 self.n_applied += 1
                 self.applied.append({**desc, "stakes": round(stakes, 4)})
             else:                                        # HIGH / fuzzy-middle / non-auto-applicable → QUEUE for 3d
-                content, _ = queue_proposal(desc, cluster_leader=cluster["leader"], stakes=stakes,
-                                            root=root, run_id=run_id, model=self.model)
+                queue_proposal(desc, cluster_leader=cluster["leader"], stakes=stakes,
+                               root=root, run_id=run_id, model=self.model)
                 self.n_queued += 1
-                self.proposals.append(content)
+                self.proposals.append({**desc, "stakes": round(stakes, 4),
+                                       "proposal_id": mint_proposal_id(desc)})
             n_out += 1
         self.n_proposed += n_out
         return n_out, cost

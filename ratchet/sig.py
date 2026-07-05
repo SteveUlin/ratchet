@@ -377,10 +377,10 @@ def _quote_of(ev: dict, blobs: dict, root: Path) -> str | None:
 
 
 def _all_pairs(corpus: list[dict]):
-    """All unordered event pairs with their exact Jaccard and the same-project proxy. ~284 events
-    → ~40k pairs — pure-Python fine; an UNRESOLVABLE project on either side counts as
-    cross-project (an unknowable origin cannot demonstrate overlap — the empty-subject discipline
-    of §3.1 step 0, mirrored)."""
+    """All unordered event pairs with their exact Jaccard and the same-project proxy. O(n²): a
+    corpus of hundreds of events yields low-hundreds-of-thousands of pairs — pure-Python fine; an
+    UNRESOLVABLE project on either side counts as cross-project (an unknowable origin cannot
+    demonstrate overlap — the empty-subject discipline of §3.1 step 0, mirrored)."""
     for i in range(len(corpus)):
         a = corpus[i]
         for j in range(i + 1, len(corpus)):

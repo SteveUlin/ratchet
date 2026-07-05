@@ -500,13 +500,14 @@ def _proposal_blob(proposal_id: str, root: Path | None = None) -> dict | None:
 
 
 def queue_proposal(desc: dict, *, cluster_leader: str, stakes: float, root: Path | None = None,
-                   run_id: str, model: str) -> tuple[str, bool]:
+                   run_id: str, model: str) -> tuple[str | None, bool]:
     """QUEUE a high-stakes op as an append-only `garden_proposal` blob for the 3d gate (NOT applied). Keyed on
     the deterministic proposal id, latest-wins; a QUEUED artifact with NO lifecycle field — its resolution is a
     separate 3d decision (`RESOLVE_VERBS`), never a status on the blob. CONTENT is run-invariant ({proposal_id,
     op, params, concept_ids, rationale, stakes, cluster_leader, prompt_version}) so a crash-retry re-ingests
     byte-identically; the producer/cost ride in `origin_ref`. The rationale rides in the body as the
-    human-facing justification — UNTRUSTED, surfaced to 3d, never acted on here. Returns (hash, written).
+    human-facing justification — UNTRUSTED, surfaced to 3d, never acted on here. Returns (hash, written); the
+    suppressed path returns the proposal's existing latest version — None when none was ever stored.
 
     REJECTED-OP SUPPRESSION (the L2 loop closing — the canonical why): the gardener REMEMBERS a 3d verdict.
     `mint_proposal_id` is deterministic on op identity, so a re-gardened cluster re-proposes the SAME id —

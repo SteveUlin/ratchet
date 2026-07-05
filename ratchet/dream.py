@@ -1,6 +1,6 @@
 """dream v2 — incremental WORKING-SET CONSOLIDATION: route each un-consolidated glean event to one of
-NEW / STRENGTHEN / NOOP and maintain a small, live CATALOG of durable, evidence-cited **takeaways**
-(ADR-0010, superseding 0006's global re-cluster).
+NEW / STRENGTHEN / WEAKEN / NOOP and maintain a small, live CATALOG of durable, evidence-cited
+**takeaways** (ADR-0010, superseding 0006's global re-cluster).
 
     … chunk → chunkset → glean → events → dream → takeaways → [human review] → concepts → generate
                                             (consolidation: a cheap router + a rare synthesizer)
@@ -318,7 +318,8 @@ def concept_scopes(root: Path | None = None) -> dict[str, str]:
 def load_concepts(root: Path | None = None) -> list[dict]:
     """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
     against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
-    derived: the latest version of each concept source, minus any whose latest decision is `retire`.
+    derived: the latest version of each concept source, minus any whose latest decision carries a
+    `CONCEPT_INVALID_VERBS` verb (retire / supersede / split — each takes the concept out of the valid set).
     This is the loop closing — review's accepts become the concepts dream reads next run. Empty until
     review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal.
 
@@ -811,18 +812,20 @@ def mint_takeaway_id(seed_event_id: str) -> str:
     return "t-" + hashlib.sha256(seed_event_id.encode("utf-8")).hexdigest()[:12]
 
 
-def evidence_entry(rv: ResolvedEvent, *, context_bytes: int = CONTEXT_BYTES) -> dict:
+def evidence_entry(rv: ResolvedEvent, *, context_bytes: int = CONTEXT_BYTES,
+                   root: Path | None = None) -> dict:
     """A ROBUST ANCHOR (W3C Web Annotation) for one cited event: the byte span AND the verbatim quote +
     a little surrounding context. The span is RE-VALIDATED via `validate_span` at WRITE — the same
     immutable, content-addressed blob `working_set` resolved, so this re-anchors at the write boundary
-    too. If the blob is gone, the (already-validated) span + quote still ship; only the context window is
-    best-effort."""
+    too (`root` threads the caller's store, so an injected root re-validates against the SAME store the
+    span resolved from). If the blob is gone, the (already-validated) span + quote still ship; only the
+    context window is best-effort."""
     ch = rv.event.get("cleaned_hash")
     entry = {"event_id": rv.id, "cleaned_hash": ch,
              "byte_start": rv.span[0], "byte_end": rv.span[1],
              "quote": rv.quote, "context": rv.quote}
     try:
-        data = blobstore.get(ch).encode("utf-8")
+        data = blobstore.get(ch, root).encode("utf-8")
     except (FileNotFoundError, OSError):
         return entry
     span = blobstore.validate_span(data, rv.span[0], rv.span[1])   # re-validate at WRITE
@@ -945,7 +948,8 @@ def _synth_user(rv: ResolvedEvent, concept_digest: str) -> str:
 
 
 def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
-                   known_concept_ids: set[str], model: str, run_id: str) -> tuple[dict | None, float]:
+                   known_concept_ids: set[str], model: str, run_id: str,
+                   root: Path | None = None) -> tuple[dict | None, float]:
     """Mint a takeaway from ONE event (the injected SYNTH Completer, Sonnet). `drop` or no usable `why`
     → (None, cost): a successful adjudication that this event is noise (apply marks it consolidated so it
     is not re-synthesized). Else build the v2 takeaway: a STABLE minted id, one robust-anchored evidence
@@ -966,7 +970,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest:
         "why": why,
         "relation": _clean_relation(parsed.get("relation"), known_concept_ids),
         "cites": [rv.id],
-        "evidence": [evidence_entry(rv)],
+        "evidence": [evidence_entry(rv, root=root)],
         "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
         "sessions_seen": [rv.session_id] if rv.session_id else [],
         "contradictions": {"events": 0, "sessions": 0},    # the symmetric side, born empty (ADR-0012)
@@ -983,7 +987,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest:
 
 def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
                    known_concept_ids: set[str], drift_threshold: float,
-                   model: str, run_id: str) -> tuple[dict, float]:
+                   model: str, run_id: str, root: Path | None = None) -> tuple[dict, float]:
     """BUMP SUPPORT — the cheap path (NO LLM by default). Build a NEW VERSION of `tk` (same id): append
     the event's evidence IDEMPOTENTLY (dedup by event_id — a re-strengthen of an already-cited event is a
     byte-identical no-op, so sessions never inflate and a one-off can't falsely mature); union the
@@ -1011,7 +1015,7 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
     if rv.id in cited:                             # already incorporated → idempotent, byte-stable no-op
         nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
         return nv, 0.0
-    nv["evidence"].append(evidence_entry(rv))
+    nv["evidence"].append(evidence_entry(rv, root=root))
     nv["cites"].append(rv.id)
     if rv.session_id and rv.session_id not in nv["sessions_seen"]:
         nv["sessions_seen"].append(rv.session_id)
@@ -1033,7 +1037,7 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
     return nv, cost
 
 
-def update_contradictions(tk: dict, rv: ResolvedEvent) -> tuple[dict, float]:
+def update_contradictions(tk: dict, rv: ResolvedEvent, root: Path | None = None) -> tuple[dict, float]:
     """WEAKEN — the demotion half `update_support` lacked: dream could accrue support but never be DEMOTED
     by contradicting evidence (ExpeL's downvote, in dream's additive-sufficient-statistic style; ADR-0012).
     ALWAYS NO LLM (cost 0.0): a contradiction RECORDS the conflict, it does NOT rewrite the `why` — support,
@@ -1041,11 +1045,11 @@ def update_contradictions(tk: dict, rv: ResolvedEvent) -> tuple[dict, float]:
     `contradicted_by`/`contradiction_evidence` IDEMPOTENTLY (dedup by event_id — a re-weaken of an
     already-recorded event is a byte-identical no-op, so sessions can't inflate); recompute
     `contradictions = {events: distinct contradicted_by, sessions: distinct contradicting sessions}` (the
-    BIRCH stat); bump last_seen. The span+quote TRUST CHAIN extends to the contradiction: each entry is a
-    `evidence_entry` (re-validated on write) carrying the session it came from — unlike support's parallel `sessions_seen`, the session rides INSIDE each
-    entry, so the contradiction side needs NO parallel session list (the simpler shape support should migrate
-    TO, not a list to grow here). NEVER auto-deletes — a
-    contested takeaway is quarantined (drops below the net gate), retained, and re-graduatable."""
+    BIRCH stat); bump last_seen. The span+quote TRUST CHAIN extends to the contradiction: each entry is an
+    `evidence_entry` (re-validated on write) carrying the session it came from — unlike support's parallel
+    `sessions_seen`, the session rides INSIDE each entry, so the contradiction side needs NO parallel
+    session list (the simpler shape support should migrate TO, not a list to grow here). NEVER auto-deletes
+    — a contested takeaway is quarantined (drops below the net gate), retained, and re-graduatable."""
     nv = {
         "id": tk["id"],
         "title": str(tk.get("title", "")),
@@ -1065,7 +1069,7 @@ def update_contradictions(tk: dict, rv: ResolvedEvent) -> tuple[dict, float]:
     if rv.id in against:                           # already recorded → idempotent, byte-stable no-op
         nv["contradictions"] = _contradiction_stats(nv)
         return nv, 0.0
-    entry = evidence_entry(rv)
+    entry = evidence_entry(rv, root=root)
     entry["session_id"] = rv.session_id            # the session rides WITH the evidence (powers the count)
     nv["contradiction_evidence"].append(entry)
     nv["contradicted_by"].append(rv.id)
@@ -1100,13 +1104,13 @@ def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Complete
         tk = cat_by_id.get(rr["takeaway_id"])
         if tk is None:                             # the contested takeaway vanished → NOOP, not new
             return 0, 0.0, None
-        nv, cost = update_contradictions(tk, rv)                                        # NO LLM, cost 0.0
+        nv, cost = update_contradictions(tk, rv, root=root)                             # NO LLM, cost 0.0
         _ingest_takeaway(nv, model=model, run_id=run_id, root=root)             # takeaway FIRST
         _write_consolidated(rv.id, nv["id"], "weaken", run_id=run_id, root=root)  # consolidated LAST
         return 1, cost, nv
     if decision == "new":
         tk, cost = synthesize_new(rv, complete_synth, concept_digest, known_concept_ids=known_concept_ids,
-                                  model=model, run_id=run_id)
+                                  model=model, run_id=run_id, root=root)
         if tk is None:
             _write_consolidated(rv.id, None, "new", run_id=run_id, root=root)   # noise: do not re-synth
             return 0, cost, None
@@ -1120,7 +1124,7 @@ def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Complete
                      known_concept_ids=known_concept_ids, drift_threshold=drift_threshold,
                      model=model, run_id=run_id, root=root)
     nv, cost = update_support(tk, rv, complete_synth, concept_digest, known_concept_ids=known_concept_ids,
-                              drift_threshold=drift_threshold, model=model, run_id=run_id)
+                              drift_threshold=drift_threshold, model=model, run_id=run_id, root=root)
     _ingest_takeaway(nv, model=model, run_id=run_id, root=root)                  # takeaway FIRST
     _write_consolidated(rv.id, nv["id"], "strengthen", run_id=run_id, root=root)  # consolidated LAST
     return 1, cost, nv
@@ -1308,7 +1312,7 @@ class DreamBlock:
     def __init__(self, complete_route: Completer, complete_synth: Completer, *,
                  route_model: str = ROUTE_MODEL, synth_model: str = SYNTH_MODEL,
                  min_confidence: float = 0.0, drift_threshold: float = DRIFT_THRESHOLD,
-                 maturity: float = MATURITY_WEIGHT, forget: bool = True,
+                 forget: bool = True,
                  forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR,
                  source_filter: str | None = None) -> None:
         self.complete_route = complete_route
@@ -1317,7 +1321,6 @@ class DreamBlock:
         self.synth_model = synth_model
         self.min_confidence = min_confidence
         self.drift_threshold = drift_threshold
-        self.maturity = maturity
         self.source_filter = source_filter             # PROCESSING FOCUS: consolidate only this source's events (ADR-0022)
         self.forget_on = forget
         self.forget_tau = forget_tau
@@ -1449,7 +1452,7 @@ class RunReport(block.ProxyReport):
 
 def run(complete_route: Completer, complete_synth: Completer, *, route_model: str = ROUTE_MODEL,
         synth_model: str = SYNTH_MODEL, min_confidence: float = 0.0,
-        drift_threshold: float = DRIFT_THRESHOLD, maturity: float = MATURITY_WEIGHT,
+        drift_threshold: float = DRIFT_THRESHOLD,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None, source_filter: str | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> RunReport:
@@ -1458,7 +1461,7 @@ def run(complete_route: Completer, complete_synth: Completer, *, route_model: st
     Completers (route = Haiku, synth = Sonnet), offline-testable with fakes. `progress` defaults to None
     (silent) so a setup helper doesn't spew per-event lines."""
     blk = DreamBlock(complete_route, complete_synth, route_model=route_model, synth_model=synth_model,
-                     min_confidence=min_confidence, drift_threshold=drift_threshold, maturity=maturity,
+                     min_confidence=min_confidence, drift_threshold=drift_threshold,
                      forget=forget, source_filter=source_filter)
     report = block.run(blk, max_usd=max_usd, limit=limit, root=root, priority=priority, progress=progress)
     return RunReport(report, blk)
@@ -1470,7 +1473,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(
         prog="dream",
         description="Incremental working-set consolidation: route each un-consolidated event to "
-                    "NEW/STRENGTHEN/NOOP and maintain evidence-cited takeaways (LLM).")
+                    "NEW/STRENGTHEN/WEAKEN/NOOP and maintain evidence-cited takeaways (LLM).")
     ap.add_argument("--route-model", default=ROUTE_MODEL, help=f"router model (default: {ROUTE_MODEL})")
     ap.add_argument("--synth-model", default=SYNTH_MODEL, help=f"synthesis model (default: {SYNTH_MODEL})")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="ignore events below this glean confidence")
@@ -1481,8 +1484,8 @@ def main(argv=None) -> None:
     ap.add_argument("--drift-threshold", type=float, default=DRIFT_THRESHOLD,
                     help="lexical drift above which a strengthen re-synthesizes the why")
     ap.add_argument("--maturity", type=float, default=MATURITY_WEIGHT,
-                    help="recency-weighted net-entrenchment bar a takeaway must cross to reach review "
-                         "(net_entrenchment >= this; ~MATURITY_SESSIONS for fresh evidence)")
+                    help="shapes ONLY the --dry-run preview's mature-takeaway count; the bar itself is the "
+                         "reviewer's knob and lives with review/synthesize (ADR-0027)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
     ap.add_argument("--limit", type=int, help="cap events examined this run (the salience-ordered top)")
     ap.add_argument("--no-forget", action="store_true", help="skip the straggler-eviction (forget) pass")
@@ -1533,7 +1536,7 @@ def main(argv=None) -> None:
         out_noun=OUT_NOUN, verbose=args.verbose)
     report = run(complete_route, complete_synth, route_model=args.route_model, synth_model=args.synth_model,
                  min_confidence=args.min_confidence, drift_threshold=args.drift_threshold,
-                 maturity=args.maturity, forget=not args.no_forget, max_usd=args.max_usd,
+                 forget=not args.no_forget, max_usd=args.max_usd,
                  limit=args.limit, priority=block.priority_strategy(args.priority), source_filter=args.source,
                  progress=progress)
     if args.show:

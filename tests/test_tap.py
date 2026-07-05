@@ -256,5 +256,22 @@ assert self_proj.name in names(tap.discover(ds2, skip_self=None)), \
     "skip_self=None (--include-self) re-includes the data-dir project"
 
 
+# --- _sweep_partials: AGE, not existence, marks a leak (tmp/ is the blobstore's SHARED staging dir) --
+# A fresh partial may be a CONCURRENT stage's in-flight blob write; only one older than PARTIAL_STALE_S
+# is a crash leak. os.utime backdates the "leak" so the test never sleeps.
+sweep_root = Path(tempfile.mkdtemp(prefix="ratchet-test-sweep-"))
+config.ensure_layout(sweep_root)
+fresh = sweep_root / "tmp" / "inflight.partial"
+leaked = sweep_root / "tmp" / "leaked.partial"
+fresh.write_text("x", encoding="utf-8")
+leaked.write_text("x", encoding="utf-8")
+old = leaked.stat().st_mtime - (tap.PARTIAL_STALE_S + 60)
+os.utime(leaked, (old, old))
+tap._sweep_partials(sweep_root)
+assert fresh.exists(), "a FRESH partial survives the sweep (may be a concurrent stage's in-flight write)"
+assert not leaked.exists(), "a partial older than PARTIAL_STALE_S is swept (a crash leak)"
+
+
 print("OK — tap on block.py: error isolation, idempotent re-tap, touched-once, marker shape, "
-      "dry-run, source-id scoping, limit, inert budget, self+exclude discover scoping")
+      "dry-run, source-id scoping, limit, inert budget, self+exclude discover scoping, "
+      "age-gated partial sweep")

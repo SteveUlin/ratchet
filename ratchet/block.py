@@ -47,7 +47,7 @@ class Block(Protocol):
     """The structural interface a stage satisfies — a `Protocol`, not a base class, so stages stay
     plain modules/objects (no inheritance ceremony). The driver only ever touches these members."""
 
-    name: str                                   # "tap" | "weave" | "chunk" | "glean" | "dream"
+    name: str                                   # the stage name (the marker's stage field, the CLI prog)
     params: tuple[tuple[str, str], ...]         # ordered (key, value) idempotency-param pairs; the
                                                 # done-key suffix, stored verbatim in the marker body
     commits_per_item: bool                      # default True; dream sets False (commits in finalize)
@@ -89,7 +89,7 @@ class Block(Protocol):
         buy us. The default `Greedy` strategy stably sorts items DESCENDING by it before the --limit cap,
         so the highest-value work runs first and a budget/limit ceiling takes the top slice. Default
         (`no_priority`) returns 0.0, so Greedy's stable sort preserves enumeration order — a stage that
-        does not care (tap/weave/chunk/glean) stays byte-for-byte identical. dream scores by event
+        does not care (tap/weave/chunk) stays byte-for-byte identical. dream scores by event
         salience, glean by pre-LLM structural cues."""
         ...
 
@@ -125,7 +125,7 @@ def no_marker_extra(_self, item: Item) -> dict:
 def no_priority(_self, item: Item) -> float:
     """The default `priority` SIGNAL — every item ties at 0.0. Under the default `Greedy` policy Python's
     sort is stable, so a uniform score leaves enumeration order untouched: a stage that never opts in
-    (tap/weave/chunk/glean) processes in exactly the order it always did. dream overrides with event
+    (tap/weave/chunk) processes in exactly the order it always did. dream overrides with event
     salience, glean with structural cues, to feed the priority queue."""
     return 0.0
 
@@ -443,6 +443,9 @@ class ProxyReport:
         self._blk = blk
 
     @property
+    def stage(self) -> str:
+        return self._report.stage
+    @property
     def run_id(self) -> str:
         return self._report.run_id
     @property
@@ -469,6 +472,12 @@ class ProxyReport:
     @property
     def breaker_tripped(self) -> bool:
         return self._report.breaker_tripped
+    @property
+    def would_process(self) -> int:
+        return self._report.would_process
+    @property
+    def pending(self) -> int:
+        return self._report.pending
 
 
 # --- live progress: spinner + ▰▱ bar + spend on a TTY; idempotent per-item lines when piped --------

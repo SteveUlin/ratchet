@@ -20,8 +20,9 @@ Everything here is a REBUILDABLE VIEW — computed on read from the blobs, never
   - edges  — DERIVED edges (`shares-repo` / `shares-file` / `shares-tool` / `shares-tag` /
              `temporal-proximity`), one per non-empty facet overlap between a pair. A pure view
              (recomputed each call).
-  - clusters — leader clustering over the facet-overlap SCORE: a single deterministic pass, the most
-             distinctive concept seeds a cluster, later ones join the first leader within threshold.
+  - clusters — leader clustering over the facet-overlap SCORE: a single deterministic pass in
+             sorted-id order — a concept joins the FIRST existing leader it scores past the
+             threshold against, else it seeds a new cluster.
 
 The provenance facets are 3a (ADR-0013); the gardener's MANAGED TAGS (3b/ADR-0014) thread in as the
 second grouping axis — a cheap-AI semantic signal `garden.py` produces, folded once in `_facet_index`
@@ -419,9 +420,11 @@ def _digest_relations(edges: list[dict]) -> dict[str, list[str]]:
 def _digest_shared(members: list[str], by_node: dict) -> str:
     """The facet a cluster's members hold in COMMON — the legible BASIS of the grouping, so the model sees
     WHAT a cluster shares (`shares file: foo.py`) instead of an opaque leader id. Intersect members' facets,
-    most-salient axis first (file > repo > tool — `facet_score`'s weight order). A transitively-joined cluster
-    with no globally-common facet → no annotation (each concept's own line still carries its facets)."""
-    for axis, label in (("files", "file"), ("repos", "repo"), ("tools", "tool")):
+    most-salient axis first — the facet weights' true order (W_FILE > W_TAG > W_REPO > W_TOOL). Tags are an
+    axis here because two shared tags alone (2×W_TAG) clear CLUSTER_THRESHOLD — a tag-formed cluster must
+    show its basis like any other. A transitively-joined cluster with no globally-common facet → no
+    annotation (each concept's own line still carries its facets)."""
+    for axis, label in (("files", "file"), ("tags", "tag"), ("repos", "repo"), ("tools", "tool")):
         common = set.intersection(*(set(by_node[m]["facets"].get(axis) or ()) for m in members))
         if common:
             shown = sorted(common)[:3]
@@ -495,8 +498,10 @@ def concept_digest(root: Path | None = None, *, budget: int = DIGEST_BUDGET,
             rendered.append((rank[members[0]], cl["leader"], members))
     rendered.sort(key=lambda t: t[0])
 
-    lines = ["KNOWN CONCEPTS — what the memory already holds, grouped by facet cluster "
-             "(most-entrenched first):"]
+    # the header states the ORDERING RULE the consumer (an LLM) should trust — it must track the
+    # actual sortkey: relevance-first under `relevant_to`, pure entrenchment otherwise.
+    order_note = "most-relevant first" if relevant_to is not None else "most-entrenched first"
+    lines = [f"KNOWN CONCEPTS — what the memory already holds, grouped by facet cluster ({order_note}):"]
     for _, leader, members in rendered:
         lines.append("")
         shares = _digest_shared(members, by_node) if len(members) >= 2 else ""

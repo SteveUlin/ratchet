@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -171,13 +172,25 @@ def save_fetch_state(root: Path, state: dict) -> None:
     os.replace(tmp, p)
 
 
-def _sweep_partials(root: Path) -> None:
-    """Reclaim temp files leaked by a hard crash mid-write (disk hygiene)."""
+PARTIAL_STALE_S = 3600   # tmp/ is SHARED: blobstore stages EVERY stage's blob write there (*.partial →
+                         # atomic rename), so at sweep time a fresh partial may be a CONCURRENT stage's
+                         # in-flight write, not a crash leak — unlinking it would error that stage's item.
+                         # AGE separates the two: an in-flight write lives milliseconds-to-minutes, a leak
+                         # forever. An hour is huge margin for any writer yet still reclaims every real
+                         # leak on the next tap run.
+
+
+def _sweep_partials(root: Path, *, stale_s: float = PARTIAL_STALE_S) -> None:
+    """Reclaim `*.partial` temps leaked by a hard crash mid-write (disk hygiene) — but only those older
+    than `stale_s`: a young partial may be a concurrent stage's in-flight blob write (see
+    PARTIAL_STALE_S), so age, not mere existence, marks a leak."""
     tmp = root / "tmp"
     if tmp.exists():
+        now = time.time()
         for f in tmp.glob("*.partial"):
             try:
-                f.unlink()
+                if now - f.stat().st_mtime > stale_s:
+                    f.unlink()
             except OSError:
                 pass
 

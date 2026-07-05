@@ -76,13 +76,12 @@ def data_root() -> Path:
 
 
 def ensure_layout(root: Path | None = None) -> Path:
-    """Create the data subtree and return the root. All four artifact kinds (event/takeaway/concept/
-    decision) now live under `blobs/` as versioned blobs — the `events/` stream and `state/` ledger
-    retired with runlog (ADR-0007 §5: the blobstore's content-then-meta commit is the only atomicity
-    primitive). `concepts/` is the curated-knowledge layer the human-review gate writes and `dream`
-    reads (empty until review exists) — the source of truth that skills/CLAUDE.md are later generated
-    *from*, kept distinct from that generated output."""
+    """Create the data subtree and return the root. `blobs/` holds EVERY artifact — events, takeaways/
+    claims, concepts, decisions, proposals — as versioned blobs (ADR-0007); `tmp/` is the blobstore's
+    same-filesystem staging ground (`*.partial` write-then-rename, atomic because tmp and blobs share
+    `root`). `state/` is deliberately NOT made here: it is tap's rebuildable fetch-cursor home, created
+    on demand by `tap.save_fetch_state`."""
     root = root or data_root()
-    for sub in ("blobs", "tmp", "concepts"):
+    for sub in ("blobs", "tmp"):
         (root / sub).mkdir(parents=True, exist_ok=True)
     return root

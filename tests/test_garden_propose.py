@@ -169,6 +169,17 @@ assert not active_edge("c-k2", "supersedes", "c-k1"), "no supersedes edge — th
 assert active_edge("c-k1", "relates-to", "c-k3"), "the low-stakes relate auto-applied (the asserted edge landed)"
 # the dropped ops left NO trace: no edge to the ghost, no proposal for the out-of-cluster merge.
 assert not active_edge("c-k1", "relates-to", "c-ghost"), "the nonexistent-id relate was dropped (no edge)"
+
+# REGRESSION (--show crash): `proposals` holds the queued op DESCRIPTORS (dicts, mirroring `applied`), never
+# blob hashes — `propose_main --show` formats p['op']/p['stakes']/p['concept_ids']/p['rationale'] off them.
+assert len(run1.proposals) == 1 and isinstance(run1.proposals[0], dict), \
+    f"proposals holds the queued op dicts, not hashes: {run1.proposals}"
+qd = run1.proposals[0]
+assert (qd["op"] == "merge" and qd["concept_ids"] == ["c-k1", "c-k2"] and qd["rationale"]
+        and qd["stakes"] > garden.AUTO_APPLY_MAX_STAKES and qd["proposal_id"].startswith("gp-")), \
+    f"the queued descriptor carries op/stakes/concept_ids/rationale/proposal_id: {qd}"
+# the exact --show line renders (the TypeError this regression guards).
+_ = f"  queued   [{qd['op']} · stakes {qd['stakes']:.2f}]  {qd['concept_ids']}  {qd['rationale']!r}"
 print("OK §1 — high-stakes merge QUEUED (concepts unchanged); low-stakes relate AUTO-APPLIED; drops leave no trace.")
 
 
