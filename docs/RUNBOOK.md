@@ -46,7 +46,7 @@ ratchet chunk --all --limit 500   # → windowed chunksets (pointers, not copies
 
 ```
 ratchet glean --all --limit 1000 --max-usd 5
-ratchet glean --all --topic ratchet --limit 500    # focus one project
+ratchet glean --all --source ratchet --limit 500   # focus one project
 ratchet glean --all --max-usd 5 --parallel 2       # stepping away? overlap 2-3 calls — the token bucket is SHARED with your interactive session, so this buys latency, not capacity
 ```
 
@@ -54,7 +54,7 @@ ratchet glean --all --max-usd 5 --parallel 2       # stepping away? overlap 2-3 
 
 ```
 ratchet resolve --limit 100 --max-usd 1
-ratchet resolve --topic ratchet --limit 50         # focus a project
+ratchet resolve --source ratchet --limit 50        # focus a project
 ratchet resolve --dry-run                          # the priority-ordered working set + pool sizes; no calls
 ```
 
@@ -125,14 +125,14 @@ Your existing `~/.claude/CLAUDE.md` is knowledge ratchet can't see: the novelty 
 ratchet tap --file ~/.claude/CLAUDE.md      # cursor applies: re-taps of an unchanged file no-op
 ratchet weave --all                         # documents ride the normal prep sweep ($0, idempotent)
 ratchet chunk --all
-ratchet glean --all --topic CLAUDE.md --max-usd 1   # document prompt: each rule → one event
+ratchet glean --all --source CLAUDE.md --max-usd 1  # document prompt: each rule → one event
 ratchet resolve --limit 100
 ```
 
 The claims sit **incubating at 1 session — by design**: one file is one session no matter how often it's saved, so a document can never self-mature; only your lived sessions (or your accept) mature it. Seed them in one sitting:
 
 ```
-ratchet review --incubating --topic CLAUDE.md --limit 0    # every rule-claim, with its rationale
+ratchet review --incubating --source CLAUDE.md --limit 0   # every rule-claim, with its rationale
 ratchet review --accept <claim> --assessment "hand-written rule, seeded from CLAUDE.md"
 ```
 
@@ -178,7 +178,7 @@ A freshly reopened backlog is all "stragglers" by cycle count — `--no-forget` 
 | `--limit N` | process the top-N by priority; leave the rest for next run |
 | `--max-usd C` | stop cleanly at a spend; committed-so-far persists (resolve: paid residue defers, $0 work completes) |
 | `--priority aging` | surface old-but-modest work that pure value-ranking would starve — use on a long backlog |
-| `--topic <project>` | focus one project (glean / resolve / review) |
+| `--source <substring>` | focus by PROVENANCE — the item's source handle contains the substring: a project name for transcripts, a file path for documents (glean / resolve / review; exact key is `--source-id`) |
 | `--dry-run` | show what a stage *would* do, without doing it |
 
 ## A note on old data

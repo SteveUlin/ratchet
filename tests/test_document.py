@@ -237,14 +237,14 @@ before = fake.calls
 rep_again = block.run(glean.GleanBlock(fake, model="fake", targets=[cs2]), progress=None)
 assert fake.calls == before and rep_again.skipped == len(chunks2), "doc-mode re-run skips on its key"
 
-# --topic FOCUS reaches documents through the path fallback (project_of) — the seeding flow's filter.
+# --source FOCUS reaches documents through the path fallback (project_of) — the seeding flow's filter.
 assert blobstore.project_of(ch2, root) == sid, "a document's FOCUS handle is its path"
-topical = list(glean.GleanBlock(fake, model="fake", targets=[cs2], topic="claude.md").items(root))
-assert len(topical) == len(chunks2), "--topic CLAUDE.md selects the document's chunks"
-assert not list(glean.GleanBlock(fake, model="fake", targets=[cs2], topic="no-such").items(root))
+focused = list(glean.GleanBlock(fake, model="fake", targets=[cs2], source_filter="claude.md").items(root))
+assert len(focused) == len(chunks2), "--source CLAUDE.md selects the document's chunks"
+assert not list(glean.GleanBlock(fake, model="fake", targets=[cs2], source_filter="no-such").items(root))
 
 print("OK — glean document mode: doc system prompt + relaxed pre-filter, spans verbatim by")
-print("     construction, DOC_PROMPT_VERSION in producer + done-key, idempotent, --topic via path")
+print("     construction, DOC_PROMPT_VERSION in producer + done-key, idempotent, --source via path")
 
 
 # --- 5. SESSION IDENTITY end-to-end: one path = one session ------------------------------------

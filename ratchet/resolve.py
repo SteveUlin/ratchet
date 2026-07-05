@@ -846,7 +846,7 @@ class ResolveBlock:
     marker_extra = block.no_marker_extra
 
     def __init__(self, complete_resolve: Completer, *, model: str = RESOLVE_MODEL,
-                 min_confidence: float = 0.0, topic: str | None = None,
+                 min_confidence: float = 0.0, source_filter: str | None = None,
                  maturity: float = dream.MATURITY_WEIGHT,
                  j_maybe: float | None = None, h_min: float | None = None,
                  k_residue: int = K_RESIDUE, k_rare: int = K_RARE, rare_min: int = RARE_MIN,
@@ -861,7 +861,7 @@ class ResolveBlock:
         self.complete_resolve = complete_resolve
         self.model = model
         self.min_confidence = min_confidence
-        self.topic = topic
+        self.source_filter = source_filter
         self.maturity = maturity
         self.j_maybe = sig.J_MAYBE if j_maybe is None else j_maybe
         self.h_min = sig.H_MIN if h_min is None else h_min
@@ -926,8 +926,8 @@ class ResolveBlock:
         self._blocked = rm["pairs"]
         self._epochs = rm["epochs"]
         ws = dream.working_set(root, min_confidence=self.min_confidence)
-        if self.topic is not None:
-            ws = dream.filter_by_topic(ws, self.topic, root)
+        if self.source_filter is not None:
+            ws = dream.filter_by_source(ws, self.source_filter, root)
         self.n_events = len(ws)
         return ws
 
@@ -1193,7 +1193,7 @@ class ResolveReport(block.ProxyReport):
 
 
 def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confidence: float = 0.0,
-        topic: str | None = None, maturity: float = dream.MATURITY_WEIGHT,
+        source_filter: str | None = None, maturity: float = dream.MATURITY_WEIGHT,
         j_maybe: float | None = None, h_min: float | None = None, k_residue: int = K_RESIDUE,
         k_rare: int = K_RARE, rare_min: int = RARE_MIN, facet_df_max: float = FACET_DF_MAX,
         active_floor: float = ACTIVE_FLOOR, active_days: float = ACTIVE_DAYS,
@@ -1205,7 +1205,7 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
     """Resolve the working set incrementally — a thin shim over `block.run(ResolveBlock(...))`.
     `max_usd` goes to the BLOCK (residue deferral, §7.2), never to the driver's break-on-budget:
     the tick always runs the full list, paying only what the cap allows."""
-    blk = ResolveBlock(complete_resolve, model=model, min_confidence=min_confidence, topic=topic,
+    blk = ResolveBlock(complete_resolve, model=model, min_confidence=min_confidence, source_filter=source_filter,
                        maturity=maturity, j_maybe=j_maybe, h_min=h_min, k_residue=k_residue,
                        k_rare=k_rare, rare_min=rare_min, facet_df_max=facet_df_max,
                        active_floor=active_floor, active_days=active_days, dup_exact=dup_exact,
@@ -1226,8 +1226,9 @@ def main(argv=None) -> None:
                     "Haiku call on the residue, immediate mint of claim(why=null)+edge.")
     ap.add_argument("--model", default=RESOLVE_MODEL, help=f"residue adjudicator model (default: {RESOLVE_MODEL})")
     ap.add_argument("--min-confidence", type=float, default=0.0, help="ignore events below this glean confidence")
-    ap.add_argument("--topic", help="PROCESSING FOCUS: resolve only events from a PROJECT whose name "
-                    "contains this substring (case-insensitive; ADR-0022)")
+    ap.add_argument("--source", help="PROCESSING FOCUS: resolve only events whose SOURCE handle contains "
+                    "this substring, case-insensitive — the originating project for transcripts (e.g. taro), "
+                    "the file path for documents (e.g. CLAUDE.md); ADR-0022")
     ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT,
                     help="recency-weighted net-entrenchment bar a claim must cross to reach review "
                          "(the single bar, dream.MATURITY_WEIGHT — the reviewer's knob, ADR-0027)")
@@ -1281,7 +1282,7 @@ def main(argv=None) -> None:
     ap.add_argument("--scores", action="store_true",
                     help="read-only: the pending working set's salience distribution (stats + "
                          "histogram + top/bottom events — what a capped tick buys); composes with "
-                         "--priority/--topic/--min-confidence; no LLM calls, no writes")
+                         "--priority/--source/--min-confidence; no LLM calls, no writes")
     ap.add_argument("--show", action="store_true", help="print each minted/corroborated claim")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-event progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
@@ -1315,15 +1316,15 @@ def main(argv=None) -> None:
     if args.scores:                                    # read-only early-return, --dry-run's sibling:
         root = config.ensure_layout()                  # the pending queue's value curve. The block is
         blk = ResolveBlock(completer.make_cli_completer(args.model), model=args.model,  # built exactly
-                           min_confidence=args.min_confidence, topic=args.topic)  # as run() would (its
+                           min_confidence=args.min_confidence, source_filter=args.source)  # as run() would (its
         print(block.scores_report(blk, root=root, priority=args.priority))  # completer never fires)
         return
 
     if args.dry_run:                                   # eyeball the queue + pool before spending
         root = config.ensure_layout()
         ws = dream.working_set(root, min_confidence=args.min_confidence)
-        if args.topic is not None:
-            ws = dream.filter_by_topic(ws, args.topic, root)
+        if args.source is not None:
+            ws = dream.filter_by_source(ws, args.source, root)
         born = dream._event_born_map(root) if args.priority == "aging" else {}
         ws = block.priority_strategy(args.priority).order(
             ws, lambda rv: dream.salience(rv.event),
@@ -1349,7 +1350,7 @@ def main(argv=None) -> None:
         "resolve", cap=args.max_usd, params={"prompt_version": PROMPT_VERSION, "model": args.model},
         out_noun=OUT_NOUN, verbose=args.verbose)
     report = run(complete_resolve, model=args.model, min_confidence=args.min_confidence,
-                 topic=args.topic, maturity=args.maturity, j_maybe=args.j_maybe, h_min=args.h_min,
+                 source_filter=args.source, maturity=args.maturity, j_maybe=args.j_maybe, h_min=args.h_min,
                  k_residue=args.k_residue, k_rare=args.k_rare, rare_min=args.rare_min,
                  facet_df_max=args.facet_df_max, active_floor=args.active_floor,
                  active_days=args.active_days, dup_exact=args.dup_exact,

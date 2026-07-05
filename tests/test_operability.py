@@ -5,10 +5,10 @@ need none for the enumeration filters; review is the pure backend). Four knobs, 
   TAP FETCH SELECTION — `--last N` keeps the N most-recently-MODIFIED to-ingest files (after the cursor
     skip — "the last N I haven't already pulled"); `--since <date>` keeps files modified at/after a cutoff.
     Owned by the FETCHER (selection is per-source), distinct from the driver's `--limit` (items EXAMINED).
-  PROCESSING FOCUS — `dream --topic X` / `glean --topic X` keep only items from a PROJECT whose name
+  PROCESSING FOCUS — `dream --source X` / `glean --source X` keep only items whose SOURCE handle
     contains X (case-insensitive substring), reached by the `cleaned_hash` → raw `origin_ref.project` hop.
   REVIEW PRIORITIZED SUBSET — `pending` ORDERS by importance (net entrenchment × confidence) descending,
-    `--limit N` takes the top-N, `--topic X` filters to a project. Highest-leverage calls first.
+    `--limit N` takes the top-N, `--source X` filters to a source. Highest-leverage calls first.
 
 Run: `python tests/test_operability.py` (throwaway dirs)."""
 import json
@@ -113,7 +113,7 @@ def _amsg(mid, text):
 
 def make_session(sid, line, project, root):
     """A real transcript whose RAW blob carries `origin_ref.project` — so the `cleaned_hash` → raw →
-    `origin_ref.project` hop `--topic` walks is genuine, not mocked. Returns the chunkset hash."""
+    `origin_ref.project` hop `--source` walks is genuine, not mocked. Returns the chunkset hash."""
     records = [_rec("u0", None, "user", message={"role": "user", "content": f"session {sid} kickoff"})]
     parent = "u0"
     for i in range(4):
@@ -146,10 +146,10 @@ class GleanFake:
 
 
 # ============================================================================================
-# 2. dream --topic: consolidate only events from a PROJECT matching the substring
+# 2. dream --source: consolidate only events from a SOURCE matching the substring
 # ============================================================================================
 
-R2 = use_store("dream-topic")
+R2 = use_store("dream-source")
 RAT, NIX = "home-sulin-ratchet", "home-sulin-nixos"
 cs_r = make_session("d-rat", JJ, RAT, R2)
 cs_n = make_session("d-nix", JJ, NIX, R2)
@@ -162,61 +162,61 @@ assert len(ws) == 2, "two un-consolidated events, one per project"
 projs = {blobstore.project_of(rv.event["cleaned_hash"], R2) for rv in ws}
 assert projs == {RAT, NIX}, f"each event resolves to its source project: {projs}"
 
-# filter_by_topic (the focus filter) and DreamBlock.items() both keep only the matching project.
-only_rat = dream.filter_by_topic(ws, "ratchet", R2)
+# filter_by_source (the focus filter) and DreamBlock.items() both keep only the matching project.
+only_rat = dream.filter_by_source(ws, "ratchet", R2)
 assert {rv.event["cleaned_hash"] for rv in only_rat} == \
     {rv.event["cleaned_hash"] for rv in ws if blobstore.project_of(rv.event["cleaned_hash"], R2) == RAT}, \
-    "filter_by_topic keeps only ratchet-project events"
+    "filter_by_source keeps only ratchet-project events"
 assert len(only_rat) == 1 and blobstore.project_of(only_rat[0].event["cleaned_hash"], R2) == RAT
 
-blk_r = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", topic="ratchet")
+blk_r = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", source_filter="ratchet")
 items_r = blk_r.items(R2)
 assert all(blobstore.project_of(rv.event["cleaned_hash"], R2) == RAT for rv in items_r), \
-    "DreamBlock(topic='ratchet').items() yields ONLY ratchet-project events"
+    "DreamBlock(source_filter='ratchet').items() yields ONLY ratchet-project events"
 assert len(items_r) == 1 and blk_r.n_events == 1, "exactly the one ratchet event (n_events reflects the focus)"
 
-blk_n = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", topic="nixos")
+blk_n = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", source_filter="nixos")
 assert {rv.event["cleaned_hash"] for rv in blk_n.items(R2)} == {ws_rv.event["cleaned_hash"] for ws_rv in ws
                                                                  if blobstore.project_of(ws_rv.event["cleaned_hash"], R2) == NIX}, \
-    "topic='nixos' yields ONLY the nixos event"
-# default (no topic) yields the whole working set.
+    "source_filter='nixos' yields ONLY the nixos event"
+# default (no source filter) yields the whole working set.
 blk_all = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake")
-assert len(blk_all.items(R2)) == 2, "no --topic → every event (default behavior preserved)"
+assert len(blk_all.items(R2)) == 2, "no --source → every event (default behavior preserved)"
 # a substring matching NEITHER project yields nothing.
-blk_none = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", topic="zzz")
-assert blk_none.items(R2) == [], "a topic matching no project focuses on nothing"
-print("OK 2 — dream --topic: filter_by_topic + DreamBlock.items() keep ONLY the matching project's events "
+blk_none = dream.DreamBlock(GleanFake(JJ), GleanFake(JJ), route_model="fake", synth_model="fake", source_filter="zzz")
+assert blk_none.items(R2) == [], "a source filter matching no project focuses on nothing"
+print("OK 2 — dream --source: filter_by_source + DreamBlock.items() keep ONLY the matching project's events "
       "(cleaned_hash → raw origin_ref.project); default None → all events.")
 
 
 # ============================================================================================
-# 3. glean --topic: extract only chunks from a PROJECT matching the substring
+# 3. glean --source: extract only chunks from a SOURCE matching the substring
 # ============================================================================================
 
-R3 = use_store("glean-topic")
+R3 = use_store("glean-source")
 cs_r3 = make_session("g-rat", JJ, RAT, R3)
 cs_n3 = make_session("g-nix", JJ, NIX, R3)
 targets = [cs_r3, cs_n3]
 
 all_chunks = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets).items(R3))
-assert len(all_chunks) > 2, "several chunks across the two chunksets (no topic → all)"
-rat_chunks = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, topic="ratchet").items(R3))
+assert len(all_chunks) > 2, "several chunks across the two chunksets (no source filter → all)"
+rat_chunks = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, source_filter="ratchet").items(R3))
 assert rat_chunks and all(blobstore.project_of(it.chunk.cleaned_hash, R3) == RAT for it in rat_chunks), \
-    "glean --topic ratchet enumerates ONLY ratchet-project chunks"
+    "glean --source ratchet enumerates ONLY ratchet-project chunks"
 assert len(rat_chunks) == sum(1 for it in all_chunks if blobstore.project_of(it.chunk.cleaned_hash, R3) == RAT), \
     "and exactly all of them (no over/under-selection)"
-nix_chunks = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, topic="nixos").items(R3))
+nix_chunks = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, source_filter="nixos").items(R3))
 assert nix_chunks and all(blobstore.project_of(it.chunk.cleaned_hash, R3) == NIX for it in nix_chunks), \
-    "glean --topic nixos enumerates ONLY nixos-project chunks"
+    "glean --source nixos enumerates ONLY nixos-project chunks"
 assert len(rat_chunks) + len(nix_chunks) == len(all_chunks), "the two foci partition the full enumeration"
-assert list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, topic="zzz").items(R3)) == [], \
-    "a topic matching no project enumerates nothing"
-print("OK 3 — glean --topic: GleanBlock.items() enumerates ONLY the matching project's chunks "
+assert list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, source_filter="zzz").items(R3)) == [], \
+    "a source filter matching no project enumerates nothing"
+print("OK 3 — glean --source: GleanBlock.items() enumerates ONLY the matching project's chunks "
       "(same cleaned_hash → project hop); the foci partition the full set; default None → all chunks.")
 
 
 # ============================================================================================
-# 4. review: importance ORDERING + --limit (top-N) + --topic (project filter)
+# 4. review: importance ORDERING + --limit (top-N) + --source (provenance filter)
 # ============================================================================================
 
 R4 = use_store("review")
@@ -269,9 +269,9 @@ tie_order = [t["takeaway_id"] for t in review.pending(R4b)]
 cur_order = [t["id"] for t in dream.current_takeaways(R4b)]            # the derivation order ties fall back to
 assert tie_order == cur_order, f"a stable sort keeps derivation order for equal-importance ties: {tie_order}"
 
-# --topic: a takeaway matches the queue topic if ANY cited span comes from that project. Seed two MATURE
+# --source: a takeaway matches the queue filter if ANY cited span comes from that source. Seed two MATURE
 # takeaways with REAL evidence from two projects, then filter.
-R4c = use_store("review-topic")
+R4c = use_store("review-source")
 cs_rat = make_session("rv-rat", JJ, RAT, R4c)
 cs_nix = make_session("rv-nix", JJ, NIX, R4c)
 
@@ -288,16 +288,16 @@ def real_evidence(cs, line, root):
 seed_takeaway(id="T-rat", sessions=3, confidence=0.9, evidence=real_evidence(cs_rat, JJ, R4c), root=R4c)
 seed_takeaway(id="T-nix", sessions=3, confidence=0.9, evidence=real_evidence(cs_nix, JJ, R4c), root=R4c)
 assert {t["takeaway_id"] for t in review.pending(R4c)} == {"T-rat", "T-nix"}, "both mature takeaways are in the queue"
-assert [t["takeaway_id"] for t in review.pending(R4c, topic="ratchet")] == ["T-rat"], \
-    "--topic ratchet filters the queue to the ratchet-project takeaway"
-assert [t["takeaway_id"] for t in review.pending(R4c, topic="nixos")] == ["T-nix"], "--topic nixos → only the nixos one"
-assert review.pending(R4c, topic="zzz") == [], "a topic matching no project empties the queue"
+assert [t["takeaway_id"] for t in review.pending(R4c, source_filter="ratchet")] == ["T-rat"], \
+    "--source ratchet filters the queue to the ratchet-project takeaway"
+assert [t["takeaway_id"] for t in review.pending(R4c, source_filter="nixos")] == ["T-nix"], "--source nixos → only the nixos one"
+assert review.pending(R4c, source_filter="zzz") == [], "a source filter matching no project empties the queue"
 print("OK 4 — review: pending() ORDERS by importance (net entrenchment × confidence) descending; --limit "
-      "takes the top-N; ties keep derivation order (stable); --topic filters to a project's takeaways.")
+      "takes the top-N; ties keep derivation order (stable); --source filters to a source's takeaways.")
 
 
 # ============================================================================================
-# 5. review --proposals: ordered by STAKES, with --limit and --topic
+# 5. review --proposals: ordered by STAKES, with --limit and --source
 # ============================================================================================
 
 R5 = use_store("review-prop")

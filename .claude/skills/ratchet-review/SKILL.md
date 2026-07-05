@@ -25,7 +25,7 @@ A review sitting is a **conversation, not a report**. Careful verdicts are expen
 1. **Orient** — `nix run ~/ratchet#status`. Give sulin ONE line: the counts that matter (pending, incubating, contested, proposals, thin seeds).
 2. **Contested** — `nix run ~/ratchet#review -- --contested`. These are claims being knocked down near the bar — one wrong LLM CONTRADICTS verdict must not silently suppress a good claim. Surface the **count**, and if a contradiction is holding down something that looks durable, say so *now*: it is the one thing that must not wait at the back of a queue.
 3. **Hygiene** — `nix run ~/ratchet#resolve -- --audit-thin`. The pre-gate noise-seed backlog. Report the **count only**, unless items are new since the last sitting — then name them and offer the bulk retire.
-4. **The queue** — `nix run ~/ratchet#review -- --pending --json`. The default top-10 slice, importance-ordered. Pass the backlog depth on ("top 10 of 23") so sulin always knows what the slice was cut from — and can ask to widen or `--topic`-narrow it.
+4. **The queue** — `nix run ~/ratchet#review -- --pending --json`. The default top-10 slice, importance-ordered. Pass the backlog depth on ("top 10 of 23") so sulin always knows what the slice was cut from — and can ask to widen or `--source`-narrow it (provenance substring: a project name for transcripts, a file path for documents).
 
 If the slice is empty, **don't just say "nothing to review."** The opener already surfaced contested; also run `nix run ~/ratchet#review -- --incubating` to show what's accruing and *why* it's below the bar (each with its score), and offer to lower `--maturity` for this sitting if something looks durable enough already. The bar is sulin's knob, not a fixed rule — a claim earns the queue by *recurring* across distinct, recent sessions; that is evidence of durability, not a quota.
 
@@ -160,4 +160,4 @@ Two-speed, same as tier 1:
 - **Prefer the surgical verb.** A foreign quote in a good claim → `--reject-merge` the edge, not `--reject` the claim; a wrong wording → `--edit-title`/`--edit-why` on accept.
 - **Capture the reasoning.** Always pass `--assessment` so an accept records *why* it was trustworthy (audited later as "verified by Claude, approved by sulin").
 - **Everything noticed becomes a decision** — an executed verb or a named deferred item at the close, never loose prose.
-- The queue is bounded by design: the maturity bar filters noise and the default slice is a sitting's worth. If sulin wants more, widen with `--limit` (0 = everything) or focus with `--topic` — his call, not yours.
+- The queue is bounded by design: the maturity bar filters noise and the default slice is a sitting's worth. If sulin wants more, widen with `--limit` (0 = everything) or focus with `--source` — his call, not yours.

@@ -321,7 +321,7 @@ def stratified_sample(pair_records: list[dict], n: int, *, j_maybe: float | None
 def load_corpus(root: Path | None = None) -> list[dict]:
     """Every current event (latest version per event_id, `latest_by_kind`) with its signature
     computed FRESH from the summary, its PROJECT resolved as the subject proxy — the same
-    `blobstore.project_of` lineage hop the --topic filters ride (ADR-0022) — and its SESSION
+    `blobstore.project_of` lineage hop the --source filters ride (ADR-0022) — and its SESSION
     resolved via the same cleaned→raw lineage (`blobstore.session_of`, the hop resolve's
     same-session gate keys on): the sampler's second stratification axis. Fresh-computed, not
     read off the blob: pre-S1 events carry no stmt_sig, and the measuring instrument must see the

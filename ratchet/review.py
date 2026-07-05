@@ -168,12 +168,12 @@ def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = N
                                   coalesce_hours=coalesce_hours) * conf
 
 
-def _evidence_in_topic(evidence: list, topic: str, root: Path, cache: dict) -> bool:
-    """Does ANY cited span come from a PROJECT whose name contains `topic` (case-insensitive)? The
-    `--topic` queue filter (ADR-0022) — a takeaway/concept spans the sessions it cites, so it matches the
-    topic if any one of them does. Same lineage hop dream/glean use: `cleaned_hash` → raw
+def _evidence_in_source(evidence: list, source_filter: str, root: Path, cache: dict) -> bool:
+    """Does ANY cited span come from a SOURCE whose handle contains `source_filter` (case-insensitive)?
+    The `--source` queue filter (ADR-0022) — a takeaway/concept spans the sessions it cites, so it matches
+    the filter if any one of them does. Same lineage hop dream/glean use: `cleaned_hash` → raw
     `origin_ref.project` (`blobstore.project_of`, one cached meta read per span, no LLM)."""
-    t = topic.lower()
+    t = source_filter.lower()
     for ev in evidence or []:
         ch = ev.get("cleaned_hash") if isinstance(ev, dict) else None
         if not ch:
@@ -541,7 +541,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
 
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
-            limit: int | None = None, topic: str | None = None,
+            limit: int | None = None, source_filter: str | None = None,
             maturity: float = dream.MATURITY_WEIGHT,
             coalesce_hours: float = dream.COALESCE_HOURS, with_total: bool = False):
     """The review queue: every takeaway AT/ABOVE the maturity bar with no terminal decision and no live
@@ -559,7 +559,7 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     returns.
 
     ORDERING + the operator knobs (ADR-0022): `importance` (net entrenchment × confidence) sorts DESCENDING —
-    highest-leverage first. `--topic` filters to a PROJECT (substring over cited evidence); `--limit N` returns
+    highest-leverage first. `--source` filters to a SOURCE handle (substring over cited evidence); `--limit N` returns
     the top-N (`0`/`None` = everything — the escape hatch; the CLI defaults to `SITTING_LIMIT`). Filter + sort
     run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`) is paid only for the
     survivors the human will see. `with_total=True` returns `(cards, total)` — the backlog depth BEFORE the
@@ -585,7 +585,7 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         d = decisions.get(c["id"])
         if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
             continue                               # pre-birth decisions targeted the retired v2 predecessor
-        if topic is not None and not _evidence_in_topic(c.get("evidence"), topic, root, cache):
+        if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
             continue
         rows.append((c, "claim"))
     for tk in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times):  # bar is the knob
@@ -594,8 +594,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):
             continue
-        if topic is not None and not _evidence_in_topic(tk.get("evidence"), topic, root, cache):
-            continue                               # FOCUS: drop takeaways with no evidence from the topic project
+        if source_filter is not None and not _evidence_in_source(tk.get("evidence"), source_filter, root, cache):
+            continue                               # FOCUS: drop takeaways with no evidence from a matching source
         rows.append((tk, "takeaway"))
     rows.sort(key=lambda r: importance(r[0], valid_times=valid_times, coalesce_hours=coalesce_hours),
               reverse=True)                            # IMPORTANCE desc; stable
@@ -935,20 +935,21 @@ def _present_proposal(proposal: dict, root: Path, *, context_bytes: int) -> dict
     }
 
 
-def _proposal_in_topic(proposal: dict, topic: str, root: Path, cache: dict) -> bool:
-    """Does a structural-op proposal touch the `topic` PROJECT? It cites concepts, not events, so the hop
-    is one longer: each cited concept → its evidence spans → `cleaned_hash` → raw `origin_ref.project`
-    (`_evidence_in_topic`). True if ANY cited concept has evidence from a project matching the substring."""
+def _proposal_in_source(proposal: dict, source_filter: str, root: Path, cache: dict) -> bool:
+    """Does a structural-op proposal touch a SOURCE matching `source_filter`? It cites concepts, not events,
+    so the hop is one longer: each cited concept → its evidence spans → `cleaned_hash` → raw
+    `origin_ref.project` (`_evidence_in_source`). True if ANY cited concept has evidence from a source
+    handle matching the substring."""
     from . import garden
     for cid in proposal.get("concept_ids") or []:
         blob = garden._concept_blob(cid, root) or {}
-        if _evidence_in_topic(blob.get("evidence"), topic, root, cache):
+        if _evidence_in_source(blob.get("evidence"), source_filter, root, cache):
             return True
     return False
 
 
 def pending_proposals(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
-                      limit: int | None = None, topic: str | None = None) -> list[dict]:
+                      limit: int | None = None, source_filter: str | None = None) -> list[dict]:
     """The SECOND review tier: the gardener's open structural-op proposals (`garden.open_proposals`), ORDERED
     by STAKES descending and each rendered for the human with its op + params + rationale and the CITED
     concepts' RE-VALIDATED evidence. The rationale is UNTRUSTED (a proposer's justification, like a takeaway's
@@ -960,15 +961,15 @@ def pending_proposals(root: Path | None = None, *, context_bytes: int = CONTEXT_
     an op changes what concepts EXIST/ASSERT, `garden.op_stakes`), so the queue sorts by it DESCENDING —
     the highest-leverage restructurings first. (The cluster's `tension` that DROVE a proposal is a propose-
     time signal NOT carried on the proposal blob, so `stakes` is the on-proposal importance stand-in.)
-    `--topic` filters to a PROJECT (substring over the cited concepts' evidence); `--limit N` takes the
+    `--source` filters to a SOURCE handle (substring over the cited concepts' evidence); `--limit N` takes the
     top-N. Filter + sort run on the raw proposals FIRST, so the per-concept evidence resolution is paid only
     for the survivors."""
     from . import garden
     root = root or config.data_root()
     props = garden.open_proposals(root)
-    if topic is not None:
+    if source_filter is not None:
         cache: dict = {}
-        props = [p for p in props if _proposal_in_topic(p, topic, root, cache)]
+        props = [p for p in props if _proposal_in_source(p, source_filter, root, cache)]
     # stakes DESCENDING (a missing/non-numeric stakes sinks to 0.0); stable → ties keep open_proposals order.
     props = sorted(props, key=lambda p: p.get("stakes") if isinstance(p.get("stakes"), (int, float)) else 0.0,
                    reverse=True)
@@ -1106,7 +1107,9 @@ def main(argv=None) -> None:
                          f"worth: review fatigue collapses past ~10-20 careful verdicts, and the queue "
                          f"is importance-ordered so the top slice is always the most valuable. "
                          f"--limit 0 = everything (the escape hatch).")
-    ap.add_argument("--topic", help="filter the queue to a PROJECT whose name contains this substring")
+    ap.add_argument("--source", help="filter the queue to items whose cited SOURCE handle contains this "
+                    "substring, case-insensitive — the originating project for transcripts (e.g. taro), "
+                    "the file path for documents (e.g. CLAUDE.md)")
     ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT, metavar="BAR",
                     help=f"the maturity BAR a takeaway's recency-weighted corroboration must cross to surface "
                          f"in --pending (default {dream.MATURITY_WEIGHT} ≈ {dream.MATURITY_SESSIONS} recent "
@@ -1149,7 +1152,7 @@ def main(argv=None) -> None:
 
     if args.pending:
         q, total = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
-                           limit=sitting_limit, topic=args.topic, maturity=args.maturity,
+                           limit=sitting_limit, source_filter=args.source, maturity=args.maturity,
                            coalesce_hours=args.coalesce_hours, with_total=True)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
@@ -1239,7 +1242,7 @@ def main(argv=None) -> None:
                              for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
         q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
-                              limit=args.limit or None, topic=args.topic)   # 0 = everything here too
+                              limit=args.limit or None, source_filter=args.source)   # 0 = everything here too
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
         else:

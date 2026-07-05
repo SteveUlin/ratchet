@@ -461,12 +461,12 @@ class GleanBlock:
     finalize = block.no_finalize
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
-                 targets: list[str] | None = None, topic: str | None = None,
+                 targets: list[str] | None = None, source_filter: str | None = None,
                  recent_clock: str = RECENT_CLOCK) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
-        self.topic = topic        # PROCESSING FOCUS: extract only this project's chunks (ADR-0022)
+        self.source_filter = source_filter  # PROCESSING FOCUS: extract only this source's chunks (ADR-0022)
         if recent_clock not in RECENT_CLOCKS:
             raise ValueError(f"recent_clock must be one of {RECENT_CLOCKS}, got {recent_clock!r}")
         self.recent_clock = recent_clock   # which stamp dates the material (see the RECENT_CLOCK knob)
@@ -534,11 +534,11 @@ class GleanBlock:
         absence surfaces in `process` when it slices the cleaned bytes (→ FileNotFoundError → errored
         → retried), not here, so a missing blob is isolated per chunk, never a crashed enumeration."""
         self._root = root                         # capture the driver's root for age() (called during ordering)
-        # PROCESSING FOCUS (`glean --topic`, ADR-0022): keep only chunks whose source PROJECT contains the
-        # topic substring (case-insensitive), reached by the same `cleaned_hash` → raw `origin_ref.project`
+        # PROCESSING FOCUS (`glean --source`, ADR-0022): keep only chunks whose SOURCE handle contains the
+        # filter substring (case-insensitive), reached by the same `cleaned_hash` → raw `origin_ref.project`
         # hop age() walks — one cached meta read per cleaned blob (chunks share a cleaned_hash), no LLM. A
-        # chunk whose project can't be resolved does NOT match (focus narrows). Default (None) → no filter.
-        topic = self.topic.lower() if self.topic else None
+        # chunk whose handle can't be resolved does NOT match (focus narrows). Default (None) → no filter.
+        source_filter = self.source_filter.lower() if self.source_filter else None
         proj_cache: dict = {}
         for cs in self._target_chunksets(root, source_id):
             try:
@@ -554,9 +554,9 @@ class GleanBlock:
                 kind = None
             mode = "document" if kind == "document" else "transcript"
             for ch in chunks:
-                if topic is not None:
+                if source_filter is not None:
                     proj = blobstore.project_of(ch.cleaned_hash, root, proj_cache)
-                    if not proj or topic not in proj.lower():
+                    if not proj or source_filter not in proj.lower():
                         continue
                 yield ChunkItem(chunk=ch, chunkset_hash=cs, mode=mode)
 
@@ -833,8 +833,10 @@ def main(argv=None) -> None:
     ap.add_argument("--all", action="store_true", help="every materialized chunkset in the store")
     ap.add_argument("--model", default=completer.DEFAULT_MODEL,
                     help=f"claude model (default: {completer.DEFAULT_MODEL})")
-    ap.add_argument("--topic", help="PROCESSING FOCUS: extract only chunks from a PROJECT/source whose name "
-                    "contains this substring (case-insensitive; semantic-tag topic is deferred)")
+    ap.add_argument("--source", help="PROCESSING FOCUS: extract only chunks whose SOURCE handle contains "
+                    "this substring, case-insensitive — the originating project for transcripts (e.g. taro), "
+                    "the file path for documents (e.g. CLAUDE.md). Exact single-source enumeration is "
+                    "--source-id; a semantic TAG filter (garden vocabulary) is the deferred sibling knob")
     ap.add_argument("--limit", type=int,
                     help="cap CHUNKS examined this run, before the done-skip (per-chunk now, ADR-0009)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this (between chunks)")
@@ -851,7 +853,7 @@ def main(argv=None) -> None:
     ap.add_argument("--scores", action="store_true",
                     help="read-only: the pending queue's priority-score distribution (stats + "
                          "histogram + top/bottom items — what a capped tick buys); composes with "
-                         "--priority/--topic/--source-id; no LLM calls, no writes")
+                         "--priority/--source/--source-id; no LLM calls, no writes")
     ap.add_argument("--quiet", action="store_true", help="suppress the streaming per-chunk progress line")
     ap.add_argument("--verbose", action="store_true", help="also log one idempotent line per item")
     ap.add_argument("--priority", choices=sorted(block.PRIORITY_STRATEGIES), default="greedy",
@@ -880,13 +882,13 @@ def main(argv=None) -> None:
 
     if args.scores:                               # read-only early-return, --dry-run's sibling: the
         blk = GleanBlock(completer.make_cli_completer(args.model), model=args.model,   # completer is
-                         targets=targets, topic=args.topic,          # bound but never called (no LLM)
+                         targets=targets, source_filter=args.source,  # bound but never called (no LLM)
                          recent_clock=args.recent_clock)
         print(block.scores_report(blk, root=config.ensure_layout(), priority=args.priority))
         return
 
     complete = completer.make_cli_completer(args.model)
-    blk = GleanBlock(complete, model=args.model, targets=targets, topic=args.topic,
+    blk = GleanBlock(complete, model=args.model, targets=targets, source_filter=args.source,
                      recent_clock=args.recent_clock)
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.

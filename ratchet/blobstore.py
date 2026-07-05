@@ -353,14 +353,14 @@ def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     """The originating PROJECT of a cleaned blob, via the SAME content-addressed lineage `session_of`
     walks: cleaned blob → `derived_from` (raw) → the raw blob's `origin_ref.project` (the datastore
     project-dir name `tap.read_origin` stamped). The one hop `concepts._cleaned_facets` already uses for
-    its `repo` facet, single-sourced here so dream/glean/review share one spelling for the `--topic`
+    its `repo` facet, single-sourced here so dream/glean/review share one spelling for the `--source`
     operator filter (ADR-0022). An optional `cache` memoizes across calls; absent/broken meta → None
-    (never fatal — a `--topic` run then simply doesn't match that item). One meta hop per call, no
+    (never fatal — a `--source` run then simply doesn't match that item). One meta hop per call, no
     content read, no LLM.
 
     A DOCUMENT source (ADR-0031) carries no `project` — deliberately, because `origin_ref.project`
     also feeds the repo facet (`concepts._repo_label`) and a document must stay subject-empty — so
-    its FOCUS handle falls back to `origin_ref.path`: `--topic CLAUDE.md` selects the document's
+    its FOCUS handle falls back to `origin_ref.path`: `--source CLAUDE.md` selects the document's
     chunks/events without ever granting it a repo identity."""
     root = root or config.data_root()
     if cache is not None and cleaned_hash in cache:
