@@ -292,8 +292,17 @@ assert [t["takeaway_id"] for t in review.pending(R4c, source_filter="ratchet")] 
     "--source ratchet filters the queue to the ratchet-project takeaway"
 assert [t["takeaway_id"] for t in review.pending(R4c, source_filter="nixos")] == ["T-nix"], "--source nixos → only the nixos one"
 assert review.pending(R4c, source_filter="zzz") == [], "a source filter matching no project empties the queue"
+
+# --source scopes --incubating the same way — a focused sitting's "N below the bar" counts the SAME slice
+# it points at, not the global backlog. Seed one below-bar takeaway per project beside the mature pair.
+seed_takeaway(id="I-rat", sessions=1, confidence=0.9, evidence=real_evidence(cs_rat, JJ, R4c), root=R4c)
+seed_takeaway(id="I-nix", sessions=1, confidence=0.9, evidence=real_evidence(cs_nix, JJ, R4c), root=R4c)
+assert {t["takeaway_id"] for t in review.incubating(R4c)} == {"I-rat", "I-nix"}, "both below-bar takeaways incubate"
+assert [t["takeaway_id"] for t in review.incubating(R4c, source_filter="ratchet")] == ["I-rat"], \
+    "--source scopes --incubating to the same slice the filtered queue points at"
+assert review.incubating(R4c, source_filter="zzz") == [], "an unmatched source filter empties incubating too"
 print("OK 4 — review: pending() ORDERS by importance (net entrenchment × confidence) descending; --limit "
-      "takes the top-N; ties keep derivation order (stable); --source filters to a source's takeaways.")
+      "takes the top-N; ties keep derivation order (stable); --source filters pending AND incubating.")
 
 
 # ============================================================================================

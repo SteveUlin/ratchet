@@ -624,7 +624,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
 
 
 def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
-               coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
+               coalesce_hours: float = dream.COALESCE_HOURS,
+               source_filter: str | None = None) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
     them), but not yet at the human gate. The counterpart to `pending`: `catalog` minus the mature set
     (at the SAME `maturity` bar, so lowering the bar moves takeaways from here into the queue), minus
@@ -635,12 +636,15 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     (`MATURITY_SESSIONS - net_sessions`), complemented by `needs_recent` for the AGED case (enough sessions,
     but their evidence decayed below the weighted bar — the honest signal is "needs RECENT corroboration").
     The same UNION as `pending` (v3 claims beside legacy takeaways, claims preferred), tagged by `kind`.
+    `source_filter` scopes it the same way `--source` scopes the queue (`_evidence_in_source` — a cached
+    lineage hop per span, no evidence resolution), so a focused sitting sees a matching incubation count.
     ORDERED by entrenchment DESCENDING — nearest the bar first, so the CLI's bounded slice (SITTING_LIMIT)
     shows the takeaways closest to graduating, the ones a sitting can actually act on."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     valid_times = dream._session_valid_times(root)
     now = config.now()
+    cache: dict = {}
 
     def row(tk: dict, kind: str) -> dict:
         raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
@@ -663,6 +667,8 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
         d = decisions.get(c["id"])
         if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
             continue
+        if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
+            continue
         out.append(row(c, "claim"))
     mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times)}
     for tk in dream.catalog(root):
@@ -670,6 +676,8 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
             continue
         d = decisions.get(tk["id"])
         if d and _is_out_of_queue(d):              # accepted/rejected/etc. directly — no longer accruing
+            continue
+        if source_filter is not None and not _evidence_in_source(tk.get("evidence"), source_filter, root, cache):
             continue
         out.append(row(tk, "takeaway"))
     out.sort(key=lambda r: -r["entrenchment"])     # nearest the bar first; stable → ties keep derivation order
@@ -1159,10 +1167,12 @@ def main(argv=None) -> None:
         else:
             _print_queue(q, total=total,
                          incubating_count=len(incubating(maturity=args.maturity,
-                                                         coalesce_hours=args.coalesce_hours)),
+                                                         coalesce_hours=args.coalesce_hours,
+                                                         source_filter=args.source)),
                          bar=args.maturity)
     elif args.incubating:
-        inc = incubating(maturity=args.maturity, coalesce_hours=args.coalesce_hours)   # cheap — count
+        inc = incubating(maturity=args.maturity, coalesce_hours=args.coalesce_hours,
+                         source_filter=args.source)
         total = len(inc)                                         # the full depth, then slice for the sitting
         if sitting_limit > 0:
             inc = inc[:sitting_limit]
