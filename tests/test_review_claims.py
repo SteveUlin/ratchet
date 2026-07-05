@@ -31,6 +31,10 @@ event → claim + edges), so the trust chain under test is genuine. The load-bea
     global); accept records the scope on the DECISION (default = the derivation; --scope overrides,
     open vocabulary, blank refused); `set_scope` re-scopes an existing concept, outranks the accept,
     latest wins, valid targets only; a concept with no scope anywhere reads global.
+  THE REFRESH VERB — a why-pending accept mints statement ''; when synthesize later fills the claim's
+    why, the concept does NOT follow automatically (the gate is the trust source) — `refresh` is the
+    reviewer's re-snapshot: prose moves, evidence/kind/scope/validity/claim-decisions all hold; a
+    no-op refuses; retired/unknown/orphaned targets refuse.
 
 Run: `python tests/test_review_claims.py` (throwaway dirs)."""
 import io
@@ -620,5 +624,101 @@ assert scopes_of(RS)["c-legacy-s"] == "global", \
 print("OK 9 — scope: derived on the card (one repo → its label; 2+/none → global), confirmed on the")
 print("       accept decision (default = derivation, --scope overrides, blank refused), re-scoped via")
 print("       set_scope (latest wins, valid targets only, open vocabulary), legacy → global.")
+
+
+# === 10. THE REFRESH VERB: the human-triggered re-snapshot closes the why-pending statement gap =====
+# Accept never withholds on synthesize (§6), so a why-pending accept mints statement "" — and when
+# synthesize later fills the claim's why, the concept must NOT follow by itself (auto-refresh would
+# land unreviewed prose behind the gate). refresh is the reviewer's re-read: prose moves; evidence,
+# the kind/scope folds, concept validity, and the claim's own decisions all hold.
+
+RF = use_store("r")
+seed_events([("r-s1", JJ_SEED, M_HI, 0.85, "alpha", None),
+             ("r-s2", JJ_PARA, M_MID, 0.85, "alpha", None)], RF)
+resolve.run(ResolveFake(["same-as-1"]), model="fake", forget=False, root=RF)
+claim_r = the_claim(RF)
+assert claim_r["why"] is None, "the fixture claim is why-pending (synthesize hasn't run)"
+cid_r = review.accept(claim_r["id"], RF, assessment="why-pending accept — the gap under test")
+c_r0 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+assert c_r0["statement"] == "", "the why-pending accept minted an EMPTY statement (the gap is real)"
+ev_r0 = c_r0["evidence"]
+facets_r0 = (kinds_of(RF)[cid_r], scopes_of(RF)[cid_r])
+
+# (a) refresh BEFORE anything changed refuses — idempotence by refusal: nothing new to snapshot,
+# and a decision recording no change would fake a review action.
+try:
+    review.refresh(cid_r, RF)
+    assert False, "a refresh that would change nothing must refuse, not mint a hollow decision"
+except ValueError:
+    pass
+
+# (b) synthesize fills the claim's why (§8's fake, same seat); the concept does NOT move by itself.
+WHY_R = "version control here is jj; git bypasses the working-copy-is-a-commit model."
+synthesize.run(SynthKind({"title": JJ_SEED, "why": WHY_R, "kind": "behavioral", "confidence": 0.9}),
+               model="fake", claim=claim_r["id"], root=RF)
+assert the_claim(RF)["why"] == WHY_R, "the claim's live fold carries the synthesized why"
+assert {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]["statement"] == "", \
+    "…and the concept did NOT auto-refresh — the human gate stays the trust source"
+
+# (c) refresh: the statement fills; title, evidence, kind/scope, validity, claim decisions all hold.
+res_r = review.refresh(cid_r, RF, note="synthesize filled the why; re-read on command")
+assert res_r["concept"] == cid_r and res_r["before"]["statement"] == "" \
+    and res_r["after"]["statement"] == WHY_R
+c_r1 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+assert c_r1["statement"] == WHY_R and c_r1["title"] == JJ_SEED, "statement filled, title unchanged"
+assert c_r1["evidence"] == ev_r0, "evidence carried byte-identical — refresh re-reads PROSE only"
+assert (kinds_of(RF)[cid_r], scopes_of(RF)[cid_r]) == facets_r0, \
+    "kind/scope hold: they are the DECISION's facts (set_*/accept folds) and refresh carries neither"
+assert cid_r in dream.valid_concept_ids(RF), \
+    "the refresh decision is now the concept's LATEST — validity holds because load_concepts checks " \
+    "verb MEMBERSHIP (refresh ∉ CONCEPT_INVALID_VERBS), never mere decision presence"
+assert blobstore.latest_decisions(RF)[claim_r["id"]]["verb"] == "accept", \
+    "refresh targets the CONCEPT id — the claim's own LIFECYCLE decision is still the accept " \
+    "(latest_decisions, the fold the queue reads; latest_decision would see synthesize's marker)"
+assert review.pending(RF) == [], "…so the accepted claim does not re-enter the queue"
+assert [v["id"] for v in resolve.high_confidence_view(RF)] == [claim_r["id"]], \
+    "…and it stays in the trusted view"
+d_rf = blobstore.latest_decision(cid_r, RF)
+assert d_rf["verb"] == "refresh" and d_rf["before"]["statement"] == "" \
+    and d_rf["after"]["statement"] == WHY_R, "the decision records before/after (the audit trail)"
+
+# (d) a second identical refresh refuses — the no-op guard again, now with prose in place.
+try:
+    review.refresh(cid_r, RF)
+    assert False, "an identical re-refresh must refuse"
+except ValueError:
+    pass
+
+# (e) --refresh through the CLI, riding accept's --edit-title; before/after recorded.
+buf = io.StringIO()
+with redirect_stdout(buf):
+    review.main(["--refresh", cid_r, "--edit-title", "jj, never git", "--json"])
+out_rf = json.loads(buf.getvalue())
+assert out_rf["concept"] == cid_r and out_rf["after"]["title"] == "jj, never git"
+c_r2 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+assert c_r2["title"] == "jj, never git" and c_r2["statement"] == WHY_R, \
+    "--edit-title re-titles; the statement still reads from the claim"
+d_rf2 = blobstore.latest_decision(cid_r, RF)
+assert d_rf2["verb"] == "refresh" and d_rf2["before"]["title"] == JJ_SEED \
+    and d_rf2["after"]["title"] == "jj, never git"
+
+# (f) guards: a gone source, a retired concept, an unknown id — all refuse.
+orphan = {"id": "c-orphan", "title": "t", "statement": "s", "evidence": [],
+          "source_takeaway": "t-gone"}
+blobstore.ingest(blobstore.canonical_json(orphan), source_kind="concept", source_id="c-orphan",
+                 origin_ref={"stage": "test"}, root=RF)
+review.retire(cid_r, RF, reason="retired to prove the guard")
+for bad_call in (lambda: review.refresh("c-orphan", RF),                     # source gone
+                 lambda: review.refresh(cid_r, RF, edited={"title": "x"}),   # retired target
+                 lambda: review.refresh("c-nope", RF)):                      # unknown id
+    try:
+        bad_call()
+        assert False, "refresh must refuse a gone source / a retired concept / an unknown id"
+    except ValueError:
+        pass
+assert cid_r not in dream.valid_concept_ids(RF), "…and the retired concept stayed retired"
+print("OK 10 — refresh re-snapshots the concept's prose from the claim's live fold on the reviewer's")
+print("        command: never automatic, no-op refused, evidence/kind/scope/claim-decisions untouched,")
+print("        retired/unknown/orphaned targets refused.")
 
 print("\nall review-claims tests passed.")

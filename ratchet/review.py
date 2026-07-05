@@ -19,8 +19,8 @@ makes the call. This module just serves the materials and records the verdict, a
   v2 takeaway the legacy arm naturally empties; until then both queue side by side.
 - **evidence** is re-resolved from the immutable blobs and re-validated (the trust chain reaches the
   reviewer: "verified real"), with an optional surrounding-context window for deep investigation.
-- a **decision** (accept / reject / snooze / retire) is an append-only decision blob referencing its
-  target; an **accept** also ingests the concept it mints and records Claude's assessment + the human's
+- a **decision** (accept / reject / snooze / retire / refresh) is an append-only decision blob referencing
+  its target; an **accept** also ingests the concept it mints and records Claude's assessment + the human's
   call as provenance. State is never a flipped field — it is the latest decision referencing the target.
 
 The v3 claim surfaces (design §6, ADR-0028) ride the same fold: the LLM-merge AUDIT CARD renders every
@@ -489,7 +489,7 @@ def reject_merge(spec: str, *, reason: str = "", reviewer: str = "sulin",
         if len(parts) != 3 or parts[1] not in resolve.EDGE_VERBS or not (parts[0] and parts[2]):
             raise ValueError(f"--reject-merge edge form is event{resolve.EDGE_SEP}verb"
                              f"{resolve.EDGE_SEP}claim (verbs: {resolve.EDGE_VERBS}); got {spec!r}")
-        return resolve.reject_merge(edge_id=spec, reason=reason, reviewer=reviewer, root=root)
+        return resolve.reject_merge(edge=spec, reason=reason, reviewer=reviewer, root=root)
     if "," in spec:
         a, _, b = (s.strip() for s in spec.partition(","))
         if not a or not b or a == b:
@@ -588,7 +588,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
             continue
         rows.append((c, "claim"))
-    for tk in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times):  # bar is the knob
+    for tk in dream.current_takeaways(root, min_weight=maturity, now=now,      # bar is the knob
+                                      valid_times=valid_times):
         if tk["id"] in claim_ids:
             continue                               # the claim view is preferred — one id, one card
         d = decisions.get(tk["id"])
@@ -597,8 +598,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
         if source_filter is not None and not _evidence_in_source(tk.get("evidence"), source_filter, root, cache):
             continue                               # FOCUS: drop takeaways with no evidence from a matching source
         rows.append((tk, "takeaway"))
-    rows.sort(key=lambda r: importance(r[0], valid_times=valid_times, coalesce_hours=coalesce_hours),
-              reverse=True)                            # IMPORTANCE desc; stable
+    rows.sort(key=lambda r: importance(r[0], now, valid_times=valid_times, coalesce_hours=coalesce_hours),
+              reverse=True)                            # IMPORTANCE desc; stable; the ONE pinned now
     total = len(rows)                              # the backlog depth, counted BEFORE the sitting slice
     if limit is not None and limit > 0:
         rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering);
@@ -617,7 +618,7 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             card["merge_suggestions"] = sugg.get(view["id"], [])
         else:
             card = {**_present(view, root, context_bytes=context_bytes),
-                    **bar_status(view, maturity, valid_times=valid_times,
+                    **bar_status(view, maturity, valid_times=valid_times, now=now,
                                  coalesce_hours=coalesce_hours)}
         out.append(card)
     return (out, total) if with_total else out
@@ -648,7 +649,8 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
 
     def row(tk: dict, kind: str) -> dict:
         raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
-        st = bar_status(tk, maturity, valid_times=valid_times, coalesce_hours=coalesce_hours)
+        st = bar_status(tk, maturity, valid_times=valid_times, now=now,   # the ONE pinned now —
+                        coalesce_hours=coalesce_hours)                    # net_entrenchment's contract
         return {"takeaway_id": tk["id"], "kind": kind, "title": tk.get("title", ""),
                 "support": tk.get("support") or {"events": 0, "sessions": 0},
                 "entrenchment": st["entrenchment"], "bar": st["bar"], "rationale": st["rationale"],
@@ -670,7 +672,8 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
         if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
             continue
         out.append(row(c, "claim"))
-    mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, valid_times=valid_times)}
+    mature = {t["id"] for t in dream.current_takeaways(root, min_weight=maturity, now=now,
+                                                       valid_times=valid_times)}
     for tk in dream.catalog(root):
         if tk["id"] in mature or tk["id"] in claim_ids:
             continue
@@ -889,6 +892,66 @@ def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: 
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
+def refresh(concept_id: str, root: Path | None = None, *, edited: dict | None = None,
+            reviewer: str = "sulin", note: str = "") -> dict:
+    """Re-SNAPSHOT a concept's prose from its source claim's LIVE fold — the reviewer's answer to the
+    why-pending statement gap. Accept never withholds on synthesize's cadence (§6), so a why-pending
+    claim (why=null) mints its concept with statement '' — and when synthesize later fills the claim's
+    `why`, nothing carries it forward. Nothing MAY carry it forward automatically: the gate is the
+    trust source (ADR-0008), the concept is the system's most trusted artifact, and an auto-refresh
+    would land unreviewed LLM prose behind the human gate. So refresh is a HUMAN verb — the reviewer
+    reads the synthesized why (or corrects it via `edited` {title?, why?}, accept's shape) and
+    commands the re-read; the decision records before/after, so the audit trail says what the prose
+    was and what it became.
+
+    The refusals derive from the same pressures. A NO-OP (title and statement both already current) is
+    refused, never silently absorbed: a decision blob is a fact, and a refresh that changed nothing
+    would fake a review action — idempotence by refusal, accept's no-evidence discipline. A concept
+    whose latest lifecycle decision is retire/supersede/split is refused because a fresh decision would
+    become its LATEST and pull it back into the valid set (set_kind's guard — a refresh must never
+    double as an accidental un-retire). A gone source is refused: with no live claim to re-read, a
+    "refresh" would be invention. And only the PROSE moves — evidence + source_takeaway are carried
+    byte-identical (the spans were verified at accept; swapping evidence is accept/garden's business),
+    and kind/scope sit untouched because they are the DECISION's facts, folded from set_kind/set_scope/
+    accept decisions (ADR-0029/0030), never blob fields — the same design that lets a garden re-version
+    keep them lets this one. Returns {concept, concept_hash, before, after}."""
+    from . import garden                           # function-local: garden imports review at module load
+    root = root or config.data_root()
+    concept = garden._concept_blob(concept_id, root)
+    if concept is None:
+        raise ValueError(f"no concept {concept_id!r}")
+    d = blobstore.latest_decisions(root).get(concept_id)   # the LIFECYCLE fold load_concepts reads
+    if d and d.get("verb") in dream.CONCEPT_INVALID_VERBS:
+        raise ValueError(f"concept {concept_id!r} is out of the valid set (latest decision: "
+                         f"{d['verb']}) — a refresh decision would become its latest and resurrect "
+                         f"it; re-establishing a dead concept is a deliberate call, not a side-effect")
+    src = concept.get("source_takeaway")
+    if not isinstance(src, str) or not src:
+        raise ValueError(f"concept {concept_id!r} records no source_takeaway — nothing to re-read "
+                         f"(a garden-minted concept has no single source claim)")
+    tk = _claim_view(src, root) or _load_takeaway(src, root)   # the LIVE fold first — accept's read
+    if tk is None:
+        raise ValueError(f"concept {concept_id!r}'s source {src!r} is gone (folded out or reclaimed) "
+                         f"— nothing live to re-read")
+    edited = edited or {}
+    title = edited.get("title", tk.get("title", ""))
+    statement = edited.get("why", tk.get("why") or "")   # accept's read: a null why snapshots ''
+    before = {"title": concept.get("title", ""), "statement": concept.get("statement", "")}
+    after = {"title": title, "statement": statement}
+    if after == before:
+        raise ValueError(f"refresh of {concept_id!r} would change nothing — title and statement "
+                         f"already match the claim's current prose (run synthesize to fill the "
+                         f"claim's why, or pass --edit-title/--edit-why)")
+    blob = {**concept, "title": title, "statement": statement}   # same id/evidence/source_takeaway
+    ch, _ = blobstore.ingest(blobstore.canonical_json(blob), source_kind="concept",
+                             source_id=concept_id,
+                             origin_ref={"stage": "review", "verb": "refresh",
+                                         "reviewer": reviewer, "takeaway": src}, root=root)
+    _record("refresh", concept_id, root, concept_hash=ch, before=before, after=after,
+            reviewer=reviewer, note=str(note)[:ASSESSMENT_MAX])
+    return {"concept": concept_id, "concept_hash": ch, "before": before, "after": after}
+
+
 def valid_concepts(root: Path | None = None) -> list[dict]:
     """The current valid concept set — what dream judges belief-change against and `generate` projects
     to skills/CLAUDE.md. Same derivation as `dream.load_concepts` (kept there to avoid a review→dream
@@ -1092,6 +1155,12 @@ def main(argv=None) -> None:
     g.add_argument("--reject", metavar="TAKEAWAY", help="reject a takeaway")
     g.add_argument("--snooze", metavar="TAKEAWAY", help="defer a takeaway (needs --until)")
     g.add_argument("--retire", metavar="CONCEPT", help="take a concept out of the valid set")
+    g.add_argument("--refresh", metavar="CONCEPT",
+                   help="re-snapshot a concept's title/statement from its source claim's LIVE fold — "
+                        "accept never withholds on synthesize (§6/why-pending), so a why-pending "
+                        "accept mints an EMPTY statement; once synthesize fills the claim's why, "
+                        "this re-reads it on the reviewer's command (never automatically — the gate "
+                        "is the trust source). Rides --edit-title/--edit-why/--note; a no-op refuses")
     g.add_argument("--set-kind", nargs=2, metavar=("CONCEPT", "KIND"),
                    help="re-kind an EXISTING concept (behavioral|reference) — an append-only reviewer "
                         "decision that outranks the kind recorded at accept; the backfill path for "
@@ -1242,6 +1311,18 @@ def main(argv=None) -> None:
     elif args.retire:
         retire(args.retire, reason=args.reason)
         print(f"retired concept {args.retire}")
+    elif args.refresh:
+        edited = {}
+        if args.edit_title is not None:
+            edited["title"] = args.edit_title
+        if args.edit_why is not None:
+            edited["why"] = args.edit_why
+        res = refresh(args.refresh, edited=edited or None, note=args.note)
+        print(json.dumps(res, ensure_ascii=False) if args.json
+              else f"refreshed concept {res['concept']}: "
+                   + " · ".join(f"{k} {res['before'][k]!r} → {res['after'][k]!r}"
+                                for k in ("title", "statement")
+                                if res["before"][k] != res["after"][k]))
     elif args.concepts:
         cs = valid_concepts()
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
