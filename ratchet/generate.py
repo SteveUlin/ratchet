@@ -164,18 +164,13 @@ def default_reference_target(root: Path | None = None) -> Path:
 
 
 # --- the projection: valid concepts → tag-led, provenance-marked rules ----------------------------
-
-def _trigger(repos: list[str]) -> str:
-    """The WHERE prefix for a rule — "When working in `<repo>`: " (AutoGuide state-conditioning): a rule
-    fires more usefully when the reader knows WHERE it applies. The THEME now lives in the group HEADING
-    (the tag), so the trigger carries ONLY the repo — the strongest "where am I" provenance facet — no
-    longer the tag (that would just echo the heading). A concept spanning several repos takes the first
-    (sorted, deterministic); a path-shaped repo is basenamed so no `/home/<user>/…` leaks into a rule.
-    Returns a prefix ending in ": " (the verbatim statement follows), or "" when the concept has no repo —
-    an unconditional rule then renders as just its statement."""
-    if not repos:
-        return ""
-    return f"When working in `{Path(repos[0]).name}`: "
+#
+# No per-rule WHERE prefix: a rule's "where" is the reviewer's CONFIRMED SCOPE, and scope is already
+# the projection filter (ADR-0030) — the global region holds only concepts the reviewer made
+# unconditional, and `--repo X` renders into X's own CLAUDE.md where the whole file is the condition.
+# The evidence repo is PROVENANCE, not a condition: prefixing "When working in `taro`:" onto a
+# scope=global rule re-conditions what the reviewer explicitly un-conditioned (found live 2026-07-05 —
+# teaching preferences rendering as taro-only). Provenance stays greppable via the `<!-- c-id -->` marker.
 
 
 def _render_body(ctx: dict) -> str:
@@ -216,9 +211,8 @@ def _render_body(ctx: dict) -> str:
             lines.append("")                         # a blank line separates groups
         lines.append(f"## {tag}")
         for cid in sorted(groups[tag], key=lambda c: (-entrench(c), c)):
-            facets = by_node[cid]["facets"]
             statement = str(blobs.get(cid, {}).get("statement", "")).strip()
-            lines.append(f"- {_trigger(facets.get('repos') or [])}{statement} <!-- {cid} -->")
+            lines.append(f"- {statement} <!-- {cid} -->")
     return "\n".join(lines)
 
 

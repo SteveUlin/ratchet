@@ -115,12 +115,15 @@ assert "## general" in p, f"the untagged concept lands in the trailing general b
 assert "<!-- cluster" not in p, "the cluster comments are gone (tag-led, not cluster-led)"
 assert "**Shared" not in p, "the shared-basis cluster headings are gone"
 
-# DE-REDUNDANT rule line: the heading carries the THEME (tag), so the trigger carries only the WHERE (repo) —
-# no tag echoed in the trigger anymore. A concept with no repo (c-e) renders UNCONDITIONALLY (no trigger).
-assert "- When working in `alpha`: Run the formatter before every commit. <!-- c-a -->" in p, f"repo-only trigger:\n{p}"
-assert "- When working in `beta`: Prefer jj over git for every operation. <!-- c-d -->" in p, p
-assert "- Write tests first. <!-- c-e -->" in p, f"no repo → unconditional rule (no trigger):\n{p}"
-assert "with `workflow`" not in p and "with `version-control`" not in p, "the tag is NOT echoed in the trigger"
+# DE-REDUNDANT rule line: the heading carries the THEME (tag); the bullet is the statement VERBATIM.
+# No WHERE prefix at all — a rule's where is its reviewer-confirmed SCOPE (the projection filter,
+# ADR-0030), never the evidence repo: a facet prefix would re-condition a scope=global rule the
+# reviewer explicitly made unconditional. Provenance stays greppable via the c-id marker.
+assert "- Run the formatter before every commit. <!-- c-a -->" in p, f"bare statement bullet:\n{p}"
+assert "- Prefer jj over git for every operation. <!-- c-d -->" in p, p
+assert "- Write tests first. <!-- c-e -->" in p, p
+assert "When working in" not in p, f"no evidence-repo conditioning on any rule:\n{p}"
+assert "with `workflow`" not in p and "with `version-control`" not in p, "the tag is NOT echoed in the rule"
 
 # PARTITION: every concept in EXACTLY one group (4 statements, 4 markers, 3 headings).
 assert p.count("<!-- c-") == 4, f"four concepts, four provenance markers, one group each:\n{p}"
