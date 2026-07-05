@@ -1,130 +1,104 @@
 # ratchet
 
 Small, composable tools that mine durable learnings from Claude Code sessions and turn them
-into reviewable improvements to your config. Plain files, no database, no daemon.
+into reviewable improvements to your config. Plain files, no database, no daemon, stdlib-only
+Python. There is no unifying service: you run each stage by hand as a **bounded, prioritized
+tick** — `--limit`/`--max-usd` cap the work, re-running never repeats what's done, and the
+backlog waits with the most valuable work rising first.
 
-The unifying `ratchet` service does not exist yet — the project is built as composable blocks
-over a content-addressed **blobstore**, each step a materialized, lineage-linked artifact:
+## Pipeline
+
+Two human gates:
 
 ```
-tap → raw → weave → cleaned → chunk → chunkset → glean → events → dream → takeaways → review → concepts → generate → CLAUDE.md
-  (fetch)      (render)            (window)        (extract, LLM)    (synthesize, LLM)   (human gate)        (project, no LLM)
+tap → weave → chunk → glean → resolve → synthesize → review¹ → garden → review² → generate
+fetch  clean   window  extract match     prose        ↑concepts reorganize          ↑CLAUDE.md
 ```
 
-- `tap` — locate new/changed Claude Code transcripts and copy each in as an immutable **raw** blob.
-- `weave` — reconstruct a transcript's active conversation (across rewinds, compacts, parallel
-  tool calls; sidechains dropped) and render it to one **cleaned** blob of speaker-tagged text.
-  Deterministic, no LLM.
-- `chunk` — window a cleaned blob into a **chunkset**: bounded, provenance-tagged byte-offset
-  pointers an extractor consumes. A chunk resolves by slicing the immutable cleaned blob — no
-  re-render. Deterministic, no LLM.
-- `glean` — filter chunks for durable signal and extract **events**: thin pointers into the cleaned
-  blob (a byte span whose verbatim quote is *trusted*, plus an *untrusted* one-sentence summary and
-  scored *markers* — surprise / insight / research — that classify why the learning matters). A quote
-  is accepted only if it is a real substring of the chunk, so a hallucinated quote is rejected
-  deterministically. Events are an append-only log, not blobstore blobs.
-- `dream` — cluster events and synthesize each cluster into a durable, evidence-cited **takeaway**
-  (a "why" + name). Deterministic stdlib clustering first, then one LLM call per cluster with a
-  *sharper* model (sleep-time: rare, batched). A takeaway cites its events, extending the trust chain
-  to the immutable blob. Takeaways **evolve by supersession** — a re-run re-clusters and a new takeaway
-  supersedes those it re-covers (grow/split/merge are one mechanism); "current" is a derived fold.
-- `review` — the **human gate**: promote takeaways to **concepts** (ratchet's curated knowledge).
-  `review.py` is the pure backend; the interaction is the `/ratchet-review` skill, where Claude is an
-  active faithfulness-checker (the `why` is untrusted — Claude checks it against the verified evidence
-  and escalates to investigate the doubtful cases) and you make every call. accept/reject/snooze/edit
-  are append-only decision blobs; an accept mints a concept, closing the loop (dream reads concepts to
-  judge belief-change). The queue and the valid concept set are derived queries, never stored lists.
-- `concepts` — the **concept-graph view**: derived edges + clusters between concepts from PROVENANCE
-  FACETS (shared repo/file/tool, temporal proximity — recomputed on read from each cited session's raw
-  transcript, never stored), NO LLM and NO text similarity (ADR-0013). A rebuildable read-side view; the substrate
-  the gardener (managed tags, structural ops) is built on.
-- `garden` — the **gardener**. *Phase 1 (tags)*: a cheap model tags each concept from a gardener-managed,
-  controlled **vocabulary** (both a derived fold over append-only blobs — concepts stay immutable), and a
-  shared **tag** becomes a `shares-tag` edge that sharpens the `concepts` graph. LOW-STAKES, auto-applied;
-  a `block.Block` reusing the whole driver (ADR-0014). *Phase 2 (structural ops, 3c-i)*: the deterministic,
-  append-only machinery that ACTS on the graph — `merge`/`split`/`abstract`/`reparent`/`retire` of concepts
-  + `merge_tags`/`retire_tag` of the vocab, plus **asserted edges** (the gardener's stored claims, vs the
-  derived ones), all invalidate-don't-delete with the trust chain re-proven on every write, no LLM
-  (ADR-0015). The LLM that drives them + the human gate for the high-stakes ones are 3c-ii / 3d.
-- `generate` — the **loop-closer**: a mechanical, deterministic projection of the VALID concepts (the
-  source of truth) into a **marked region** of a CLAUDE.md — concepts grouped by their facet cluster, each
-  a rule (its reviewed `statement` verbatim + a `<!-- c-id -->` provenance marker + a "when working in
-  &lt;repo&gt;/with &lt;tag&gt;" trigger). NO LLM. generate owns ONLY the delimited region (human content
-  outside is byte-preserved); `--apply` refreshes it in place, so a retired concept's rule UNMAKES itself
-  (retraction-for-free) and re-apply with unchanged concepts is a no-op. The default `--target` is a STAGED
-  path under the data root, so it never clobbers a real CLAUDE.md; `--diff` is the second review tier
-  (ADR-0020).
+- `tap` — copy new/changed transcripts (or a hand-written doc: `--file`, ADR-0031) in as
+  immutable **raw** blobs.
+- `weave` — reconstruct the active conversation (across rewinds, compacts, parallel tool calls;
+  sidechains dropped) into one **cleaned** blob of speaker-tagged text. Deterministic, no LLM.
+- `chunk` — window a cleaned blob into a **chunkset** of byte-offset pointers; a chunk resolves
+  by slicing the frozen blob, no re-render. Deterministic, no LLM.
+- `glean` — extract **events** (Haiku): a quote that must be a real substring of the chunk — a
+  hallucinated quote is rejected deterministically — plus an untrusted one-sentence summary,
+  novelty-aware markers, and the statement signature + subject key that `resolve` matches on.
+- `resolve` — statement-first entity resolution (ADR-0028): deterministic signals REJECT at $0,
+  one bounded Haiku call owns acceptance over the residue, and a non-match seeds a new **claim**
+  on the spot. Corroboration is an edge, so a wrong merge retracts cleanly — it cannot latch.
+- `synthesize` — Sonnet writes a claim's durable `why` only after it matures (corroborated
+  across distinct, recent sessions), so prose cost is bounded by the graduation rate, not the
+  event rate.
+- `review` — the human gate, two tiers: promote mature claims to **concepts** (kind + scope
+  recorded, ADR-0029/0030) and judge the gardener's structural proposals. Driven by the
+  `/ratchet-review` skill; every verdict is an append-only decision blob.
+- `garden` — tend the concept layer: cheap managed tags auto-apply (ADR-0014);
+  merge/split/abstract/retire proposals and staleness flags queue for review².
+- `generate` — mechanically project valid **behavioral** concepts into a marked CLAUDE.md
+  region: repo-scoped concepts route to that repo's file (`--repo`), human content outside the
+  region is byte-preserved, and a retired concept's rule unmakes itself on the next `--apply`.
+  No LLM (ADR-0020).
 
-## Layout
-
-- `ratchet/` — the Python package: `config`, `blobstore` (every artifact is a content-addressed,
-  versioned blob — ADR-0007), `block` (the one driver every stage runs on — ADR-0009), `tap`, `weave`,
-  `chunk`, `glean`, `dream`, `review`, `concepts` (the rebuildable concept-graph view — ADR-0013),
-  `garden` (the gardener's managed-tags pass over concepts — ADR-0014), and `completer` (the injected
-  LLM seam).
-- `.claude/skills/ratchet-review/` — the `/ratchet-review` skill (the human gate's interaction).
-- `.claude/skills/ratchet-generate/` — the `/ratchet-generate` skill: craft the CLAUDE.md projection
-  with Claude (tighten wording, group by theme, fit your voice) over the mechanical `generate` CLI, every
-  rule kept faithful to its concept's statement + evidence.
-- Every batch stage (tap/weave/chunk/glean/dream) is a **Block**: same `--all`/`--source-id`/`--max-usd`/
-  `--limit`/`--dry-run`/`--quiet` CLI, same streaming per-item progress, same per-item commit + resume.
-- `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.
+`resolve` + `synthesize` replace `dream` (ADR-0010 → 0028): v2 forced each event to pick from
+the whole takeaway catalog and over-merged; v3 splits the job into cheap match-or-mint on every
+event and expensive prose only for what matures. The `dream` module stays for history — don't
+run it on new events.
 
 ## Data
 
-The data lives **outside** this repo, in `$RATCHET_DATA_DIR`
-(default `${XDG_DATA_HOME:-~/.local/share}/ratchet`), append-only and local-only; the repo holds
-only code. The **blobstore** (`blobs/`) holds deterministic, content-addressed artifacts (raw +
-cleaned + chunkset). The **stream store** (`events/glean-*.jsonl`, `events/dream-*.jsonl`) is a
-separate append-only log of non-deterministic LLM output that *points into* the blobstore — each
-event/takeaway verifiable forever against its frozen cleaned blob. `concepts/` is the curated-
-knowledge layer the human-review gate will write and `dream` reads.
+Data lives **outside** this repo in `$RATCHET_DATA_DIR` (default
+`${XDG_DATA_HOME:-~/.local/share}/ratchet`), local-only; the repo holds only code. **Every
+artifact is a blob** (ADR-0007): raw transcripts, cleaned renders, chunksets, events, claims,
+edges, concepts, review decisions — content-addressed, immutable, lineage-linked, so every LLM
+output stays verifiable forever against the frozen transcript it cites. Nothing is edited or
+deleted: a change is a new version, a retraction is a new decision blob, and "what is currently
+valid" — the review queue, the concept set, the census — is always a derived fold over the
+blobs, never a stored list that could desync.
+
+## Layout
+
+- `ratchet/` — one module per stage (`tap`, `weave`, `chunk`, `glean`, `resolve`, `synthesize`,
+  `review`, `garden/`, `generate`, `status`) over a shared substrate: `config`, `blobstore`
+  (ADR-0007), `block` (the one driver every batch stage runs on — the same bounded-tick CLI,
+  streaming per-item progress, per-item commit + resume; ADR-0009), `completer` (the injected
+  LLM seam), `sig` + `subject` (the resolver's deterministic identity math: statement
+  signatures, repo+files scope keys), `concepts` (the rebuildable concept-graph view —
+  ADR-0013), and `dream` (superseded — kept for history).
+- `.claude/skills/` — `/ratchet-review` (the human gate's interaction) and `/ratchet-generate`
+  (craft the projection's wording with Claude; every rule stays faithful to its concept).
+- `docs/RUNBOOK.md` — the operator loop: order, cadence, budgets, knobs.
+- `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.
 
 ## Run
 
+Every stage is `nix run .#<stage> -- <args>` (in the dev shell: `python -m ratchet.<stage>`):
+
 ```
-nix run .#tap -- --dry-run          # show which transcripts would be copied
-nix run .#tap                       # copy new transcripts into the blobstore
-
-python -m ratchet.weave --source-id <session>            # inspect a session's cleaned render
-python -m ratchet.weave --source-id <session> --render   # print the full cleaned document
-python -m ratchet.chunk --source-id <session>            # materialize + list its chunkset
-
-nix run .#glean -- --source-id <session> --dry-run       # show which chunksets would be gleaned
-nix run .#glean -- --source-id <session>                 # extract events (default model: haiku)
-nix run .#glean -- --all --max-usd 2.00                  # glean every chunkset, capped at $2
-
-nix run .#dream -- --dry-run                             # cluster events, print groupings (no LLM)
-nix run .#dream -- --show --max-usd 2.00                 # synthesize takeaways (default model: sonnet)
-
-nix run .#review -- --pending                            # the review queue (takeaways + verified evidence)
-nix run .#review -- --accept <takeaway> --assessment ".."  # promote a takeaway → concept
-
-nix run .#generate                                       # print the projected CLAUDE.md region (no write)
-nix run .#generate -- --diff --target ~/proj/CLAUDE.md   # review the proposed region vs the target's current one
-nix run .#generate -- --apply --target ~/proj/CLAUDE.md  # refresh the marked region in place (human content preserved)
+nix run .#status                                     # first, every session: where does the backlog sit?
+nix run .#tap -- --last 200                          # pull new transcripts
+nix run .#glean -- --all --limit 1000 --max-usd 5    # extract events (Haiku)
+nix run .#resolve -- --limit 100 --max-usd 1         # match or mint claims — run often
+nix run .#review -- --pending                        # a sitting's worth — or guided: /ratchet-review
+nix run .#generate -- --diff --target ~/.claude/CLAUDE.md
 ```
 
-The review gate is meant to be driven by the **`/ratchet-review` skill** (Claude presents each
-takeaway with its verified evidence, checks the untrusted `why`, and records your verdict); the CLI
-above is the same backend it calls.
-
-`glean` and `dream` are the LLM stages — by default they shell out to your authed `claude` CLI.
-Both re-run idempotently (a processed ledger skips done work); a bumped prompt or `--model` re-does
-it over the same frozen inputs. `dream --dry-run` shows the deterministic clustering for free, so you
-can eyeball the groupings before spending on synthesis.
+**`docs/RUNBOOK.md` is the operator manual** — the full loop, the cadence table, seeding
+hand-written rules, every knob. Two read-side instruments ride alongside the pipeline:
+`concepts` renders the derived concept graph and digest (recomputed from blobs, no LLM), and
+`sig` is the measuring CLI that earned the resolver's thresholds (`--band-report`,
+`--sample-pairs`, `--score-gold`; never writes).
 
 ## Develop
 
 From the dev shell (picks up uncommitted changes):
 
 ```
-direnv allow                        # or: nix develop
-python -m ratchet.tap --dry-run
-python tests/test_storage.py && python tests/test_tap.py && python tests/test_block.py && \
-  python tests/test_weave.py && python tests/test_chunk.py && \
-  python tests/test_glean.py && python tests/test_dream.py && python tests/test_review.py
+direnv allow                                             # or: nix develop
+for t in tests/test_*.py; do python "$t" || break; done  # bash
+for t in tests/test_*.py; python $t; or break; end       # fish
 ```
 
-`test_glean.py` and `test_dream.py` run offline with fake completers; set `RATCHET_LIVE_TEST=1` to
-also smoke-test the real `claude` CLI against one transcript.
+Every test is a plain stdlib script — no framework, a throwaway `RATCHET_DATA_DIR`, fake
+completers for the LLM stages, golden files under `tests/golden/` pinning exact derived output.
+`RATCHET_LIVE_TEST=1` additionally smoke-tests the real `claude` CLI.
