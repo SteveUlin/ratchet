@@ -34,8 +34,9 @@ from .weave import active_path, parse
 # The narrowing window: bytes either side of the event's evidence span within which a write-tool
 # line counts as CO-LOCATED (§3.0). The principle: a lesson's subject is its OWN nearby writes,
 # not everything the session touched — the window is the "same working beat" radius. ±4000 bytes
-# is one-to-two rendered turns of cleaned text (weave caps a tool result at ~1.3k, a text block at
-# ~5k), so an edit made while the lesson was being learned is in; the unrelated refactor three
+# is one-to-two rendered turns of cleaned text (weave's named caps: a tool result renders at most
+# RESULT_HEAD+RESULT_TAIL ≈ 1.3k, a text block TEXT_HEAD+TEXT_TAIL ≈ 5k — re-derive this window if
+# those move), so an edit made while the lesson was being learned is in; the unrelated refactor three
 # episodes earlier is out. UNTUNED starting value — widen if real events' co-located edits render
 # further from their quotes, shrink if narrowing still smears (gold set, like the concepts weights).
 SPAN_WINDOW = 4000
@@ -92,14 +93,11 @@ def _blob_entry(cleaned_hash: str, root: Path) -> dict:
     event narrows never pays the raw re-parse. Never fatal: a reclaimed blob or broken lineage
     degrades to an empty entry, so the event carries an empty subject (seed-only, §3.1)."""
     from . import concepts                         # lazy: see module docstring
-    repo, raw = None, None
-    try:
-        raw = blobstore.get_meta(cleaned_hash, root).get("derived_from")
-        if raw:
-            origin = blobstore.get_meta(raw, root).get("origin_ref") or {}
-            repo = concepts._repo_label(origin)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        raw = None
+    # the shared lineage hop (`blobstore.raw_meta_of`) yields both fields at once: the repo off
+    # `origin_ref`, the raw HASH (`content_hash`) the fallback union re-parses. None → empty entry.
+    m = blobstore.raw_meta_of(cleaned_hash, root)
+    repo = concepts._repo_label(m.get("origin_ref") or {}) if m else None
+    raw = m.get("content_hash") if m else None
     writes: list[tuple[int, int, str]] = []
     nbytes = 0
     try:

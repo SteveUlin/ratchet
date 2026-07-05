@@ -11,7 +11,7 @@ the model with NUMBERED lines, and the model returns the line numbers its eviden
 copies those lines' bytes from the immutable blob. The model never reproduces transcript text, so
 evidence cannot be hallucinated — it is verbatim by construction, not by checking a retyped quote.
 
-Events ARE blobs now (ADR-0007): a logical event is a RAW blob whose `source_id` is the
+Events ARE blobs (ADR-0007): a logical event is a RAW blob whose `source_id` is the
 span-derived, deterministic `event_id`, and each extraction is an immutable VERSION (content =
 `blob_hash(canonical-json(record))`). ADR-0004's objection — content-addressing a non-deterministic
 output is wrong — dissolves by splitting identity (`event_id`) from content: a re-extraction with a
@@ -61,7 +61,9 @@ DOC_PROMPT_VERSION = "glean-doc/1"   # DOCUMENT mode's own version knob (ADR-003
                                # doc chunks too; their re-extraction re-ingests byte-identically, so a
                                # transcript prompt bump wastes a few LLM calls on the (small) document
                                # corpus, never duplicates data.
-SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary
+SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary. Deliberately ABOVE
+                               # the prompts' "<= 200 chars" ask — tolerance for model overshoot: the
+                               # prompt asks, the hygiene cap forgives (a mild run-on keeps its tail)
 OUT_NOUN = "events"            # the per-item output noun the Progress bar/line shows (glean emits events)
 
 # The VALID-TIME recency term of priority(): a BONUS of `W_RECENT · 0.5^(material_age_days /
@@ -462,11 +464,14 @@ class GleanBlock:
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
                  targets: list[str] | None = None, source_filter: str | None = None,
-                 recent_clock: str = RECENT_CLOCK) -> None:
+                 exclude: tuple[str, ...] = (), recent_clock: str = RECENT_CLOCK) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
         self.source_filter = source_filter  # PROCESSING FOCUS: extract only this source's chunks (ADR-0022)
+        self.exclude = tuple(exclude)       # JUNK QUARANTINE: skip chunks whose source handle contains any
+                                            # listed substring (tap --exclude's vocabulary) — the include
+                                            # filter's complement at the money gate; see items()
         if recent_clock not in RECENT_CLOCKS:
             raise ValueError(f"recent_clock must be one of {RECENT_CLOCKS}, got {recent_clock!r}")
         self.recent_clock = recent_clock   # which stamp dates the material (see the RECENT_CLOCK knob)
@@ -507,12 +512,16 @@ class GleanBlock:
         # RAW transcript's stamps behind each cleaned blob — `_age_cache` its `fetched_at` (TRANSACTION
         # time: when the material arrived, age()'s wait-clock) and `_vt_cache` its `origin_ref.mtime`
         # (VALID time: when the session happened, priority()'s recency clock, ADR-0023). Both live on
-        # the same raw meta, so ONE `_fill_stamps` hop (cleaned → derived_from → raw, two meta reads)
-        # fills both per cleaned blob: the many chunks SHARING one cleaned_hash pay the read pair once,
-        # and an Aging run pays nothing beyond what priority() already paid.
+        # the same raw meta, so ONE `_fill_stamps` hop (`blobstore.raw_meta_of`) fills both per cleaned
+        # blob: the many chunks SHARING one cleaned_hash pay the hop once, and an Aging run pays
+        # nothing beyond what priority() already paid.
         self._root: Path | None = None
         self._age_cache: dict[str, str | None] = {}   # cleaned_hash → raw fetched_at (None = unknown)
         self._vt_cache: dict[str, str | None] = {}    # cleaned_hash → raw origin_ref.mtime (None = undated)
+        self._meta_cache: dict = {}                   # cleaned_hash → raw meta (`raw_meta_of`'s cache),
+                                                      # SHARED by items()'s --source/--exclude handle reads
+                                                      # and _fill_stamps — the lineage hop is paid once per
+                                                      # cleaned blob across the filters AND both clocks
         # The subject-stamp seam (dream-v3 §2.1, S1): `subject_key` derivation parses the cleaned blob
         # once (meta hop + write-line scan, maybe a raw re-parse) — shared across the many events of one
         # session's chunks, keyed by cleaned_hash. The `_facet_cache`/`_age_cache` idiom.
@@ -534,12 +543,14 @@ class GleanBlock:
         absence surfaces in `process` when it slices the cleaned bytes (→ FileNotFoundError → errored
         → retried), not here, so a missing blob is isolated per chunk, never a crashed enumeration."""
         self._root = root                         # capture the driver's root for age() (called during ordering)
-        # PROCESSING FOCUS (`glean --source`, ADR-0022): keep only chunks whose SOURCE handle contains the
-        # filter substring (case-insensitive), reached by the same `cleaned_hash` → raw `origin_ref.project`
-        # hop age() walks — one cached meta read per cleaned blob (chunks share a cleaned_hash), no LLM. A
-        # chunk whose handle can't be resolved does NOT match (focus narrows). Default (None) → no filter.
+        # PROCESSING FOCUS (`glean --source`, ADR-0022) + JUNK QUARANTINE (`--exclude`): both read the
+        # chunk's SOURCE handle (case-insensitive substring, the same `cleaned_hash` → raw handle hop
+        # age() rides — one cached `raw_meta_of` read per cleaned blob, no LLM), composed include-FIRST
+        # then exclude. The asymmetry on an unresolvable handle is deliberate: include FOCUSES (no
+        # handle → no match → dropped), exclude drops only a POSITIVE match (no handle → kept) — each
+        # filter acts only on what it can prove. Defaults (None / empty) → no filtering.
         source_filter = self.source_filter.lower() if self.source_filter else None
-        proj_cache: dict = {}
+        exclude = tuple(x.lower() for x in self.exclude)
         for cs in self._target_chunksets(root, source_id):
             try:
                 chunks = chunk.load(cs, root)
@@ -554,9 +565,12 @@ class GleanBlock:
                 kind = None
             mode = "document" if kind == "document" else "transcript"
             for ch in chunks:
-                if source_filter is not None:
-                    proj = blobstore.project_of(ch.cleaned_hash, root, proj_cache)
-                    if not proj or source_filter not in proj.lower():
+                if source_filter is not None or exclude:
+                    proj = blobstore.project_of(ch.cleaned_hash, root, self._meta_cache)
+                    low = (proj or "").lower()
+                    if source_filter is not None and (not proj or source_filter not in low):
+                        continue
+                    if proj and any(x in low for x in exclude):
                         continue
                 yield ChunkItem(chunk=ch, chunkset_hash=cs, mode=mode)
 
@@ -626,22 +640,17 @@ class GleanBlock:
     def _fill_stamps(self, cleaned_hash: str) -> None:
         """Fill BOTH stamp caches for one cleaned blob in ONE lineage hop. The cleaned blob is a render —
         derived meta carries `created_at` (resettable by any re-render), never its source's stamps — so
-        both clocks hop cleaned → `derived_from` → raw meta (recompute-on-read, ADR-0013; the same hop
-        `session_of`/`project_of` walk) and read the raw transcript's `fetched_at` (transaction time,
-        age()'s clock) and `origin_ref.mtime` (valid time, priority()'s clock) off the SAME meta — two
-        reads fill two caches. Degrades to None on absent/unreadable lineage, never raises (a missing
-        stamp must not crash ordering). An mtime that does not PARSE normalizes to None here: downstream
-        None means "undated → no bonus", whereas letting `config.age_days` degrade it (0.0 = fresh)
-        would award the MAXIMUM bonus to an unreadable date — the wrong direction (see priority())."""
-        fetched = mtime = None
-        try:
-            raw = blobstore.get_meta(cleaned_hash, self._root).get("derived_from")
-            if raw:
-                m = blobstore.get_meta(raw, self._root)
-                fetched = m.get("fetched_at")
-                mtime = (m.get("origin_ref") or {}).get("mtime")
-        except (OSError, json.JSONDecodeError):
-            pass                              # absent/unreadable lineage → both stamps unknown, never raise
+        both clocks read the raw meta via `blobstore.raw_meta_of` (recompute-on-read, ADR-0013; the one
+        single-sourced hop `session_of`/`project_of` are field reads of): the raw transcript's
+        `fetched_at` (transaction time, age()'s clock) and `origin_ref.mtime` (valid time, priority()'s
+        clock) come off the SAME dict — one hop fills two caches, and `_meta_cache` shares it with the
+        --source/--exclude reads in items(). Degrades to None on absent/unreadable lineage, never raises
+        (a missing stamp must not crash ordering). An mtime that does not PARSE normalizes to None here:
+        downstream None means "undated → no bonus", whereas letting `config.age_days` degrade it (0.0 =
+        fresh) would award the MAXIMUM bonus to an unreadable date — the wrong direction (see priority())."""
+        m = blobstore.raw_meta_of(cleaned_hash, self._root, self._meta_cache) or {}
+        fetched = m.get("fetched_at")
+        mtime = (m.get("origin_ref") or {}).get("mtime")
         if mtime is not None:
             try:
                 datetime.fromisoformat(str(mtime))
@@ -770,7 +779,8 @@ class GleanBlock:
 # --- run: a thin compat shim over the block driver (keeps dream/review setup untouched) -----
 
 class _ShimReport(block.ProxyReport):
-    """The shape the old `glean.run` returned — a thin WRAPPER, not a copy. The `block.ProxyReport` base
+    """The shape `glean.run` returns — the pre-block-driver report contract (ADR-0009), kept so its
+    callers read one shape — a thin WRAPPER, not a copy. The `block.ProxyReport` base
     holds the uniform `block.Report` the driver populated plus the GleanBlock instance and forwards every
     uniform field by reading THROUGH them (`@anti-desync`, the spec's #4 — no copy that can drift); this
     subclass adds only the genuinely-extra instance tallies (events/rejected), read off the block.
@@ -837,6 +847,13 @@ def main(argv=None) -> None:
                     "this substring, case-insensitive — the originating project for transcripts (e.g. taro), "
                     "the file path for documents (e.g. CLAUDE.md). Exact single-source enumeration is "
                     "--source-id; a semantic TAG filter (garden vocabulary) is the deferred sibling knob")
+    ap.add_argument("--exclude", action="append", default=[], metavar="SUBSTR",
+                    help="skip chunks whose SOURCE handle contains this substring, case-insensitive "
+                         "(repeatable; --source's vocabulary, tap --exclude's) — the include filter's "
+                         "complement at the money gate. The append-only store has no retire-source, so "
+                         "junk tapped before tap grew its self-skip/--exclude (ADR-0025), e.g. -tmp- "
+                         "test fixtures, sits pending forever; this keeps it out of the LLM spend. "
+                         "Composes with --source: include first, then exclude")
     ap.add_argument("--limit", type=int,
                     help="cap CHUNKS examined this run, before the done-skip (per-chunk now, ADR-0009)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this (between chunks)")
@@ -883,13 +900,13 @@ def main(argv=None) -> None:
     if args.scores:                               # read-only early-return, --dry-run's sibling: the
         blk = GleanBlock(completer.make_cli_completer(args.model), model=args.model,   # completer is
                          targets=targets, source_filter=args.source,  # bound but never called (no LLM)
-                         recent_clock=args.recent_clock)
+                         exclude=tuple(args.exclude), recent_clock=args.recent_clock)
         print(block.scores_report(blk, root=config.ensure_layout(), priority=args.priority))
         return
 
     complete = completer.make_cli_completer(args.model)
     blk = GleanBlock(complete, model=args.model, targets=targets, source_filter=args.source,
-                     recent_clock=args.recent_clock)
+                     exclude=tuple(args.exclude), recent_clock=args.recent_clock)
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
     progress = None if (args.quiet or args.dry_run) else block.Progress(
@@ -910,10 +927,11 @@ def main(argv=None) -> None:
     print(f"\nglean-{report.run_id}: {report.examined} examined, {report.processed} done, "
           f"{report.skipped} skipped, {report.outputs} events, {blk.rejected} rejected{errs}, "
           f"${report.cost_usd:.4f}{tail}")
-    if blk._digest_failed:                           # the digest-disable latch tripped — surface it ONCE so a
-        print("  WARNING: concept digest build failed — novelty awareness was DISABLED this run "  # permanent
-              "(every event judged `novel`); see GleanBlock._relevant_digest. This is glean's deliberate "  # off
-              "advisory exception (isolated + recall-first), not a crash.")                          # is visible
+    # the digest-disable latch tripped — surface it ONCE so a permanent novelty-off is visible, never silent
+    if blk._digest_failed:
+        print("  WARNING: concept digest build failed — novelty awareness was DISABLED this run "
+              "(every event judged `novel`); see GleanBlock._relevant_digest. This is glean's deliberate "
+              "advisory exception (isolated + recall-first), not a crash.")
 
 
 if __name__ == "__main__":

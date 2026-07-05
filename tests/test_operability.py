@@ -6,7 +6,9 @@ need none for the enumeration filters; review is the pure backend). Four knobs, 
     skip — "the last N I haven't already pulled"); `--since <date>` keeps files modified at/after a cutoff.
     Owned by the FETCHER (selection is per-source), distinct from the driver's `--limit` (items EXAMINED).
   PROCESSING FOCUS — `dream --source X` / `glean --source X` keep only items whose SOURCE handle
-    contains X (case-insensitive substring), reached by the `cleaned_hash` → raw `origin_ref.project` hop.
+    contains X (case-insensitive substring), reached by the `cleaned_hash` → raw `origin_ref.project` hop;
+    `glean --exclude Y` (repeatable) is the include filter's complement — it DROPS handle-matching chunks
+    (the junk quarantine for fixture projects tapped before tap grew its own --exclude, ADR-0025).
   REVIEW PRIORITIZED SUBSET — `pending` ORDERS by importance (net entrenchment × confidence) descending,
     `--limit N` takes the top-N, `--source X` filters to a source. Highest-leverage calls first.
 
@@ -190,7 +192,8 @@ print("OK 2 — dream --source: filter_by_source + DreamBlock.items() keep ONLY 
 
 
 # ============================================================================================
-# 3. glean --source: extract only chunks from a SOURCE matching the substring
+# 3. glean --source / --exclude: extract only chunks from a SOURCE matching the substring;
+#    exclude drops handle-matching chunks (the junk quarantine, --source's complement)
 # ============================================================================================
 
 R3 = use_store("glean-source")
@@ -211,8 +214,47 @@ assert nix_chunks and all(blobstore.project_of(it.chunk.cleaned_hash, R3) == NIX
 assert len(rat_chunks) + len(nix_chunks) == len(all_chunks), "the two foci partition the full enumeration"
 assert list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, source_filter="zzz").items(R3)) == [], \
     "a source filter matching no project enumerates nothing"
-print("OK 3 — glean --source: GleanBlock.items() enumerates ONLY the matching project's chunks "
-      "(same cleaned_hash → project hop); the foci partition the full set; default None → all chunks.")
+
+# --exclude: the include filter's complement — drops chunks whose handle contains ANY listed substring,
+# case-insensitive, same handle vocabulary as --source (and tap --exclude). The junk-quarantine knob:
+# the append-only store has no retire-source, so this is how fixture projects stay out of the LLM spend.
+def chunk_keys(items):
+    return {glean.chunk_key(it.chunk) for it in items}
+
+
+ex_nix = list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, exclude=("nixos",)).items(R3))
+assert chunk_keys(ex_nix) == chunk_keys(rat_chunks), \
+    "--exclude nixos drops exactly the nixos-project chunks (the ratchet set survives intact)"
+assert chunk_keys(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets,
+                                   exclude=("NIXOS",)).items(R3)) == chunk_keys(rat_chunks), \
+    "--exclude is case-insensitive, like --source"
+# include + exclude COMPOSE, include first: 'sulin' matches BOTH handles, then exclude drops the nixos half.
+both = glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets,
+                        source_filter="sulin", exclude=("nixos",)).items(R3)
+assert chunk_keys(both) == chunk_keys(rat_chunks), "--source + --exclude compose (include first, then exclude)"
+# a no-match exclude is a NO-OP (drops only a positive match — it never silently narrows).
+assert chunk_keys(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets,
+                                   exclude=("zzz",)).items(R3)) == chunk_keys(all_chunks), \
+    "an exclude matching no handle drops nothing"
+# repeatable: every listed substring drops its matches.
+assert list(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets,
+                             exclude=("ratchet", "nixos")).items(R3)) == [], \
+    "two excludes covering both projects quarantine everything"
+# --dry-run counts reflect the exclusion honestly (nothing done yet in R3, so would_process == enumerated).
+dry = block.run(glean.GleanBlock(GleanFake(JJ), model="fake", targets=targets, exclude=("nixos",)),
+                dry_run=True, root=R3)
+assert dry.would_process == len(rat_chunks), "--dry-run's would-process count sees the exclusion"
+# the CLI accepts + threads --exclude (a --dry-run smoke over --all; env points at R3).
+import contextlib  # noqa: E402
+import io  # noqa: E402
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    glean.main(["--all", "--dry-run", "--exclude", "nixos"])
+assert f"{len(rat_chunks)} chunk(s) would process" in out.getvalue(), \
+    "the CLI threads --exclude through to the block (dry-run count matches the filtered enumeration)"
+print("OK 3 — glean --source/--exclude: items() keeps ONLY the matching project's chunks; --exclude drops "
+      "handle matches (case-insensitive, repeatable, composes include-first, no-match = no-op); --dry-run "
+      "and the CLI see the same filtered set.")
 
 
 # ============================================================================================

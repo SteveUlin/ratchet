@@ -71,6 +71,23 @@ lineage = list(blobstore.derived_for(h1))
 assert [m["content_hash"] for m in lineage] == [dh], "derived_for yields the render"
 assert list(blobstore.derived_for(h1, fmt="nope")) == [], "format filter excludes non-matches"
 
+# raw_meta_of: THE cleaned → derived_from → raw lineage hop, single-sourced — every lineage read
+# (session_of / project_of / glean's stamp fill / subject's repo) is a field off the dict it returns.
+rm = blobstore.raw_meta_of(dh)
+assert rm is not None and rm["content_hash"] == h1 and rm["source_id"] == "sess1", \
+    "raw_meta_of resolves a derived blob to its RAW meta"
+assert blobstore.session_of(dh) == "sess1", "session_of is the raw meta's source_id field"
+assert blobstore.project_of(dh) == "proj", "project_of is the raw meta's origin_ref.project field"
+assert blobstore.raw_meta_of(h1) is None, "a raw blob has no derived_from → None (degrade, not raise)"
+assert blobstore.raw_meta_of("no-such-hash") is None, "absent meta degrades to None, never fatal"
+lc = {}
+assert blobstore.raw_meta_of(dh, cache=lc)["content_hash"] == h1 and dh in lc, "the cache fills on first call"
+lc[dh] = {"content_hash": "sentinel"}
+assert blobstore.raw_meta_of(dh, cache=lc)["content_hash"] == "sentinel", "a cache hit skips the meta reads"
+lc2 = {}
+blobstore.raw_meta_of("no-such-hash", cache=lc2)
+assert lc2 == {"no-such-hash": None}, "a miss is cached too (an unresolvable blob pays the hop once)"
+
 # derived blobs stay OUT of the raw version index (no source_id) — they don't fork the TimeMap
 assert blobstore.latest_version("sess1") == h3, "derived blob does not become a raw version"
 
@@ -230,11 +247,13 @@ try:
 except ValueError:
     pass
 
-# ensure_layout keeps the concepts/ curated layer (read by dream until review writes concept blobs)
-assert (root / "concepts").is_dir(), "concepts/ stays — the human-curated read-only layer"
+# ensure_layout makes ONLY what the blob model uses: blobs/ + tmp/ (concepts are blobs, not a dir;
+# state/ is tap's on-demand cursor home) — a dir nothing reads or writes is a lie in the layout.
+assert not (root / "concepts").exists(), "no fossil dirs — every artifact kind lives in blobs/"
 
 print("OK — ingest dedup, header data, meta-as-truth versioning, crash-orphan repair,")
 print("     derived primitive (content-addressed, lineage-tagged, TTL, out of TimeMap),")
+print("     raw_meta_of single lineage hop (cached, degrades to None; session_of/project_of read off it),")
 print("     byte-faithful \\r round-trip, symmetric raw/derived collision guard,")
 print("     ADR-0007 blobs: event/takeaway versioning by source_id, latest_by_kind isolation,")
 print("     decisions_for/latest_decision by target+verb+stage, decision uniqueness")

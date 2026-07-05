@@ -330,52 +330,57 @@ def validate_span(data: bytes, byte_start, byte_end) -> tuple[int, int] | None:
     return byte_start, byte_end
 
 
-def session_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> str | None:
-    """The originating session id for a cleaned blob via content-addressed lineage: cleaned blob →
-    `derived_from` (raw) → its `source_id`. An optional `cache` dict memoizes across calls. Absent or
-    broken meta → None, never fatal. Single-sourced here (both dream and review walk this lineage)."""
+def raw_meta_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> dict | None:
+    """The RAW blob's meta behind a cleaned blob — THE content-addressed lineage hop (cleaned blob →
+    `derived_from` → raw meta), single-sourced. Every lineage read is a field off this one dict: the
+    session id (`source_id`, `session_of`), the source handle (`origin_ref.project`/`.path`,
+    `project_of`), the two clock stamps (`fetched_at` + `origin_ref.mtime`, glean's stamp fill), the
+    repo facet (`origin_ref` → `concepts._repo_label`, subject) — so the hop and its degrade policy
+    live in exactly one spelling. An optional `cache` (keyed by cleaned_hash, holding the meta dict
+    or None) memoizes across calls; sharing ONE cache across different field reads pays the hop once
+    per cleaned blob. Absent/broken meta anywhere along the hop → None, never fatal — a lineage read
+    degrades (the item just resolves to "unknown"), it must not crash the caller."""
     root = root or config.data_root()
     if cache is not None and cleaned_hash in cache:
         return cache[cleaned_hash]
-    sid = None
+    m = None
     try:
         raw = get_meta(cleaned_hash, root).get("derived_from")
         if raw:
-            sid = get_meta(raw, root).get("source_id")
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        sid = None
+            m = get_meta(raw, root)
+    except (OSError, json.JSONDecodeError):
+        m = None
     if cache is not None:
-        cache[cleaned_hash] = sid
-    return sid
+        cache[cleaned_hash] = m
+    return m
+
+
+def session_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> str | None:
+    """The originating session id for a cleaned blob: the raw's `source_id`, one field off
+    `raw_meta_of` (the hop itself is the single-sourced thing — this is a field read; both dream and
+    review resolve sessions here). `cache` is `raw_meta_of`'s (meta dicts, shareable with any other
+    lineage read). Absent or broken meta → None, never fatal."""
+    m = raw_meta_of(cleaned_hash, root, cache)
+    return m.get("source_id") if m else None
 
 
 def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None = None) -> str | None:
-    """The originating PROJECT of a cleaned blob, via the SAME content-addressed lineage `session_of`
-    walks: cleaned blob → `derived_from` (raw) → the raw blob's `origin_ref.project` (the datastore
-    project-dir name `tap.read_origin` stamped). The one hop `concepts._cleaned_facets` already uses for
-    its `repo` facet, single-sourced here so dream/glean/review share one spelling for the `--source`
-    operator filter (ADR-0022). An optional `cache` memoizes across calls; absent/broken meta → None
-    (never fatal — a `--source` run then simply doesn't match that item). One meta hop per call, no
-    content read, no LLM.
+    """The originating SOURCE HANDLE of a cleaned blob: the raw's `origin_ref.project` (the datastore
+    project-dir name `tap.read_origin` stamped), one field off `raw_meta_of` — the hop itself is the
+    single-sourced thing, so dream/glean/review share one spelling for the `--source` operator filter
+    (ADR-0022). `cache` is `raw_meta_of`'s (meta dicts, shareable with any other lineage read);
+    absent/broken meta → None (never fatal — a `--source` run then simply doesn't match that item).
+    One meta hop per call, no content read, no LLM.
 
     A DOCUMENT source (ADR-0031) carries no `project` — deliberately, because `origin_ref.project`
     also feeds the repo facet (`concepts._repo_label`) and a document must stay subject-empty — so
     its FOCUS handle falls back to `origin_ref.path`: `--source CLAUDE.md` selects the document's
     chunks/events without ever granting it a repo identity."""
-    root = root or config.data_root()
-    if cache is not None and cleaned_hash in cache:
-        return cache[cleaned_hash]
-    proj = None
-    try:
-        raw = get_meta(cleaned_hash, root).get("derived_from")
-        if raw:
-            origin = get_meta(raw, root).get("origin_ref") or {}
-            proj = origin.get("project") or origin.get("path")
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        proj = None
-    if cache is not None:
-        cache[cleaned_hash] = proj
-    return proj
+    m = raw_meta_of(cleaned_hash, root, cache)
+    if not m:
+        return None
+    origin = m.get("origin_ref") or {}
+    return origin.get("project") or origin.get("path")
 
 
 def ingest(
