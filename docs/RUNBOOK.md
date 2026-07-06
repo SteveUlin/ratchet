@@ -123,6 +123,7 @@ Your existing `~/.claude/CLAUDE.md` is knowledge ratchet can't see: the novelty 
 
 ```
 ratchet tap --file ~/.claude/CLAUDE.md      # cursor applies: re-taps of an unchanged file no-op
+ratchet tap --url https://example.com/guide # fetched page (ADR-0033): extracted text, url-as-session; unchanged page no-ops
 ratchet weave --all                         # documents ride the normal prep sweep ($0, idempotent)
 ratchet chunk --all
 ratchet glean --all --source CLAUDE.md --max-usd 1  # document prompt: each rule → one event
@@ -136,7 +137,7 @@ ratchet review --incubating --source CLAUDE.md --limit 0   # every rule-claim, w
 ratchet review --accept <claim> --assessment "hand-written rule, seeded from CLAUDE.md"
 ```
 
-Kinds and scopes propose as usual (a document claim derives `global`). From then on the rules live like any concept: a re-learned rule judges `known`, a lived contradiction lands a real contradicts edge, an unlived rule decays toward "re-confirm or retire?". An **edited** rule seeds a fresh claim on the next tap. This is also the pilot for fetched sources (PDFs, webpages) — same mechanism, plus a fetcher.
+Kinds and scopes propose as usual (a document claim derives `global`). From then on the rules live like any concept: a re-learned rule judges `known`, a lived contradiction lands a real contradicts edge, an unlived rule decays toward "re-confirm or retire?". An **edited** rule seeds a fresh claim on the next tap. Webpages ride the same mechanism via `--url` (ADR-0033); PDFs are still to come.
 
 ## Cadence
 

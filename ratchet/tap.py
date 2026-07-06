@@ -17,10 +17,15 @@ re-ingest of identical bytes. The per-session processed marker is written for Re
 it is cosmetic (the cursor already skipped). cost is always 0 (no LLM) — `--max-usd` is inert.
 
 DOCUMENT MODE (`--file PATH`, ADR-0031): ingest an explicit file — the owner's hand-written
-CLAUDE.md today, a fetched PDF/webpage dump tomorrow — VERBATIM as a `document` raw blob. The
-file's absolute path is its `source_id` AND its session identity (see `read_document`); the same
-fingerprint cursor and version fold apply, so a re-tap of an unchanged file no-ops and a changed
-file mints a new VERSION of the same source.
+CLAUDE.md — VERBATIM as a `document` raw blob. The file's absolute path is its `source_id` AND its
+session identity (see `read_document`); the same fingerprint cursor and version fold apply, so a
+re-tap of an unchanged file no-ops and a changed file mints a new VERSION of the same source.
+
+URL MODE (`--url URL`, ADR-0033): `--file` one level up — fetch a page (`fetch.fetch_url`,
+injectable as `TapBlock(fetcher=…)` for tests) and ingest its EXTRACTED TEXT as the same
+`document` shape. The URL is its `source_id` AND its session; the extraction — not the raw HTML —
+is what gets fingerprinted, so a page whose ads/timestamps churn but whose prose is unchanged
+re-taps as a no-op, and a changed page mints a new version (the edited-file rule, inherited).
 """
 from __future__ import annotations
 
@@ -31,9 +36,9 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-from . import blobstore, block, config
+from . import blobstore, block, config, fetch
 
 DEFAULT_DATASTORE = Path.home() / ".claude" / "projects"
 OUT_NOUN = "raw"   # the per-item output noun the Progress bar/line shows (tap copies raw transcript blobs)
@@ -235,7 +240,8 @@ class TapBlock:
     def __init__(self, datastore: Path = DEFAULT_DATASTORE, project: str | None = None,
                  last: int | None = None, since: str | None = None,
                  exclude: tuple[str, ...] = (), skip_self: Path | None = None,
-                 files: tuple[Path, ...] = ()) -> None:
+                 files: tuple[Path, ...] = (), urls: tuple[str, ...] = (),
+                 fetcher: Callable[[str], tuple[str, dict]] | None = None) -> None:
         # datastore/project/last/since scope the enumeration (tap-specific FETCH SELECTION, not block.run
         # knobs — selection is per-source, owned by the fetcher; ADR-0022). `--last`/`--since` SELECT which
         # to-ingest candidates exist; the driver's `--limit` caps how many are EXAMINED — distinct levers,
@@ -252,9 +258,17 @@ class TapBlock:
         # explicit list. Normalized to absolute, resolved paths at construction because the path IS the
         # source/session identity — `~/x` and `/home/…/x` must be ONE session, not two.
         self.files = tuple(Path(f).expanduser().resolve() for f in files)
+        # URL MODE (--url, ADR-0033): fetched pages, same explicit-list posture. URLs are kept VERBATIM
+        # (no normalization): the operator's string is the source/session identity, and a normalizer
+        # would silently decide aliasing questions (`…/page` vs `…/page/` vs `…#section`) that belong
+        # to the operator. `fetcher` is the test seam — the narrowest one (a callable, like `datastore`
+        # is for the sweep), so tests inject a fake without patching modules.
+        self.urls = tuple(urls)
+        self.fetcher = fetcher or fetch.fetch_url
         self._state: dict[str, list] = {}
         self._latest: dict[str, tuple[str, str]] = {}
         self._dirty = False
+        self._url_stamp = config.now()   # per-enumeration freshness discriminator; see key()
 
     def items(self, root: Path, *, source_id: str | None = None) -> Iterator[tuple[Path, list]]:
         """Yield (path, fingerprint) for each transcript file to ingest. The cheap (size, mtime)
@@ -266,14 +280,20 @@ class TapBlock:
         A file that fails to stat is yielded with an empty fingerprint so process() raises on the read
         and the driver isolates it as errored — never silently dropped.
 
-        DOCUMENT MODE (`files` set): the explicit list IS the selection, so the sweep's selectors
-        (project/last/since/skip_self) don't apply — only the cursor cheap tier does, identically.
-        --source-id matches the full path (the document's session id), not a stem."""
+        DOCUMENT/URL MODE (`files`/`urls` set): the explicit list IS the selection, so the sweep's
+        selectors (project/last/since/skip_self) don't apply — for files only the cursor cheap tier
+        does, identically. --source-id matches the full path / URL (the document's session id), not
+        a stem. A URL has NO cheap tier: there is nothing to stat — whether a page changed is
+        knowable only by asking the server, so every run yields it (dry-run excepted: the driver
+        never calls process, so no fetch happens); the store-side no-op still holds because
+        process() ingests the EXTRACTED text and identical extractions content-address to the same
+        blob. Conditional GET on a stored ETag would be the real cheap tier — deferred (ADR-0033)."""
         _sweep_partials(root)                       # disk hygiene at run start (leaked .partial temps)
         self._state = load_fetch_state(root)
         self._latest = blobstore.latest_index(root)  # source_id -> (fetched_at, hash); current in-run
         self._dirty = False
-        if self.files:
+        self._url_stamp = config.now()               # fresh per enumeration — see key()
+        if self.files or self.urls:
             for path in self.files:
                 if source_id is not None and str(path) != source_id:
                     continue
@@ -287,6 +307,10 @@ class TapBlock:
                 if prior is not None and prior[:2] == fp:
                     continue  # cheap tier: (size, mtime) unchanged since last tap — never examined
                 yield (path, fp)
+            for url in self.urls:
+                if source_id is not None and url != source_id:
+                    continue
+                yield (url, [])                     # no pre-fetch fingerprint exists (see docstring)
             return
         since_dt = _parse_since(self.since) if self.since else None
         # FETCH SELECTION (`--last`/`--since`, ADR-0022) narrows the SURVIVORS of the cursor skip — "the
@@ -332,8 +356,18 @@ class TapBlock:
         (no read), so the done-skip stays cheap and the read stays in process() for error isolation.
 
         A DOCUMENT's key carries the FULL path (its session id) — the stem would collide every
-        repo's `CLAUDE.md` into one done-target."""
+        repo's `CLAUDE.md` into one done-target.
+
+        A URL's key carries a PER-RUN stamp instead of a fingerprint: a remote page is never
+        "done" — whether it changed is knowable only by fetching, and a stable key would let the
+        driver's done-skip retire the URL after its first ingest, silently dropping every later
+        page change. The stamp makes each run's key fresh, so every run asks the server; within
+        one run a duplicated `--url` still skips (same stamp, same key). The processed marker
+        stays Report cosmetics, exactly as for files — the content address of the extracted text
+        is the real dedup."""
         path, fp = item
+        if isinstance(path, str):
+            return f"{path}:{self._url_stamp}"
         sid = str(path) if self.files else path.stem
         return f"{sid}:{fp[0]}:{fp[1]}" if fp else sid
 
@@ -343,8 +377,11 @@ class TapBlock:
         read (unreadable file, or a non-UTF-8 document) propagates → the driver isolates it as
         errored, no marker, the file is retried next run. Document mode differs only in the reader
         (`read_document`: verbatim, path-as-session) and the raw blob's `source_kind`; the cursor,
-        version fold (`prev`), and content-address dedup are shared."""
+        version fold (`prev`), and content-address dedup are shared. A URL item takes
+        `_process_url` (fetch → extract → the same document ingest)."""
         path, _fp = item
+        if isinstance(path, str):
+            return self._process_url(path, root=root)
         if self.files:
             text, origin = read_document(path)
             source_kind = "document"
@@ -368,6 +405,53 @@ class TapBlock:
         blobstore.ingest(text, source_kind=source_kind, source_id=sid, origin_ref=origin,
                          fetched_at=fetched_at, prev=prev, h=h, root=root)
         self._latest[sid] = (fetched_at, h)
+        return (1, 0.0)
+
+    def _process_url(self, url: str, *, root: Path) -> tuple[int, float]:
+        """Fetch → extract → ingest the EXTRACTED text as a `document` raw blob (ADR-0033). The
+        stored artifact is the extraction, NOT the raw HTML — deliberate: raw pages churn on every
+        fetch (ad slots, nonces, timestamps), so fingerprinting the raw bytes would mint a new
+        "version" per fetch; fingerprinting the extracted text makes an unchanged page a store-level
+        no-op no matter how the markup churns. The owned cost (ADR-0033): the raw HTML is not kept,
+        so a future extractor cannot re-run over past fetches (contrast weave, which re-renders from
+        the raw). A raising fetch (network, non-text type, over-cap) propagates → the driver
+        isolates the item as errored — a message, never a traceback — and the URL retries next run.
+
+        SESSION IDENTITY: `read_document`'s path-as-session epistemology, inherited whole — the URL
+        is the session, all versions of one page are ONE session, so a page asserts its rules once
+        and can never self-mature by re-fetches; only lived sessions or a human accept mature them.
+        No `project`/`cwd` (subject stays empty, scope derives global); the `--source` FOCUS handle
+        is the `origin_ref.url` fallback in `blobstore.project_of`."""
+        text, meta = self.fetcher(url)
+        h = blobstore.blob_hash(text)
+        fetched_at = meta.get("fetched_at") or config.now()
+        # the cursor entry mirrors the file shape ([size, stamp, hash]): no cheap tier reads it today
+        # (a URL cannot be stat'ed — see items()), but it is the last-seen audit record ("when did I
+        # last fetch this, what did it extract to") and the slot a future conditional-GET validator
+        # (ETag / Last-Modified) would ride.
+        size = len(text.encode("utf-8"))
+        self._state[url] = [size, fetched_at, h]
+        self._dirty = True
+        if blobstore.has(h, root):
+            return (0, 0.0)  # unchanged page (extraction-identical) — raw-HTML churn mints nothing
+        origin = {
+            "url": url,
+            "final_url": meta.get("final_url") or url,   # where redirects landed — audit, not identity
+            "session_id": url,   # url-as-session: one page = one session, forever (see docstring)
+            "content_type": meta.get("content_type"),
+            "http_status": meta.get("http_status"),
+            "fetched_at": fetched_at,
+            # `mtime` is THE slot every document session's valid-time is read from
+            # (temporal.session_valid_times). For a fetched page the fetch instant is the honest
+            # analogue of a file's save time — when this content was last OBSERVED. The server's
+            # Last-Modified would claim authorship time, but servers omit or fake it; don't pretend.
+            "mtime": fetched_at,
+            "size_bytes": size,
+        }
+        prev = self._latest.get(url, ("", None))[1]
+        blobstore.ingest(text, source_kind="document", source_id=url, origin_ref=origin,
+                         fetched_at=fetched_at, prev=prev, h=h, root=root)
+        self._latest[url] = (fetched_at, h)
         return (1, 0.0)
 
     def finalize(self, *, root: Path, run_id: str) -> None:
@@ -404,9 +488,15 @@ def main(argv=None) -> None:
                          "session — all versions of one file are ONE session, so a document can never "
                          "self-mature by re-taps (ADR-0031). Replaces the datastore sweep; the same "
                          "cursor makes re-taps of an unchanged file no-ops")
+    ap.add_argument("--url", action="append", default=[], metavar="URL",
+                    help="URL MODE: fetch this page and ingest its EXTRACTED text as a `document` "
+                         "source (repeatable; ADR-0033) — --file one level up. The URL is its source "
+                         "id AND its session (same never-self-maturing epistemology); an unchanged "
+                         "page re-taps as a no-op even when its raw HTML churns, a changed page is a "
+                         "new prev-linked version. Non-text content (PDF) is refused for now")
     # uniform block surface (per ADR-0009):
     ap.add_argument("--source-id", help="ingest just this session (path.stem == session id; "
-                                        "with --file: the full path)")
+                                        "with --file/--url: the full path / the URL)")
     ap.add_argument("--all", action="store_true",
                     help="sweep the whole datastore (default when no --source-id)")
     ap.add_argument("--limit", type=int, help="cap items EXAMINED this run")
@@ -422,20 +512,21 @@ def main(argv=None) -> None:
             _parse_since(args.since)
         except ValueError:
             ap.error(f"--since {args.since!r} is not an ISO date/datetime (e.g. 2026-06-01)")
-    if args.file:
-        # the datastore-sweep selectors would be silently inert alongside an explicit file list —
+    if args.file or args.url:
+        # the datastore-sweep selectors would be silently inert alongside an explicit source list —
         # refuse the combination rather than hide the rule (the ADR-0027 posture).
         for flag, val in (("--project", args.project), ("--last", args.last),
                           ("--since", args.since), ("--exclude", args.exclude or None)):
             if val is not None:
-                ap.error(f"{flag} selects datastore transcripts; --file names its files explicitly "
-                         f"— the two don't compose (run them as separate taps)")
+                ap.error(f"{flag} selects datastore transcripts; --file/--url name their sources "
+                         f"explicitly — the two don't compose (run them as separate taps)")
 
     # By default skip the project dir ratchet's OWN completer runs land in (cwd=data_root) so tap never
     # re-ingests its generated `claude -p` transcripts; `--include-self` lifts it. (ADR-0025)
     skip_self = None if args.include_self else config.data_root()
     blk = TapBlock(datastore=args.datastore, project=args.project, last=args.last, since=args.since,
-                   exclude=tuple(args.exclude), skip_self=skip_self, files=tuple(args.file))
+                   exclude=tuple(args.exclude), skip_self=skip_self, files=tuple(args.file),
+                   urls=tuple(args.url))
     # the stage owns its Progress now (the driver only speaks the protocol). None for --quiet/--dry-run;
     # else built from this stage's args + OUT_NOUN. tap has params=() and no LLM cost (cap omitted).
     progress = None if (args.quiet or args.dry_run) else block.Progress(

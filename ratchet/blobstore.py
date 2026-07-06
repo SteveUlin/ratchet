@@ -375,12 +375,13 @@ def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     A DOCUMENT source (ADR-0031) carries no `project` — deliberately, because `origin_ref.project`
     also feeds the repo facet (`concepts.repo_label`) and a document must stay subject-empty — so
     its FOCUS handle falls back to `origin_ref.path`: `--source CLAUDE.md` selects the document's
-    chunks/events without ever granting it a repo identity."""
+    chunks/events without ever granting it a repo identity. A URL document (ADR-0033) has no path
+    either; its handle is `origin_ref.url` — same seed-only posture, same fallback chain."""
     m = raw_meta_of(cleaned_hash, root, cache)
     if not m:
         return None
     origin = m.get("origin_ref") or {}
-    return origin.get("project") or origin.get("path")
+    return origin.get("project") or origin.get("path") or origin.get("url")
 
 
 def ingest(
