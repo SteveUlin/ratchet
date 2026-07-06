@@ -139,6 +139,26 @@ ratchet review --accept <claim> --assessment "hand-written rule, seeded from CLA
 
 Kinds and scopes propose as usual (a document claim derives `global`). From then on the rules live like any concept: a re-learned rule judges `known`, a lived contradiction lands a real contradicts edge, an unlived rule decays toward "re-confirm or retire?". An **edited** rule seeds a fresh claim on the next tap. Webpages ride the same mechanism via `--url` (ADR-0033); PDFs are still to come.
 
+## Pull — one command (ADR-0034)
+
+Tapping the projects dir, then each `--file`, then each `--url`, one command at a time, is the same sweep every session. Register your standing sources once and let `pull` do all of it — `$0` unless you ask for spend, no daemon.
+
+```
+ratchet sources --add-file ~/.claude/CLAUDE.md    # a document file (ADR-0031)
+ratchet sources --add-url https://example.com/guide   # a page — re-fetched every pull (ADR-0033)
+ratchet sources --add-feed https://www.anthropic.com/rss.xml   # an RSS/Atom feed — new posts only
+ratchet sources --list                            # the whole plan (implicit projects + what you registered)
+ratchet sources --remove <path-or-url>            # drop one (duplicates are refused loudly, ADR-0027)
+```
+
+```
+ratchet pull            # tap projects + files + urls + feed-new-entries, then weave --all + chunk --all ($0)
+ratchet pull --max-usd 2   # ...and a budgeted glean tick after prep — the ONLY spend pull ever makes
+ratchet pull --dry-run     # list what would be swept, per source; no network, no writes
+```
+
+The registry (`state/sources.json`) is **yours** — hand-editable config, not derived truth (contrast tap's rebuildable fetch cursor beside it). Two source cadences, on purpose: a **`url`** is a page you re-ask every pull (unchanged → a store no-op, the extract-then-fingerprint cursor), a **`feed`** is a stream whose NEW entries (by RSS `guid`/Atom `id`) are tapped **once** — a per-feed seen cursor (`feed_state.json`, rebuildable) gates them, so re-pulling a settled archive fetches nothing. A dead feed logs, marks itself failed in the summary, and never aborts the sweep; a dead entry URL is isolated per-item and retried next pull. `pull` reuses each stage's own Block + driver (ADR-0009) — it adds no new pipeline logic, so every guarantee is one a tested stage already makes. It stops at prep: `resolve`/`synthesize`/`review` carry judgment or real wall-clock and stay separate hand-runs.
+
 ## Cadence
 
 Documentation, not a typed API (design doc §8): what each stage watches and how often a hand-run is safe. When a scheduler is ever warranted, it reads this table; until then you run stages explicitly.
@@ -146,7 +166,8 @@ Documentation, not a typed API (design doc §8): what each stage watches and how
 | Group | Stage | When | Cost |
 |---|---|---|---|
 | — | `status` | first, every session | $0 |
-| INGEST | `tap` / `weave` / `chunk` | on new transcripts | $0 |
+| — | `pull` | catch-up: sweep every registered source + `weave`/`chunk` prep, one command (ADR-0034) | $0 (Haiku only if `--max-usd`) |
+| INGEST | `tap` / `weave` / `chunk` | on new transcripts (or targeted, e.g. `tap --last 200`) | $0 |
 | | `glean` (+ sig stamps) | with ingest | Haiku |
 | REFINE | **`resolve`** | **often** — any sitting | $0 rejection + capped Haiku residue; trends toward one call per event as the pool grows — wall-clock, not dollars, is the cost; keep `--max-usd` small |
 | | **`synthesize`** | rare — matured claims / review demand | Sonnet |

@@ -26,6 +26,8 @@
             ''}";
           };
         in {
+          pull = block "pull";    # sweep:     tap every registered source + $0 prep, one command (ADR-0034)
+          sources = block "sources"; # registry:  manage the file/url/feed sources pull sweeps (ADR-0034)
           tap = block "tap";      # fetch:     datastore → raw blob
           weave = block "weave";  # render:    raw blob → cleaned blob
           chunk = block "chunk";  # window:    cleaned blob → chunkset
