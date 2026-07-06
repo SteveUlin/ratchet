@@ -6,6 +6,19 @@ Python. There is no unifying service: you run each stage by hand as a **bounded,
 tick** — `--limit`/`--max-usd` cap the work, re-running never repeats what's done, and the
 backlog waits with the most valuable work rising first.
 
+## Prerequisites
+
+- **Python ≥3.10** — the floor `X | None` union syntax (PEP 604) sets; no `match`/`case`
+  anywhere in the tree, so nothing pushes it higher.
+- **The `claude` CLI, installed and authenticated.** The pipeline's one LLM seam
+  (`completer.py`) shells out to `claude -p`; `glean`, `resolve`'s residue calls, `synthesize`,
+  and `garden`'s proposals need it. `tap`, `weave`, `chunk`, `review`, `generate`, and `status`
+  run at $0, no CLI required.
+- **Transcripts under `~/.claude/projects`** — `tap`'s default source; `--datastore` points it
+  at another root.
+- **Nix is optional.** Every stage runs either way: `nix run .#<stage> -- <args>` or, from the
+  repo root, `python -m ratchet.<stage> <args>`.
+
 ## Pipeline
 
 Two human gates:
@@ -65,10 +78,17 @@ blobs, never a stored list that could desync.
   LLM seam), `sig` + `subject` (the resolver's deterministic identity math: statement
   signatures, repo+files scope keys), `concepts` (the rebuildable concept-graph view —
   ADR-0013), and `dream` (superseded — kept for history).
-- `.claude/skills/` — `/ratchet-review` (the human gate's interaction) and `/ratchet-generate`
-  (craft the projection's wording with Claude; every rule stays faithful to its concept).
+- `.claude/skills/` — `/ratchet-review` (the human gate's interaction), `/ratchet-generate`
+  (craft the projection's wording with Claude; every rule stays faithful to its concept), and
+  `/ratchet-research` (turn a research session into an incubating document source, through the
+  same gate as any other claim).
 - `docs/RUNBOOK.md` — the operator loop: order, cadence, budgets, knobs.
 - `docs/decisions/` — dated ADRs. A decision is superseded by a **new** ADR, never edited.
+
+The three skills are the author's own personal sittings, not a fixed API: copy them into your
+own `~/.claude/skills/`, then edit the reviewer's name and the `nix run ~/ratchet#…` paths to
+your clone's location. Every stage above is fully operable from the CLI without them — the
+skills are the ergonomic layer, not a requirement.
 
 ## Run
 
@@ -88,6 +108,29 @@ hand-written rules, every knob. Two read-side instruments ride alongside the pip
 `concepts` renders the derived concept graph and digest (recomputed from blobs, no LLM), and
 `sig` is the measuring CLI that earned the resolver's thresholds (`--band-report`,
 `--sample-pairs`, `--score-gold`; never writes).
+
+## First hour
+
+Day one is quiet by design — expect it, don't read it as broken:
+
+```
+nix run .#tap -- --last 10               # your 10 most recent sessions
+nix run .#weave -- --all                 # $0
+nix run .#chunk -- --all                 # $0
+nix run .#glean -- --all --max-usd 2     # extract events (Haiku)
+nix run .#resolve -- --limit 200         # match or mint claims
+nix run .#status
+nix run .#review -- --pending
+```
+
+On the author's corpus, gleaning runs ≈$0.06/chunk and yields ≈3 events/chunk. But a claim
+matures only once it's corroborated across 2+ distinct, recent sessions, so a fresh store —
+tapped shallow — shows everything still **incubating**: `--pending` comes back empty, and that
+is the design working, not a stall. `nix run .#review -- --incubating` shows exactly what's
+accruing and why it hasn't crossed the bar yet. The first real review sitting typically arrives
+after a few days of ordinary sessions, or a wider `tap --last` — not the first hour.
+
+`docs/RUNBOOK.md` has the full operating loop: cadence, budgets, every knob.
 
 ## Develop
 
