@@ -203,6 +203,8 @@ A freshly reopened backlog is all "stragglers" by cycle count — `--no-forget` 
 | `--source <substring>` | focus by PROVENANCE — the item's source handle contains the substring: a project name for transcripts, a file path for documents (glean / resolve / review; exact key is `--source-id`) |
 | `--dry-run` | show what a stage *would* do, without doing it |
 
+Set in your shell, not per-run: `RATCHET_REVIEWER` names the reviewer recorded in decision provenance (defaults to the login user).
+
 ## A note on old data
 
 Run a months-old **backfill** like any other batch. ratchet weights each piece of evidence by **when the conversation happened**, not when you process it — so old data can *add* lessons that are still true, but it can't re-entrench a stale belief or overturn a current one (recent evidence outweighs old). A learning you've stopped living quietly decays toward a "re-confirm or retire?" flag; one you keep living stays. **Nothing is ever auto-deleted** — staleness and contradiction only *surface* a claim for your review.

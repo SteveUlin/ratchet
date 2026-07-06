@@ -472,7 +472,7 @@ def contested(root: Path | None = None, *, maturity: float = temporal.MATURITY_W
     return out
 
 
-def reject_merge(spec: str, *, reason: str = "", reviewer: str = "sulin",
+def reject_merge(spec: str, *, reason: str = "", reviewer: str | None = None,
                  root: Path | None = None) -> dict:
     """The human "not the same" verdict, parsed and handed to the ONE compound decision writer
     (`resolve.reject_merge`, §2.2 — review-only by policy, ADR-0008). Two spec forms:
@@ -483,6 +483,7 @@ def reject_merge(spec: str, *, reason: str = "", reviewer: str = "sulin",
       a claim PAIR (`A,B`, a dismissed merge suggestion) — pair-block only: no edge exists, nothing
         reopens, the suggestion query simply never asks again."""
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     spec = spec.strip()
     if resolve.EDGE_SEP in spec:
         parts = spec.split(resolve.EDGE_SEP)
@@ -500,7 +501,7 @@ def reject_merge(spec: str, *, reason: str = "", reviewer: str = "sulin",
 
 
 def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, reason: str = "",
-                 reviewer: str = "sulin") -> dict:
+                 reviewer: str | None = None) -> dict:
     """CONFIRM a merge suggestion (§6.5) — dream.merge's evidence-union, restated in v3's edge model:
     under recompute-on-read there is no takeaway version to union, so the merge IS edge re-pointing.
     Every live edge on the loser (corroborates AND contradicts — a contradiction is never silently
@@ -513,6 +514,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
     remainder. A reject-merge'd pair is REFUSED — the standing human verdict says "not the same", and
     decisions are append-only; overturning it is a deliberate new call, not a merge side-effect."""
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     if loser_id == winner_id:
         raise ValueError("merge_claims needs two distinct claims")
     rm = resolve.reject_merge_facts(root)
@@ -807,7 +809,7 @@ def _mint_concept_id(takeaway: dict) -> str:
 
 
 def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = None,
-           assessment: str = "", reviewer: str = "sulin", note: str = "",
+           assessment: str = "", reviewer: str | None = None, note: str = "",
            kind: str | None = None, scope: str | None = None,
            allow_no_evidence: bool = False) -> str:
     """Promote a takeaway to a concept (the loop closes here) and record the accept. The concept stores
@@ -829,6 +831,7 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     re-validates every span. A why-pending claim (why=null) accepts with statement '' unless the
     reviewer edits one in — never withheld waiting on synthesize (§6)."""
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     tk = _claim_view(takeaway_id, root) or _load_takeaway(takeaway_id, root)
     if tk is None:
         raise ValueError(f"no takeaway {takeaway_id!r}")
@@ -873,16 +876,17 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
 
 
 def reject(takeaway_id: str, root: Path | None = None, *, reason: str = "", assessment: str = "",
-           reviewer: str = "sulin") -> None:
+           reviewer: str | None = None) -> None:
     """Reject a takeaway. Persisted as a label (no fine-tuning): a future PROMPT_VERSION bump can fold
     rejections into negative few-shot + suppress semantic near-dupes, fixing the 're-suggests dismissed
     things' trust-killer (MemPrompt)."""
+    reviewer = reviewer or config.reviewer()
     _record("reject", takeaway_id, root or config.data_root(),
             reason=str(reason)[:ASSESSMENT_MAX], assessment=str(assessment)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
 def snooze(takeaway_id: str, root: Path | None = None, *, until: str, reason: str = "",
-           reviewer: str = "sulin") -> None:
+           reviewer: str | None = None) -> None:
     """Defer a takeaway until a concrete time. `until` is VALIDATED as ISO here, at write time — an
     unparseable trigger would otherwise never fire and the snooze would become a permanent graveyard,
     the exact failure mode the trigger exists to prevent. (Re-surfacing on *more evidence* is not a
@@ -893,21 +897,23 @@ def snooze(takeaway_id: str, root: Path | None = None, *, until: str, reason: st
         datetime.fromisoformat(until)
     except (ValueError, TypeError):
         raise ValueError(f"--until {until!r} is not an ISO datetime")
+    reviewer = reviewer or config.reviewer()
     _record("snooze", takeaway_id, root or config.data_root(),
             until=until, reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
-def retire(concept_id: str, root: Path | None = None, *, reason: str = "", reviewer: str = "sulin") -> None:
+def retire(concept_id: str, root: Path | None = None, *, reason: str = "", reviewer: str | None = None) -> None:
     """Take a concept OUT of the valid set (a contradiction the reviewer affirms). Not a deletion — the
     concept blob and its history stay; its latest lifecycle decision being `retire` drops it from
     `load_concepts`/`valid_concepts`. (Re-establishing a retired concept is a future manual action:
     dream stops surfacing it, so a refinement won't normally re-reference it — ADR-0008.)"""
+    reviewer = reviewer or config.reviewer()
     _record("retire", concept_id, root or config.data_root(),
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
 def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: str = "",
-             reviewer: str = "sulin") -> None:
+             reviewer: str | None = None) -> None:
     """Re-KIND an EXISTING concept (ADR-0029) — the reviewer-owned append-only decision `valid_concepts`
     reads FIRST (latest set_kind > the accept's kind > behavioral). This is the backfill path for
     concepts accepted before the typology existed, and the correction path when a kind call ages badly
@@ -917,6 +923,7 @@ def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: st
     decision would become its LATEST lifecycle decision and pull it back into the valid set — re-kinding
     must never double as an accidental un-retire."""
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     if kind not in concepts.CONCEPT_KINDS:
         raise ValueError(f"kind must be one of {concepts.CONCEPT_KINDS}; got {kind!r}")
     if concept_id not in concepts.valid_concept_ids(root):
@@ -927,7 +934,7 @@ def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: st
 
 
 def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: str = "",
-              reviewer: str = "sulin") -> None:
+              reviewer: str | None = None) -> None:
     """Re-SCOPE an EXISTING concept (ADR-0030) — `set_kind`'s twin on the scope axis, the reviewer-
     owned append-only decision `valid_concepts` reads FIRST (latest set_scope > the accept's scope >
     global). The backfill path for concepts accepted before the axis existed, and the correction path
@@ -937,6 +944,7 @@ def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: 
     fresh decision on a retired concept would become its latest lifecycle decision and pull it back
     into the valid set — re-scoping must never double as an accidental un-retire."""
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     if not isinstance(scope, str) or not scope.strip():
         raise ValueError("scope must be a repo label or 'global' — got an empty string")
     if concept_id not in concepts.valid_concept_ids(root):
@@ -947,7 +955,7 @@ def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: 
 
 
 def refresh(concept_id: str, root: Path | None = None, *, edited: dict | None = None,
-            reviewer: str = "sulin", note: str = "") -> dict:
+            reviewer: str | None = None, note: str = "") -> dict:
     """Re-SNAPSHOT a concept's prose from its source claim's LIVE fold — the reviewer's answer to the
     why-pending statement gap. Accept never withholds on synthesize's cadence (§6), so a why-pending
     claim (why=null) mints its concept with statement '' — and when synthesize later fills the claim's
@@ -971,6 +979,7 @@ def refresh(concept_id: str, root: Path | None = None, *, edited: dict | None = 
     keep them lets this one. Returns {concept, concept_hash, before, after}."""
     from . import garden                           # function-local: garden imports review at module load
     root = root or config.data_root()
+    reviewer = reviewer or config.reviewer()
     concept = garden.concept_blob(concept_id, root)
     if concept is None:
         raise ValueError(f"no concept {concept_id!r}")
@@ -1144,7 +1153,7 @@ def _apply_proposal(proposal: dict, *, root: Path, run_id: str, reviewer: str,
 
 
 def accept_proposal(proposal_id: str, root: Path | None = None, *, assessment: str = "",
-                    reviewer: str = "sulin", note: str = "", split_parts: list[dict] | None = None,
+                    reviewer: str | None = None, note: str = "", split_parts: list[dict] | None = None,
                     allow_no_evidence: bool = False) -> dict:
     """Accept a queued structural-op proposal: APPLY the op (its 3c-i `garden` fn) so the concept graph
     reorganizes — a `merge` unions the winner + invalidates the losers, a `retire` drops a concept, etc. —
@@ -1159,6 +1168,7 @@ def accept_proposal(proposal_id: str, root: Path | None = None, *, assessment: s
     proposal = garden.proposal_blob(proposal_id, root)
     if proposal is None:
         raise ValueError(f"no garden proposal {proposal_id!r}")
+    reviewer = reviewer or config.reviewer()
     run_id = config.run_id()
     result = _apply_proposal(proposal, root=root, run_id=run_id, reviewer=reviewer,
                              split_parts=split_parts, allow_no_evidence=allow_no_evidence)
@@ -1169,7 +1179,7 @@ def accept_proposal(proposal_id: str, root: Path | None = None, *, assessment: s
 
 
 def reject_proposal(proposal_id: str, root: Path | None = None, *, reason: str = "",
-                    assessment: str = "", reviewer: str = "sulin") -> dict:
+                    assessment: str = "", reviewer: str | None = None) -> dict:
     """Reject a queued structural-op proposal — RECORD the reject; the op is NOT applied, the concept graph is
     untouched. No status flip: the reject DECISION is the proposal's lifecycle (`garden.open_proposals` drops
     it via `RESOLVE_VERBS`), and `garden.queue_proposal` reads that same decision so a re-gardened cluster never
@@ -1180,6 +1190,7 @@ def reject_proposal(proposal_id: str, root: Path | None = None, *, reason: str =
     proposal = garden.proposal_blob(proposal_id, root)
     if proposal is None:
         raise ValueError(f"no garden proposal {proposal_id!r}")
+    reviewer = reviewer or config.reviewer()
     _record("reject_proposal", proposal_id, root, op=proposal["op"], reviewer=reviewer,
             reason=str(reason)[:ASSESSMENT_MAX], assessment=str(assessment)[:ASSESSMENT_MAX])
     return {"proposal_id": proposal_id, "op": proposal["op"], "status": "rejected"}

@@ -2,6 +2,7 @@
 elsewhere, local-only."""
 from __future__ import annotations
 
+import getpass
 import itertools
 import os
 from datetime import datetime, timezone
@@ -63,6 +64,20 @@ def run_id() -> str:
     the counter to 0). Recorded on every version/decision as provenance (origin_ref.run_id)."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     return f"{ts}-{os.getpid()}-{next(_SEQ):06d}-{os.urandom(2).hex()}"
+
+
+def reviewer() -> str:
+    """The operator a decision blob's provenance names — `$RATCHET_REVIEWER` if set, else the login
+    user. Provenance identifies whoever ACTUALLY makes the call: the env var is the explicit override,
+    the login name the honest default. A hardcoded name would forge every other user's audit trail —
+    stamp their decisions with someone else's identity — so nothing is baked in. Resolved at CALL time,
+    never frozen at import, so the answer tracks the running operator. `getpass.getuser` can raise where
+    no login name resolves (a bare container, an unnamed uid); the last-ditch "reviewer" keeps
+    provenance writable rather than crashing the decision on its identity field."""
+    try:
+        return os.environ.get("RATCHET_REVIEWER") or getpass.getuser()
+    except Exception:
+        return "reviewer"
 
 
 def data_root() -> Path:

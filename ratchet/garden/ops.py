@@ -407,11 +407,12 @@ def reparent(concept_id: str, new_parent_id: str, *, root: Path | None = None,
     assert_edge(new_parent_id, "generalizes", concept_id, root=root, run_id=run_id, op="reparent")
 
 
-def retire(concept_id: str, *, reason: str = "", reviewer: str = "sulin",
+def retire(concept_id: str, *, reason: str = "", reviewer: str | None = None,
            root: Path | None = None) -> None:
     """RETIRE a concept — reuse review.retire (the human-gate verb `load_concepts` already folds out).
     Exposed on the gardener's op surface so all the structural ops share one entry point; the underlying
     decision + invalidate-don't-delete semantics are review's (ADR-0008/0015)."""
+    reviewer = reviewer or config.reviewer()
     review.retire(concept_id, root, reason=reason, reviewer=reviewer)
 
 

@@ -251,10 +251,32 @@ except ValueError:
 # state/ is tap's on-demand cursor home) — a dir nothing reads or writes is a lie in the layout.
 assert not (root / "concepts").exists(), "no fossil dirs — every artifact kind lives in blobs/"
 
+# ── config.reviewer(): decision provenance names the OPERATOR, never a baked-in name ──────────
+# The env var is the explicit override; the login name the honest default. A hardcoded default
+# would forge every other user's audit trail, so resolution runs at CALL time. Assert the override
+# beats the fallback; the fallback mirrors config's OWN or-guard (login, else last-ditch "reviewer")
+# so the check is deterministic under any CI user without depending on getpass succeeding.
+import getpass as _getpass  # noqa: E402
+try:
+    _login = _getpass.getuser()
+except Exception:
+    _login = "reviewer"
+_saved_reviewer = os.environ.pop("RATCHET_REVIEWER", None)
+assert config.reviewer() == _login, "no env → the honest login default (never a baked-in name)"
+os.environ["RATCHET_REVIEWER"] = "ci-operator"
+assert config.reviewer() == "ci-operator", "RATCHET_REVIEWER overrides the login default"
+os.environ["RATCHET_REVIEWER"] = ""
+assert config.reviewer() == _login, "an EMPTY override falls through to login (the or-guard)"
+if _saved_reviewer is None:
+    os.environ.pop("RATCHET_REVIEWER", None)
+else:
+    os.environ["RATCHET_REVIEWER"] = _saved_reviewer
+
 print("OK — ingest dedup, header data, meta-as-truth versioning, crash-orphan repair,")
 print("     derived primitive (content-addressed, lineage-tagged, TTL, out of TimeMap),")
 print("     raw_meta_of single lineage hop (cached, degrades to None; session_of/project_of read off it),")
 print("     byte-faithful \\r round-trip, symmetric raw/derived collision guard,")
 print("     ADR-0007 blobs: event/takeaway versioning by source_id, latest_by_kind isolation,")
-print("     decisions_for/latest_decision by target+verb+stage, decision uniqueness")
+print("     decisions_for/latest_decision by target+verb+stage, decision uniqueness,")
+print("     config.reviewer(): RATCHET_REVIEWER override beats the login-name default")
 print("data dir:", root)

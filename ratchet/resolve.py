@@ -266,7 +266,7 @@ def retract_edge(event_id: str, verb: str, claim_id: str, *, root: Path | None =
 
 def reject_merge(event_id: str | None = None, *, edge: str | None = None,
                  pair: list[str] | None = None,
-                 reason: str = "", reviewer: str = "sulin", root: Path | None = None,
+                 reason: str = "", reviewer: str | None = None, root: Path | None = None,
                  run_id: str | None = None) -> dict:
     """The ONE compound human "not the same" verdict (§2.2) — a single append-only decision blob,
     verb `reject-merge`, TARGET = the event (so `events.working_set`'s latest-decision fold reopens it
@@ -282,6 +282,7 @@ def reject_merge(event_id: str | None = None, *, edge: str | None = None,
     it (the suggestion query stops asking, resolve never pairs them)."""
     if not edge and not pair:
         raise ValueError("reject_merge needs an edge id and/or a pair to block")
+    reviewer = reviewer or config.reviewer()
     if event_id is None and edge:
         parts = edge.split(EDGE_SEP)
         event_id = parts[0] if len(parts) == 3 else None
