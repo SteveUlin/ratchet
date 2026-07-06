@@ -47,7 +47,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from . import concepts, config, dream
+from . import concepts, config, review
 
 # The region delimiters. generate owns ONLY the span between them; the START marker self-documents that
 # the region is machine-managed so a human who opens the file knows their edits inside it are transient.
@@ -81,7 +81,7 @@ GENERAL_GROUP = "general"
 # (a mechanism/fact you'd look up) is just as true and stays in the concept layer, kept + queryable,
 # but projecting it would spend rule-attention on lookup material. `--kinds` widens deliberately; the
 # region's header comment states the filter, so a CLAUDE.md reader knows what is (not) shown.
-DEFAULT_KINDS = (dream.KIND_BEHAVIORAL,)
+DEFAULT_KINDS = (concepts.KIND_BEHAVIORAL,)
 
 
 def _normalize_kinds(kinds) -> tuple[str, ...]:
@@ -91,11 +91,11 @@ def _normalize_kinds(kinds) -> tuple[str, ...]:
     `--kinds reference,behavioral` and `--kinds behavioral,reference` render byte-identically
     (idempotent `--apply`)."""
     picked = set(kinds)
-    unknown = picked - set(dream.CONCEPT_KINDS)
+    unknown = picked - set(concepts.CONCEPT_KINDS)
     if unknown or not picked:
-        raise ValueError(f"--kinds takes a non-empty subset of {','.join(dream.CONCEPT_KINDS)}; "
+        raise ValueError(f"--kinds takes a non-empty subset of {','.join(concepts.CONCEPT_KINDS)}; "
                          f"got {','.join(sorted(picked)) or '(nothing)'!r}")
-    return tuple(k for k in dream.CONCEPT_KINDS if k in picked)
+    return tuple(k for k in concepts.CONCEPT_KINDS if k in picked)
 
 
 def _kinds_note(kinds: tuple[str, ...], excluded: Counter) -> str:
@@ -105,7 +105,7 @@ def _kinds_note(kinds: tuple[str, ...], excluded: Counter) -> str:
     shown = ", ".join(kinds)
     if not excluded:
         return f"<!-- kinds: {shown} -->"
-    ex = " · ".join(f"{excluded[k]} {k}" for k in dream.CONCEPT_KINDS if excluded.get(k))
+    ex = " · ".join(f"{excluded[k]} {k}" for k in concepts.CONCEPT_KINDS if excluded.get(k))
     return (f"<!-- kinds: {shown} — {ex} concept(s) excluded: lookup material, not conduct "
             f"(`--reference` renders them as a lookup sheet; `--kinds` widens) -->")
 
@@ -130,7 +130,7 @@ def _scopes_present(scope_by_id: dict[str, str]) -> str:
     """The helpful listing a refused `--repo` gets: every scope the valid set actually carries, with
     counts — so the operator sees what to type instead of guessing (ADR-0027)."""
     counts = Counter(scope_by_id.values())
-    order = sorted(counts, key=lambda s: (s != dream.SCOPE_GLOBAL, s))   # global first, then names
+    order = sorted(counts, key=lambda s: (s != concepts.SCOPE_GLOBAL, s))   # global first, then names
     return ", ".join(f"{s}×{counts[s]}" for s in order) or "(no valid concepts)"
 
 
@@ -140,9 +140,9 @@ def _scope_note(scope: str, excluded: Counter) -> str:
     exist without seeing them, and a repo's region names itself. Deterministic like `_kinds_note`."""
     if not excluded:
         return f"<!-- scope: {scope} -->"
-    order = sorted(excluded, key=lambda s: (s != dream.SCOPE_GLOBAL, s))
+    order = sorted(excluded, key=lambda s: (s != concepts.SCOPE_GLOBAL, s))
     ex = " · ".join(f"{s}×{excluded[s]}" for s in order)
-    if scope == dream.SCOPE_GLOBAL:
+    if scope == concepts.SCOPE_GLOBAL:
         return (f"<!-- scope: global — {sum(excluded.values())} concept(s) scoped to a repo ({ex}): "
                 f"repo-local lessons; `--repo <name>` projects them into that repo's CLAUDE.md -->")
     return (f"<!-- scope: {scope} — this repo's view; {sum(excluded.values())} concept(s) "
@@ -217,7 +217,7 @@ def _render_body(ctx: dict) -> str:
 
 
 def project(root: Path | None = None, *, kinds: tuple[str, ...] = DEFAULT_KINDS,
-            scope: str = dream.SCOPE_GLOBAL) -> str:
+            scope: str = concepts.SCOPE_GLOBAL) -> str:
     """The MECHANICAL projection — the full marked region (START + kinds note + scope note + tag-led
     rule body + END) for the current VALID concept set of the selected `kinds` (behavioral-only by
     default — see DEFAULT_KINDS) and `scope` (global by default — see the scope-filter note above;
@@ -231,13 +231,13 @@ def project(root: Path | None = None, *, kinds: tuple[str, ...] = DEFAULT_KINDS,
     kinds = _normalize_kinds(kinds)
     scope = _normalize_scope(scope)
     ctx = concepts.digest_context(root or config.data_root())
-    # each node's derived kind/scope rides ctx["blobs"] (dream.load_concepts attaches them); a node
+    # each node's derived kind/scope rides ctx["blobs"] (`load_concepts` attaches them); a node
     # whose blob is gone reads behavioral/global — the recall-safe defaults (rendered, caught at the
     # diff gate). SCOPE filters first (where does it apply), kinds second (does it shape conduct),
     # so each note counts exactly its own exclusions — the two partition the drop.
-    kind_of = {cid: dream.clean_kind(ctx["blobs"].get(cid, {}).get("kind")) for cid in ctx["by_node"]}
-    scope_of = {cid: dream.clean_scope(ctx["blobs"].get(cid, {}).get("scope")) for cid in ctx["by_node"]}
-    if scope != dream.SCOPE_GLOBAL and scope not in scope_of.values():
+    kind_of = {cid: concepts.clean_kind(ctx["blobs"].get(cid, {}).get("kind")) for cid in ctx["by_node"]}
+    scope_of = {cid: concepts.clean_scope(ctx["blobs"].get(cid, {}).get("scope")) for cid in ctx["by_node"]}
+    if scope != concepts.SCOPE_GLOBAL and scope not in scope_of.values():
         raise ValueError(f"--repo {scope!r} matches no concept's scope — scopes present: "
                          f"{_scopes_present(scope_of)}")
     scope_excluded = Counter(s for s in scope_of.values() if s != scope)
@@ -260,24 +260,24 @@ def project_reference(root: Path | None = None) -> str:
     both texts are the reviewer's verbatim words, NO LLM. Same determinism (entrenchment desc, then
     id, within a group → byte-identical re-render → idempotent `--apply`), same retraction-for-free
     (a retired or re-kinded-behavioral concept simply stops appearing). A blob-less node reads
-    `behavioral` (dream's recall-first coercion) and lands in the RULES region, not here — the two
+    `behavioral` (clean_kind's recall-first coercion) and lands in the RULES region, not here — the two
     projections partition the valid set the same way status counts it."""
     ctx = concepts.digest_context(root or config.data_root())
     by_node, blobs = ctx["by_node"], ctx["blobs"]
     refs = [cid for cid in by_node
-            if dream.clean_kind(blobs.get(cid, {}).get("kind")) == dream.KIND_REFERENCE]
+            if concepts.clean_kind(blobs.get(cid, {}).get("kind")) == concepts.KIND_REFERENCE]
     if not refs:
         return f"{START}\n{REFERENCE_NOTE}\n{EMPTY_REFERENCE_BODY}\n{END}"
 
     groups: dict[str, list[str]] = {}
     for cid in refs:
-        groups.setdefault(dream.clean_scope(blobs.get(cid, {}).get("scope")), []).append(cid)
+        groups.setdefault(concepts.clean_scope(blobs.get(cid, {}).get("scope")), []).append(cid)
 
     def entrench(cid: str) -> int:
         return len(by_node[cid]["facets"].get("sessions") or ())
 
     lines: list[str] = []
-    for scope in sorted(groups, key=lambda s: (s != dream.SCOPE_GLOBAL, s)):   # global first
+    for scope in sorted(groups, key=lambda s: (s != concepts.SCOPE_GLOBAL, s)):   # global first
         if lines:
             lines.append("")
         lines.append(f"## {scope}")
@@ -295,7 +295,7 @@ def project_reference(root: Path | None = None) -> str:
 
 def projected_concepts(root: Path | None = None, *,
                        kinds: tuple[str, ...] = DEFAULT_KINDS,
-                       scope: str = dream.SCOPE_GLOBAL,
+                       scope: str = concepts.SCOPE_GLOBAL,
                        reference: bool = False) -> list[dict]:
     """The FAITHFULNESS context for the projection — each VALID concept (the ones the region renders:
     same `kinds` + `scope` filters as `project`, behavioral ∧ global by default, same unknown-scope
@@ -312,24 +312,23 @@ def projected_concepts(root: Path | None = None, *,
     concepts `project_reference` renders (kind==reference, EVERY scope, so the scope filter and its
     unknown-scope refusal don't participate).
 
-    `review` is imported FUNCTION-LOCALLY — review doesn't import generate (no cycle), but the lazy import
-    matches the convention used for the other cross-module reads and keeps the module's import graph flat."""
-    from . import review                         # function-local: review serves the canonical evidence resolver
+    `review` is a top-level import — no cycle runs back here (nothing imports generate), and a
+    function-local import with no cycle to guard would misreport the module's real dependencies."""
     kinds = _normalize_kinds(kinds)
     scope = _normalize_scope(scope)
     root = root or config.data_root()
     by_node = concepts.digest_context(root)["by_node"]
     valid = sorted(review.valid_concepts(root), key=lambda c: c["id"])
-    scope_of = {c["id"]: dream.clean_scope(c.get("scope")) for c in valid}
-    if not reference and scope != dream.SCOPE_GLOBAL and scope not in scope_of.values():
+    scope_of = {c["id"]: concepts.clean_scope(c.get("scope")) for c in valid}
+    if not reference and scope != concepts.SCOPE_GLOBAL and scope not in scope_of.values():
         raise ValueError(f"--repo {scope!r} matches no concept's scope — scopes present: "
                          f"{_scopes_present(scope_of)}")
     out: list[dict] = []
     for c in valid:
         if reference:
-            if dream.clean_kind(c.get("kind")) != dream.KIND_REFERENCE:
+            if concepts.clean_kind(c.get("kind")) != concepts.KIND_REFERENCE:
                 continue                         # the sheet renders reference only — any scope
-        elif scope_of[c["id"]] != scope or dream.clean_kind(c.get("kind")) not in kinds:
+        elif scope_of[c["id"]] != scope or concepts.clean_kind(c.get("kind")) not in kinds:
             continue                             # the region doesn't render it → nothing to be faithful to
         facets = by_node.get(c["id"], {}).get("facets", {})
         out.append({
@@ -392,7 +391,7 @@ def _proposal(root: Path, target: Path | str | None, kinds: tuple[str, ...], sco
     and silently ignoring the caller's filters would be the hidden reinterpretation ADR-0027
     forbids (the CLI refuses the flag combination earlier, with the operator-facing message)."""
     if reference:
-        if tuple(kinds) != DEFAULT_KINDS or scope != dream.SCOPE_GLOBAL:
+        if tuple(kinds) != DEFAULT_KINDS or scope != concepts.SCOPE_GLOBAL:
             raise ValueError("the reference sheet is its own projection (kind==reference, every "
                              "scope) — kinds/scope don't apply to it")
         return project_reference(root), Path(target) if target is not None else default_reference_target(root)
@@ -401,7 +400,7 @@ def _proposal(root: Path, target: Path | str | None, kinds: tuple[str, ...], sco
 
 
 def apply(root: Path | None = None, *, target: Path | str | None = None,
-          kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = dream.SCOPE_GLOBAL,
+          kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = concepts.SCOPE_GLOBAL,
           reference: bool = False) -> dict:
     """Write the projection into `target`'s marked region (refresh-in-place). Reads the current file (or ""
     when absent), splices in `project(root)` — or `project_reference(root)` into the staged reference.md
@@ -420,7 +419,7 @@ def apply(root: Path | None = None, *, target: Path | str | None = None,
 
 
 def diff(root: Path | None = None, *, target: Path | str | None = None,
-         kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = dream.SCOPE_GLOBAL,
+         kinds: tuple[str, ...] = DEFAULT_KINDS, scope: str = concepts.SCOPE_GLOBAL,
          reference: bool = False) -> str:
     """A unified diff of the PROPOSED region (rules, or the reference sheet when `reference`) vs the
     target's CURRENT one — what `--apply` would change, for
@@ -459,9 +458,9 @@ def main(argv=None) -> None:
                          f"behavioral surface — rules that shape conduct — while a reference fact is "
                          f"lookup material; it stays valid and queryable (review --concepts), and "
                          f"`--reference` projects it into its own lookup sheet. `--kinds "
-                         f"{','.join(dream.CONCEPT_KINDS)}` widens (ADR-0029)")
+                         f"{','.join(concepts.CONCEPT_KINDS)}` widens (ADR-0029)")
     ap.add_argument("--repo", metavar="REPO",
-                    help=f"project ONLY concepts scoped to this repo (default: {dream.SCOPE_GLOBAL} "
+                    help=f"project ONLY concepts scoped to this repo (default: {concepts.SCOPE_GLOBAL} "
                          f"— the global CLAUDE.md gets only what applies everywhere). A repo-scoped "
                          f"concept belongs in that repo's own CLAUDE.md: pair `--repo X` with "
                          f"`--target ~/X/CLAUDE.md`. A repo no concept is scoped to is refused, "
@@ -484,7 +483,7 @@ def main(argv=None) -> None:
                              "contradict it; use them on the rules projection (drop --reference)")
         kinds = (tuple(s.strip() for s in args.kinds.split(",") if s.strip())
                  if args.kinds is not None else DEFAULT_KINDS)
-        scope = args.repo if args.repo is not None else dream.SCOPE_GLOBAL
+        scope = args.repo if args.repo is not None else concepts.SCOPE_GLOBAL
         ref = args.reference
         if args.apply:                  # unmatched --repo, or a --reference flag combo raises —
             res = apply(root, target=target, kinds=kinds, scope=scope, reference=ref)   # surface it

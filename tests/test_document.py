@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-doc-")
 
-from ratchet import blobstore, block, chunk, config, dream, glean, resolve, review, subject, tap, weave  # noqa: E402
+from ratchet import blobstore, block, chunk, concepts, config, glean, resolve, review, subject, tap, temporal, weave  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 config.ensure_layout()
@@ -275,11 +275,11 @@ assert r5a.n_minted >= 1, f"the document rule seeds a claim: {r5a}"
 claim = claim_by_title(SUMMARY)
 assert claim["sessions_seen"] == [sid], "the claim's ONE session is the document's path"
 assert claim["support"] == {"events": 1, "sessions": 1}
-assert claim["scope_repo"] == dream.SCOPE_GLOBAL, "empty subject derives scope=global (never a path-repo)"
-vt = dream._session_valid_times(root)
+assert claim["scope_repo"] == concepts.SCOPE_GLOBAL, "empty subject derives scope=global (never a path-repo)"
+vt = temporal.session_valid_times(root)
 assert vt.get(sid), "the document session is dated by its file mtime (it joins the valid-time map)"
-net1 = dream.net_entrenchment(claim, valid_times=vt)
-assert abs(net1 - 1.0) < 0.05 and net1 < dream.MATURITY_WEIGHT, f"one session ⇒ incubating: {net1}"
+net1 = temporal.net_entrenchment(claim, valid_times=vt)
+assert abs(net1 - 1.0) < 0.05 and net1 < temporal.MATURITY_WEIGHT, f"one session ⇒ incubating: {net1}"
 assert any(r["takeaway_id"] == claim["id"] for r in review.incubating(root)), \
     "the fresh document claim sits in review --incubating (the seeding flow's queue)"
 
@@ -299,11 +299,11 @@ assert rc.calls == 0, "settled deterministically — the LLM was never asked"
 claim = claim_by_title(SUMMARY)
 assert claim["support"]["events"] == 2 and claim["support"]["sessions"] == 1, \
     "a re-tap adds an event but NO session (path-as-session)"
-det_edges = [e for e in resolve._live_edges(root, resolve._reject_merge_facts(root))[claim["id"]]
+det_edges = [e for e in resolve.live_edges(root, resolve.reject_merge_facts(root))[claim["id"]]
              if (e.get("match") or {}).get("by") == "det"]
 assert len(det_edges) == 1 and det_edges[0]["session_id"] == sid, "the dup edge is by:'det', same session"
-net2 = dream.net_entrenchment(claim, valid_times=dream._session_valid_times(root))
-assert abs(net2 - net1) < 0.05 and net2 < dream.MATURITY_WEIGHT, \
+net2 = temporal.net_entrenchment(claim, valid_times=temporal.session_valid_times(root))
+assert abs(net2 - net1) < 0.05 and net2 < temporal.MATURITY_WEIGHT, \
     f"ZERO maturity gain from the re-tap ({net1} → {net2}) — a document cannot self-mature"
 
 # 5c. an EDITED rule seeds a FRESH claim — and again without an LLM call: it is either a $0
@@ -346,9 +346,9 @@ assert r5d.n_corroborated == 1 and rc.calls == 0, f"identical statement → det 
 claim = claim_by_title(SUMMARY)
 assert set(claim["sessions_seen"]) == {sid, "lived-sess-1"} and claim["support"]["sessions"] == 2, \
     "the lived session is a SECOND distinct session"
-net3 = dream.net_entrenchment(claim, valid_times=dream._session_valid_times(root))
-assert abs(net3 - 2.0) < 0.05 and net3 >= dream.MATURITY_WEIGHT, \
-    f"document + one lived session ⇒ mature (net {net3} ≥ bar {dream.MATURITY_WEIGHT})"
+net3 = temporal.net_entrenchment(claim, valid_times=temporal.session_valid_times(root))
+assert abs(net3 - 2.0) < 0.05 and net3 >= temporal.MATURITY_WEIGHT, \
+    f"document + one lived session ⇒ mature (net {net3} ≥ bar {temporal.MATURITY_WEIGHT})"
 
 print("OK — session identity: re-tapped identical rule = det corroboration at ZERO maturity gain,")
 print("     edited rule seeds fresh (LLM never asked), ONE lived session matures the claim to net 2")

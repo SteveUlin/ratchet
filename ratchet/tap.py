@@ -131,7 +131,7 @@ def read_document(path: Path) -> tuple[str, dict]:
     only from the owner's real sessions living the rule, or his direct accept at review.
 
     No `project`/`cwd` — also deliberate: `origin_ref.project` feeds the repo facet
-    (`concepts._repo_label`), and a document must stay subject-EMPTY (seed-only via subject,
+    (`concepts.repo_label`), and a document must stay subject-EMPTY (seed-only via subject,
     scope-derives-global); its `--source` FOCUS handle is the `path` fallback in
     `blobstore.project_of` instead."""
     text = path.read_text(encoding="utf-8")

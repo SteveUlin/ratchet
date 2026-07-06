@@ -49,9 +49,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-review-claims-")
 
-from ratchet import blobstore, chunk, config, dream, glean, resolve, review, sig, synthesize  # noqa: E402
+from ratchet import blobstore, chunk, concepts, config, dream, glean, resolve, review, sig, synthesize  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
-from ratchet.dream import working_set  # noqa: E402
+from ratchet.events import working_set  # noqa: E402
 
 # --- fixtures: summaries crafted into the measured bands (verified below with sig.jaccard) ----------
 JJ_SEED = "always commit with jj and never use git for version control"
@@ -240,12 +240,12 @@ print("       recurrence story.")
 
 # === 2. ACCEPT: the concept bakes EXACTLY the re-validated spans from the live-edge fold ============
 
-assert dream.load_concepts(RA) == [], "no concepts before the accept"
+assert concepts.load_concepts(RA) == [], "no concepts before the accept"
 cid = review.accept(claim_a["id"], RA, assessment="both quotes state the jj-not-git lesson")
 assert cid.startswith("c-")
-concepts = dream.load_concepts(RA)
-assert [c["id"] for c in concepts] == [cid], "the accepted claim is now a concept (the loop closes)"
-c = concepts[0]
+cs = concepts.load_concepts(RA)
+assert [c["id"] for c in cs] == [cid], "the accepted claim is now a concept (the loop closes)"
+c = cs[0]
 assert c["title"] == JJ_SEED and c["statement"] == "", "provisional title; why-pending → empty statement"
 assert {e["event_id"] for e in c["evidence"]} == set(claim_a["cites"]), \
     "the concept's evidence == the claim's live-edge citations (the stored claim blob has NO evidence)"
@@ -340,7 +340,7 @@ print("       fresh corroboration re-matures it into pending with the contested 
 RD = use_store("d")
 seed_events([("d-s1", PYTEST, M_HI, 0.85, "gamma", days_ago(10)),
              ("d-s2", RUFF, M_MID, 0.85, "gamma", days_ago(9))], RD)   # a DAY apart: two same-repo
-# sessions at the SAME instant would coalesce into one SITTING (dream.COALESCE_HOURS) and the gate
+# sessions at the SAME instant would coalesce into one SITTING (temporal.COALESCE_HOURS) and the gate
 # would settle the pair at $0 — this section needs the residue call to fire, so the fixture keeps
 # the sessions genuinely distinct (>12h). Still both >5 days old for the TTL fold-out below.
 fake_d = ResolveFake(["none"])
@@ -480,7 +480,7 @@ for the_id, line in ((pid, PYTEST), (rid, RUFF)):
                    model="fake", claim=the_id, root=RK)
 
 def kinds_of(root):
-    return {c["id"]: c["kind"] for c in dream.load_concepts(root)}
+    return {c["id"]: c["kind"] for c in concepts.load_concepts(root)}
 
 # (a) the card carries the proposal — reference, the non-default worth a line.
 cards = {t["takeaway_id"]: t for t in review.pending(RK, maturity=0.5)}
@@ -557,7 +557,7 @@ pool_s = {c["title"]: c for c in resolve.claim_pool(RS)}
 pid_s, rid_s = pool_s[PYTEST]["id"], pool_s[RUFF]["id"]
 
 def scopes_of(root):
-    return {c["id"]: c["scope"] for c in dream.load_concepts(root)}
+    return {c["id"]: c["scope"] for c in concepts.load_concepts(root)}
 
 # (a) the DERIVATION proposes on the card: one repo → that repo's label; no repo → global.
 cards_s = {t["takeaway_id"]: t for t in review.pending(RS, maturity=0.5)}
@@ -639,7 +639,7 @@ resolve.run(ResolveFake(["same-as-1"]), model="fake", forget=False, root=RF)
 claim_r = the_claim(RF)
 assert claim_r["why"] is None, "the fixture claim is why-pending (synthesize hasn't run)"
 cid_r = review.accept(claim_r["id"], RF, assessment="why-pending accept — the gap under test")
-c_r0 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+c_r0 = {c["id"]: c for c in concepts.load_concepts(RF)}[cid_r]
 assert c_r0["statement"] == "", "the why-pending accept minted an EMPTY statement (the gap is real)"
 ev_r0 = c_r0["evidence"]
 facets_r0 = (kinds_of(RF)[cid_r], scopes_of(RF)[cid_r])
@@ -657,19 +657,19 @@ WHY_R = "version control here is jj; git bypasses the working-copy-is-a-commit m
 synthesize.run(SynthKind({"title": JJ_SEED, "why": WHY_R, "kind": "behavioral", "confidence": 0.9}),
                model="fake", claim=claim_r["id"], root=RF)
 assert the_claim(RF)["why"] == WHY_R, "the claim's live fold carries the synthesized why"
-assert {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]["statement"] == "", \
+assert {c["id"]: c for c in concepts.load_concepts(RF)}[cid_r]["statement"] == "", \
     "…and the concept did NOT auto-refresh — the human gate stays the trust source"
 
 # (c) refresh: the statement fills; title, evidence, kind/scope, validity, claim decisions all hold.
 res_r = review.refresh(cid_r, RF, note="synthesize filled the why; re-read on command")
 assert res_r["concept"] == cid_r and res_r["before"]["statement"] == "" \
     and res_r["after"]["statement"] == WHY_R
-c_r1 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+c_r1 = {c["id"]: c for c in concepts.load_concepts(RF)}[cid_r]
 assert c_r1["statement"] == WHY_R and c_r1["title"] == JJ_SEED, "statement filled, title unchanged"
 assert c_r1["evidence"] == ev_r0, "evidence carried byte-identical — refresh re-reads PROSE only"
 assert (kinds_of(RF)[cid_r], scopes_of(RF)[cid_r]) == facets_r0, \
     "kind/scope hold: they are the DECISION's facts (set_*/accept folds) and refresh carries neither"
-assert cid_r in dream.valid_concept_ids(RF), \
+assert cid_r in concepts.valid_concept_ids(RF), \
     "the refresh decision is now the concept's LATEST — validity holds because load_concepts checks " \
     "verb MEMBERSHIP (refresh ∉ CONCEPT_INVALID_VERBS), never mere decision presence"
 assert blobstore.latest_decisions(RF)[claim_r["id"]]["verb"] == "accept", \
@@ -695,7 +695,7 @@ with redirect_stdout(buf):
     review.main(["--refresh", cid_r, "--edit-title", "jj, never git", "--json"])
 out_rf = json.loads(buf.getvalue())
 assert out_rf["concept"] == cid_r and out_rf["after"]["title"] == "jj, never git"
-c_r2 = {c["id"]: c for c in dream.load_concepts(RF)}[cid_r]
+c_r2 = {c["id"]: c for c in concepts.load_concepts(RF)}[cid_r]
 assert c_r2["title"] == "jj, never git" and c_r2["statement"] == WHY_R, \
     "--edit-title re-titles; the statement still reads from the claim"
 d_rf2 = blobstore.latest_decision(cid_r, RF)
@@ -716,7 +716,7 @@ for bad_call in (lambda: review.refresh("c-orphan", RF),                     # s
         assert False, "refresh must refuse a gone source / a retired concept / an unknown id"
     except ValueError:
         pass
-assert cid_r not in dream.valid_concept_ids(RF), "…and the retired concept stayed retired"
+assert cid_r not in concepts.valid_concept_ids(RF), "…and the retired concept stayed retired"
 print("OK 10 — refresh re-snapshots the concept's prose from the claim's live fold on the reviewer's")
 print("        command: never automatic, no-op refused, evidence/kind/scope/claim-decisions untouched,")
 print("        retired/unknown/orphaned targets refused.")

@@ -27,9 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-recency-")
 
 from ratchet import blobstore, config, dream, glean  # noqa: E402
-from ratchet.dream import (  # noqa: E402
+from ratchet.dream import current_takeaways  # noqa: E402
+from ratchet.temporal import (  # noqa: E402
     MATURITY_SESSIONS, MATURITY_WEIGHT, RECENCY_HALF_LIFE_DAYS,
-    current_takeaways, net_entrenchment, net_sessions, recency_weight)
+    net_entrenchment, net_sessions, recency_weight)
 
 
 # A fixed reference instant the whole suite decays against — never `config.now()`, so no wall-clock

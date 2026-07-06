@@ -31,9 +31,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-resolve-")
 
-from ratchet import blobstore, block, chunk, config, dream, glean, resolve, sig  # noqa: E402
+from ratchet import blobstore, block, chunk, config, dream, events, glean, resolve, sig, temporal  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
-from ratchet.dream import working_set  # noqa: E402
+from ratchet.events import working_set  # noqa: E402
 from ratchet.resolve import (  # noqa: E402
     candidate_ids, claim_pool, current_claims, high_confidence_view, is_active, _clean_verdict)
 
@@ -246,7 +246,7 @@ assert got == set(), "an EMPTY subject key contributes nothing via subject (seed
 # recall AND false-accept to candidate invisibility (80-char titles, no candidate quote). A noise
 # seed_quote renders VERBATIM (visibly noise); a missing one renders the explicit absence marker;
 # titles render at the summary scale (RESIDUE_TITLE_MAX), past dream's 80-char clip.
-_rv0 = dream.ResolvedEvent(event={"id": "e-obs", "summary": "an observation"},
+_rv0 = events.ResolvedEvent(event={"id": "e-obs", "summary": "an observation"},
                            quote="the observation's verbatim quote", span=(0, 32), session_id="s-obs")
 _long_title = ("a lesson whose full statement runs well past the old eighty-character clip because "
                "claim titles are event summaries and the measured corpus runs 92-240 characters")
@@ -571,7 +571,7 @@ review._record("retire", mature9[0]["id"], R9, reviewer="sulin")
 assert high_confidence_view(R9) == [], "a retire drops it from the view (invalidate-don't-delete)"
 # the ACTIVE view is a predicate, not a status: a zero-evidence claim folds out of candidacy.
 now9 = config.now()
-vt9 = dream._session_valid_times(R9)
+vt9 = temporal.session_valid_times(R9)
 assert all(is_active(c, now=now9, valid_times=vt9) for c in claim_pool(R9)), "fresh claims are active"
 assert not is_active({"sessions_seen": [], "contradiction_evidence": []}, now=now9, valid_times=vt9), \
     "a claim with no live evidence folds out of the ACTIVE view (the pool's drain)"
@@ -690,9 +690,9 @@ print("OK §13 — --audit-thin lists the noise-seeded claim (id, title, quote v
 # === 14. SITTING COALESCING: a /clear-split afternoon is ONE sitting, never 2-session maturity =======
 # The cheapest fake-maturity path (ADR-0028 backlog, closed): a /clear or crash-restart writes 2+
 # transcript files, so one sitting's work reads as 2 "distinct sessions" and matures a claim at the
-# ~2-session bar. `dream.coalesce_sessions` groups same-repo sessions whose valid-times sit within
+# ~2-session bar. `temporal.coalesce_sessions` groups same-repo sessions whose valid-times sit within
 # COALESCE_HOURS into one sitting — for the COUNT (net_entrenchment, support/contradiction symmetric)
-# and, via the SAME helper (`dream.same_sitting`), for the cascade's gate.
+# and, via the SAME helper (`temporal.same_sitting`), for the cascade's gate.
 
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
@@ -708,46 +708,46 @@ T_4H, T_2H, T_3D, T_NOW = ago(hours=4), ago(hours=2), ago(days=3), ago()
 # -- units: the grouping itself (pure, no store) --
 _vt = {"a": T_4H, "b": T_2H, "c": T_3D, "u": None}
 _rp = {"a": "alpha", "b": "alpha", "c": "alpha", "u": "alpha"}
-g = dream.coalesce_sessions({"a", "b", "c", "u"}, _vt, _rp)
+g = temporal.coalesce_sessions({"a", "b", "c", "u"}, _vt, _rp)
 assert sorted(map(sorted, g)) == [["a", "b"], ["c"], ["u"]], \
     f"same-repo 2h-apart pair is ONE sitting; 3-days-apart and undated stay distinct: {g}"
-g = dream.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": "beta"})
+g = temporal.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": "beta"})
 assert sorted(map(sorted, g)) == [["a"], ["b"]], "different repos 2h apart stay distinct (context switch)"
-g = dream.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": None})
+g = temporal.coalesce_sessions({"a", "b"}, _vt, {"a": "alpha", "b": None})
 assert sorted(map(sorted, g)) == [["a"], ["b"]], "an unhomed session never coalesces (recall-safe)"
 _chain_vt = {"p": ago(hours=20), "q": ago(hours=10), "r": ago(hours=0)}
 _chain_rp = {s: "alpha" for s in _chain_vt}
-assert len(dream.coalesce_sessions(set(_chain_vt), _chain_vt, _chain_rp)) == 1, \
+assert len(temporal.coalesce_sessions(set(_chain_vt), _chain_vt, _chain_rp)) == 1, \
     "the greedy chain: adjacent 10h gaps merge even though the sitting spans 20h"
-assert dream.coalesce_sessions({"a", "b"}, _vt, _rp, hours=0) == [["a"], ["b"]], \
+assert temporal.coalesce_sessions({"a", "b"}, _vt, _rp, hours=0) == [["a"], ["b"]], \
     "hours=0 is OFF — every session its own group (the escape hatch)"
-assert dream._sitting_valid_time(["a", "b"], _vt) == T_2H, "a sitting's valid-time is its LATEST member's"
-assert dream._sitting_valid_time(["u"], _vt) is None, "a lone undated session stays undated (weight 1.0)"
+assert temporal._sitting_valid_time(["a", "b"], _vt) == T_2H, "a sitting's valid-time is its LATEST member's"
+assert temporal._sitting_valid_time(["u"], _vt) is None, "a lone undated session stays undated (weight 1.0)"
 
 # same_sitting — the gate's helper IS the count's helper.
-assert dream.same_sitting("b", {"a"}, _vt, _rp), "2h same-repo → same sitting"
-assert not dream.same_sitting("c", {"a", "b"}, _vt, _rp), "3 days away → its own sitting"
-assert not dream.same_sitting("b", {"a"}, _vt, {"a": "alpha", "b": "beta"}), "repo jump → distinct"
-assert dream.same_sitting("a", {"a"}, _vt, {}, hours=0), "exact same id is same-sitting at ANY hours"
-assert not dream.same_sitting("b", {"a"}, _vt, _rp, hours=0), "hours=0 restores the plain same-session gate"
+assert temporal.same_sitting("b", {"a"}, _vt, _rp), "2h same-repo → same sitting"
+assert not temporal.same_sitting("c", {"a", "b"}, _vt, _rp), "3 days away → its own sitting"
+assert not temporal.same_sitting("b", {"a"}, _vt, {"a": "alpha", "b": "beta"}), "repo jump → distinct"
+assert temporal.same_sitting("a", {"a"}, _vt, {}, hours=0), "exact same id is same-sitting at ANY hours"
+assert not temporal.same_sitting("b", {"a"}, _vt, _rp, hours=0), "hours=0 restores the plain same-session gate"
 
 # net_entrenchment counts SITTINGS, recency reads each group's LATEST valid-time, symmetric for
 # contradictions (ADR-0012), and a view with no _session_repos (a v2 takeaway) never coalesces.
 _now14 = config.now()
 _v = {"sessions_seen": ["a", "b"], "contradiction_evidence": [], "_session_repos": _rp}
-assert dream.net_entrenchment(_v, _now14, valid_times=_vt) == dream.recency_weight(T_2H, _now14), \
+assert temporal.net_entrenchment(_v, _now14, valid_times=_vt) == temporal.recency_weight(T_2H, _now14), \
     "one split sitting counts ONCE, weighted by its latest valid-time"
-assert dream.net_entrenchment(_v, _now14, valid_times=_vt, coalesce_hours=0) == \
-    sum(dream.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
+assert temporal.net_entrenchment(_v, _now14, valid_times=_vt, coalesce_hours=0) == \
+    sum(temporal.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
     "coalesce_hours=0 restores the per-session sum byte-exact"
 _vc = {"sessions_seen": ["c"], "contradiction_evidence": [{"session_id": "a"}, {"session_id": "b"}],
        "_session_repos": _rp}
-assert dream.net_entrenchment(_vc, _now14, valid_times=_vt) == \
-    dream.recency_weight(T_3D, _now14) - dream.recency_weight(T_2H, _now14), \
+assert temporal.net_entrenchment(_vc, _now14, valid_times=_vt) == \
+    temporal.recency_weight(T_3D, _now14) - temporal.recency_weight(T_2H, _now14), \
     "contradicting sessions coalesce identically — a split sitting can't fake a 2-session overturn"
 _v2 = {"sessions_seen": ["a", "b"], "contradiction_evidence": []}
-assert dream.net_entrenchment(_v2, _now14, valid_times=_vt) == \
-    sum(dream.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
+assert temporal.net_entrenchment(_v2, _now14, valid_times=_vt) == \
+    sum(temporal.recency_weight(_vt[s], _now14) for s in ["a", "b"]), \
     "no _session_repos (a v2 takeaway) → nothing coalesces — v2 counting is untouched"
 print("OK §14a — coalesce_sessions: same-repo-within-window merges (greedy chain), repo jumps and")
 print("         undated/unhomed sessions stay distinct, hours=0 is off; the count and the gate share")
@@ -773,12 +773,12 @@ assert fake14b.calls == 1 and rep14b.n_corroborated == 1, "the escape hatch rest
 c14 = claim_pool(R14b)[0]
 assert c14["support"] == {"events": 2, "sessions": 2}, \
     "the RAW audit count still says 2 sessions (like net_sessions, kept for the human)"
-vt14 = dream._session_valid_times(R14b)
+vt14 = temporal.session_valid_times(R14b)
 assert c14["_session_repos"] == {"st-1": "alpha", "st-2": "alpha"}, "the fold derives the repo map"
-assert len(dream.coalesce_sessions(c14["sessions_seen"], vt14, c14["_session_repos"])) == 1, \
+assert len(temporal.coalesce_sessions(c14["sessions_seen"], vt14, c14["_session_repos"])) == 1, \
     "…but the two transcripts are ONE sitting"
 now14 = config.now()
-assert dream.net_entrenchment(c14, now14, valid_times=vt14) == dream.recency_weight(T_2H, now14), \
+assert temporal.net_entrenchment(c14, now14, valid_times=vt14) == temporal.recency_weight(T_2H, now14), \
     "support counts one sitting, weighted by the sitting's latest valid-time"
 assert current_claims(R14b) == [], "a split sitting can NOT mature a claim — the fake-maturity path is closed"
 assert [c["id"] for c in current_claims(R14b, coalesce_hours=0)] == [c14["id"]], \

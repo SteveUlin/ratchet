@@ -46,7 +46,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .. import blobstore, block, completer, config, dream
+from .. import blobstore, block, completer, concepts, config
 from ..completer import Completer
 from ..concepts import concept_facets
 from . import slugify
@@ -291,7 +291,7 @@ def tag_concept(concept: dict, vocab: dict[str, str], vocab_rendered: str, finge
 
 class GardenBlock:
     """The gardener's tagging phase as a `block.Block` (ADR-0009): a cheap tagger over the valid concepts,
-    committing PER CONCEPT. `items()` = the valid concepts (`dream.load_concepts`); the driver's done-skip
+    committing PER CONCEPT. `items()` = the valid concepts (`concepts.load_concepts`); the driver's done-skip
     plus the VOCAB FINGERPRINT in `params` make it idempotent — a concept already tagged against the
     CURRENT vocab is skipped, and a vocab change (the fingerprint flips) re-tags every concept. `process()`
     runs the one tagger call and commits the assignment + any new tags; the driver writes the per-concept
@@ -333,13 +333,13 @@ class GardenBlock:
         self.assignments: list[dict] = []               # [{concept_id, tags}] for --show / tests
 
     def items(self, root: Path, *, source_id: str | None = None):
-        """The valid concepts (`dream.load_concepts`, sorted by id) — the driver done-skips those already
+        """The valid concepts (`concepts.load_concepts`, sorted by id) — the driver done-skips those already
         tagged against the current vocab. `source_id` is ignored (garden is a global pass). The current
         tags are folded ONCE here for `priority`."""
         self._current = all_concept_tags(root)
-        concepts = sorted(dream.load_concepts(root), key=lambda c: c["id"])
-        self.n_concepts = len(concepts)
-        return concepts
+        valid = sorted(concepts.load_concepts(root), key=lambda c: c["id"])
+        self.n_concepts = len(valid)
+        return valid
 
     def key(self, concept: dict) -> str:
         return concept["id"]

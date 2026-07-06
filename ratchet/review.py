@@ -45,7 +45,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import blobstore, config, dream, resolve, sig, subject
+from . import blobstore, concepts, config, dream, resolve, sig, subject, temporal
 
 CONCEPT_ID_PREFIX = "c-"
 ASSESSMENT_MAX = 2000
@@ -152,10 +152,10 @@ def _is_out_of_queue(d: dict) -> bool:
 
 
 def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = None,
-               root: Path | None = None, coalesce_hours: float = dream.COALESCE_HOURS) -> float:
+               root: Path | None = None, coalesce_hours: float = temporal.COALESCE_HOURS) -> float:
     """A takeaway's REVIEW IMPORTANCE — the signal `pending` orders DESCENDING so the human sees the
     highest-leverage calls first (the active-learning "spend your attention where it matters most"; ADR-0022).
-    RECENCY-WEIGHTED net entrenchment × confidence: `dream.net_entrenchment` (support sessions minus
+    RECENCY-WEIGHTED net entrenchment × confidence: `temporal.net_entrenchment` (support sessions minus
     contradicting ones, each weighted by its valid-time — the SAME signal the maturity gate graduates on,
     ADR-0012/0023) scaled by the takeaway's own durability `confidence`. So the queue's order respects
     recency for free: a belief sustained by RECENT corroboration outranks one entrenched only by old
@@ -164,7 +164,7 @@ def importance(tk: dict, now: str | None = None, *, valid_times: dict | None = N
     sort is STABLE, so equal-importance takeaways keep their derivation order."""
     conf = tk.get("confidence")
     conf = conf if isinstance(conf, (int, float)) else 0.5
-    return dream.net_entrenchment(tk, now, valid_times=valid_times, root=root,
+    return temporal.net_entrenchment(tk, now, valid_times=valid_times, root=root,
                                   coalesce_hours=coalesce_hours) * conf
 
 
@@ -186,21 +186,21 @@ def _evidence_in_source(evidence: list, source_filter: str, root: Path, cache: d
 
 def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
                now: str | None = None, root: Path | None = None,
-               coalesce_hours: float = dream.COALESCE_HOURS) -> dict:
+               coalesce_hours: float = temporal.COALESCE_HOURS) -> dict:
     """Make the maturity gate TRANSPARENT (ADR-0027): a takeaway's recency-weighted entrenchment SCORE, the
     operator's BAR, whether it clears, and a one-line plain reason. Corroboration is EVIDENCE of durability,
     not a quota — so this EXPLAINS the standing rather than hiding a count behind a constant. The score is
-    `dream.net_entrenchment` (the very signal the gate graduates on); the bar is the reviewer's knob, shown
+    `temporal.net_entrenchment` (the very signal the gate graduates on); the bar is the reviewer's knob, shown
     next to the score so the call is legible. A takeaway can sit below the bar two ways — too few sessions
     yet, or enough sessions whose evidence has AGED below the recency-weighted line — and the note says which,
     because the remedy differs (wait for recurrence vs. needs RECENT corroboration)."""
-    score = dream.net_entrenchment(tk, now, valid_times=valid_times, root=root,
+    score = temporal.net_entrenchment(tk, now, valid_times=valid_times, root=root,
                                    coalesce_hours=coalesce_hours)
-    raw = dream.net_sessions(tk)
+    raw = temporal.net_sessions(tk)
     mature = score >= bar
     if mature:
         why = f"corroborated across {raw} distinct session(s); weighted {score:.2f} ≥ bar {bar:.2f}"
-    elif raw < dream.MATURITY_SESSIONS:
+    elif raw < temporal.MATURITY_SESSIONS:
         why = (f"seen in {raw} session(s) so far (weighted {score:.2f} < bar {bar:.2f}) — "
                f"a learning earns the queue by RECURRING, so it waits for corroboration in another session")
     else:
@@ -211,10 +211,10 @@ def bar_status(tk: dict, bar: float, *, valid_times: dict | None = None,
 
 # --- the v3 claim surfaces: audit card, corroboration story, suggestions, contested (§6) ----------
 #
-# Everything here is a DERIVED render-time view over resolve's fold — claim_pool, _live_edges,
-# _reject_merge_facts — computed when the reviewer looks and stored nowhere (ADR-0013). The claim id
+# Everything here is a DERIVED render-time view over resolve's fold — claim_pool, live_edges,
+# reject_merge_facts — computed when the reviewer looks and stored nowhere (ADR-0013). The claim id
 # space is dream's `t-…` (mint_takeaway_id), so claims ride the same decision folds as takeaways; the
-# one v3 wrinkle is `resolve._decision_binds`: after --reset-v2 a claim can be re-minted under a
+# one v3 wrinkle is `resolve.decision_binds`: after --reset-v2 a claim can be re-minted under a
 # RETIRED takeaway's id, and a decision older than the claim's birth targeted that predecessor, never
 # the live claim — so every claim-side decision read carries the binds guard.
 
@@ -223,8 +223,8 @@ def _claim_materials(root: Path) -> dict:
     """The shared per-render fold the claim surfaces read: reject-merge facts (the pair-block +
     retraction reads), live edges by claim, and the event-blob caches the audit card resolves
     subjects/quotes through. Built once per pending/context render, threaded everywhere."""
-    rm = resolve._reject_merge_facts(root)
-    return {"rm": rm, "edges": resolve._live_edges(root, rm),
+    rm = resolve.reject_merge_facts(root)
+    return {"rm": rm, "edges": resolve.live_edges(root, rm),
             "ev_hashes": blobstore.latest_by_kind("event", root),
             "ev_cache": {}, "subj_cache": {}}
 
@@ -310,8 +310,8 @@ def claim_audit(claim: dict, root: Path, *, mats: dict, valid_times: dict,
     quotes = {ev["event_id"]: ev["quote"] for ev in resolved_evidence}
     subj_by_event: dict[str, dict] = {}
     for e in corro:
-        ev = resolve._load_event(e["event_id"], mats["ev_hashes"], mats["ev_cache"], root)
-        subj_by_event[e["event_id"]] = (resolve._event_subject(ev, root, mats["subj_cache"])
+        ev = resolve.load_event(e["event_id"], mats["ev_hashes"], mats["ev_cache"], root)
+        subj_by_event[e["event_id"]] = (resolve.event_subject(ev, root, mats["subj_cache"])
                                         if ev else {"repo": None, "files": []})
     rows: list[dict] = []
     for e in corro:
@@ -386,9 +386,9 @@ def merge_suggestions(root: Path | None = None, *, j_maybe: float | None = None,
     h_min = sig.H_MIN if h_min is None else h_min
     now = now or config.now()
     if valid_times is None:
-        valid_times = dream._session_valid_times(root)
+        valid_times = temporal.session_valid_times(root)
     if rm is None:
-        rm = resolve._reject_merge_facts(root)
+        rm = resolve.reject_merge_facts(root)
     if pool is None:
         pool = resolve.claim_pool(root)
     active = [c for c in pool if resolve.is_active(c, now=now, valid_times=valid_times)]
@@ -438,9 +438,9 @@ def _suggestions_by_claim(suggestions: list[dict]) -> dict[str, list[dict]]:
     return by
 
 
-def contested(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
+def contested(root: Path | None = None, *, maturity: float = temporal.MATURITY_WEIGHT,
               window: float = CONTESTED_WINDOW,
-              coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
+              coalesce_hours: float = temporal.COALESCE_HOURS) -> list[dict]:
     """CONTESTED-NEAR-BAR visibility (§6.6, v2's `contradicted_takeaways` carried forward): live claims
     carrying a live contradicts edge whose net entrenchment sits within `window` of the bar — above OR
     below. Above, the claim is in `pending` anyway (flagged `contested`); below, the contradiction is
@@ -449,16 +449,16 @@ def contested(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIG
     (re-validated, like all evidence). Ordered by entrenchment descending — nearest the bar first."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
-    valid_times = dream._session_valid_times(root)
+    valid_times = temporal.session_valid_times(root)
     now = config.now()
     out: list[dict] = []
     for c in resolve.claim_pool(root):
         if not c.get("contradicted_by"):
             continue
         d = decisions.get(c["id"])
-        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+        if d and _is_out_of_queue(d) and resolve.decision_binds(d, c):
             continue                                   # already decided — no longer the gate's business
-        if dream.net_entrenchment(c, now, valid_times=valid_times,
+        if temporal.net_entrenchment(c, now, valid_times=valid_times,
                                   coalesce_hours=coalesce_hours) < maturity - window:
             continue
         st = bar_status(c, maturity, valid_times=valid_times, now=now, coalesce_hours=coalesce_hours)
@@ -515,7 +515,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
     root = root or config.data_root()
     if loser_id == winner_id:
         raise ValueError("merge_claims needs two distinct claims")
-    rm = resolve._reject_merge_facts(root)
+    rm = resolve.reject_merge_facts(root)
     if frozenset((loser_id, winner_id)) in rm["pairs"]:
         raise ValueError(f"pair ({loser_id}, {winner_id}) carries a reject-merge verdict — "
                          f"the standing call is 'not the same'")
@@ -523,7 +523,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
     for cid in (winner_id, loser_id):
         if cid not in pool:
             raise ValueError(f"no live claim {cid!r}")
-    edges_by_claim = resolve._live_edges(root, rm)
+    edges_by_claim = resolve.live_edges(root, rm)
     have = {(e["event_id"], e["verb"]) for e in edges_by_claim.get(winner_id, [])}
     run_id = config.run_id()
     moved = 0
@@ -542,8 +542,8 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
             limit: int | None = None, source_filter: str | None = None,
-            maturity: float = dream.MATURITY_WEIGHT,
-            coalesce_hours: float = dream.COALESCE_HOURS, with_total: bool = False):
+            maturity: float = temporal.MATURITY_WEIGHT,
+            coalesce_hours: float = temporal.COALESCE_HOURS, with_total: bool = False):
     """The review queue: every takeaway AT/ABOVE the maturity bar with no terminal decision and no live
     snooze, ORDERED by IMPORTANCE descending and presented with its verified evidence + its bar standing.
     Derived from references — stores nothing (ADR-0007).
@@ -572,18 +572,18 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     why-pending badge, the contested flag, and its merge suggestions (`_present_claim`)."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)   # lifecycle decisions only — producer markers excluded
-    valid_times = dream._session_valid_times(root) # session → valid-time, scanned ONCE for the gate + the sort
+    valid_times = temporal.session_valid_times(root) # session → valid-time, scanned ONCE for the gate + the sort
     now = config.now()
     cache: dict = {}
     rows: list[tuple[dict, str]] = []              # (view, kind) — one queue, two sources
     pool = resolve.claim_pool(root)
     claim_ids = {c["id"] for c in pool}
     for c in pool:
-        if dream.net_entrenchment(c, now, valid_times=valid_times,       # the same bar, same knob —
+        if temporal.net_entrenchment(c, now, valid_times=valid_times,       # the same bar, same knob —
                                   coalesce_hours=coalesce_hours) < maturity:   # sittings incl. (ADR-0028)
             continue
         d = decisions.get(c["id"])
-        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+        if d and _is_out_of_queue(d) and resolve.decision_binds(d, c):
             continue                               # pre-birth decisions targeted the retired v2 predecessor
         if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
             continue
@@ -624,8 +624,8 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     return (out, total) if with_total else out
 
 
-def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
-               coalesce_hours: float = dream.COALESCE_HOURS,
+def incubating(root: Path | None = None, *, maturity: float = temporal.MATURITY_WEIGHT,
+               coalesce_hours: float = temporal.COALESCE_HOURS,
                source_filter: str | None = None) -> list[dict]:
     """The takeaways still BELOW the maturity bar — live in the routing catalog (dream can strengthen
     them), but not yet at the human gate. The counterpart to `pending`: `catalog` minus the mature set
@@ -643,12 +643,12 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     shows the takeaways closest to graduating, the ones a sitting can actually act on."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
-    valid_times = dream._session_valid_times(root)
+    valid_times = temporal.session_valid_times(root)
     now = config.now()
     cache: dict = {}
 
     def row(tk: dict, kind: str) -> dict:
-        raw_needs = max(0, dream.MATURITY_SESSIONS - dream.net_sessions(tk))
+        raw_needs = max(0, temporal.MATURITY_SESSIONS - temporal.net_sessions(tk))
         st = bar_status(tk, maturity, valid_times=valid_times, now=now,   # the ONE pinned now —
                         coalesce_hours=coalesce_hours)                    # net_entrenchment's contract
         return {"takeaway_id": tk["id"], "kind": kind, "title": tk.get("title", ""),
@@ -663,11 +663,11 @@ def incubating(root: Path | None = None, *, maturity: float = dream.MATURITY_WEI
     pool = resolve.claim_pool(root)
     claim_ids = {c["id"] for c in pool}
     for c in pool:
-        if dream.net_entrenchment(c, now, valid_times=valid_times,
+        if temporal.net_entrenchment(c, now, valid_times=valid_times,
                                   coalesce_hours=coalesce_hours) >= maturity:
             continue
         d = decisions.get(c["id"])
-        if d and _is_out_of_queue(d) and resolve._decision_binds(d, c):
+        if d and _is_out_of_queue(d) and resolve.decision_binds(d, c):
             continue
         if source_filter is not None and not _evidence_in_source(c.get("evidence"), source_filter, root, cache):
             continue
@@ -711,7 +711,7 @@ def context_for(takeaway_id: str, root: Path | None = None, *, context_bytes: in
     c = _claim_view(takeaway_id, root)
     if c is not None:
         return _present_claim(c, root, context_bytes=context_bytes, mats=_claim_materials(root),
-                              valid_times=dream._session_valid_times(root))
+                              valid_times=temporal.session_valid_times(root))
     tk = _load_takeaway(takeaway_id, root)
     return _present(tk, root, context_bytes=context_bytes) if tk else None
 
@@ -766,7 +766,7 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     before it becomes a concept, captured before/after. `kind` confirms/overrides the claim's proposed
     typology (ADR-0029; default = the proposal, else behavioral) and `scope` confirms/overrides its
     DERIVED scope (ADR-0030; default = the evidence-derived proposal, else global) — both recorded ON
-    THE DECISION, where the valid-concept view reads them (`dream.concept_kinds`/`concept_scopes`),
+    THE DECISION, where the valid-concept view reads them (`concepts.concept_kinds`/`concept_scopes`),
     never on the blob. Returns the concept id.
 
     A v3 CLAIM accepts through the same door (§5 — review appends a decision FACET, nothing forks):
@@ -789,18 +789,18 @@ def accept(takeaway_id: str, root: Path | None = None, *, edited: dict | None = 
     # proposed kind (synthesize's, coerced); else behavioral (v2 takeaways and unsynthesized claims
     # carry no proposal). An explicit override outside the vocabulary is REFUSED, not coerced —
     # coercion absorbs a model's noise, never a reviewer's typo (their decision is authoritative).
-    if kind is not None and kind not in dream.CONCEPT_KINDS:
-        raise ValueError(f"--kind must be one of {dream.CONCEPT_KINDS}; got {kind!r}")
-    kind = kind if kind is not None else dream.clean_kind(tk.get("kind"))
+    if kind is not None and kind not in concepts.CONCEPT_KINDS:
+        raise ValueError(f"--kind must be one of {concepts.CONCEPT_KINDS}; got {kind!r}")
+    kind = kind if kind is not None else concepts.clean_kind(tk.get("kind"))
     # the SCOPE the accept confirms (ADR-0030): the reviewer's explicit --scope wins; else the
     # claim's DERIVED proposal (scope_repo — the evidence's repo, or global); else global (v2
     # takeaways carry no derivation). The vocabulary is OPEN (any repo label), so only an explicit
     # BLANK is refused — an empty scope is a reviewer's slip, never a namable place for a rule.
     if scope is not None and not scope.strip():
         raise ValueError("--scope must be a repo label or 'global' — got an empty string")
-    scope = scope.strip() if scope is not None else dream.clean_scope(tk.get("scope_repo"))
+    scope = scope.strip() if scope is not None else concepts.clean_scope(tk.get("scope_repo"))
     rel = tk.get("relation") or {}
-    known = dream.valid_concept_ids(root)
+    known = concepts.valid_concept_ids(root)
     concept_id = (rel["concept_id"] if rel.get("kind") in ("strengthens", "refines")
                   and isinstance(rel.get("concept_id"), str) and rel["concept_id"] in known
                   else _mint_concept_id(tk))        # reuse only an EXISTING concept; else mint fresh
@@ -863,12 +863,12 @@ def set_kind(concept_id: str, kind: str, root: Path | None = None, *, reason: st
     decision would become its LATEST lifecycle decision and pull it back into the valid set — re-kinding
     must never double as an accidental un-retire."""
     root = root or config.data_root()
-    if kind not in dream.CONCEPT_KINDS:
-        raise ValueError(f"kind must be one of {dream.CONCEPT_KINDS}; got {kind!r}")
-    if concept_id not in dream.valid_concept_ids(root):
+    if kind not in concepts.CONCEPT_KINDS:
+        raise ValueError(f"kind must be one of {concepts.CONCEPT_KINDS}; got {kind!r}")
+    if concept_id not in concepts.valid_concept_ids(root):
         raise ValueError(f"no valid concept {concept_id!r} — set-kind targets the valid set only "
                          f"(a decision on a retired concept would resurrect it)")
-    _record(dream.VERB_SET_KIND, concept_id, root, kind=kind,
+    _record(concepts.VERB_SET_KIND, concept_id, root, kind=kind,
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
@@ -885,10 +885,10 @@ def set_scope(concept_id: str, scope: str, root: Path | None = None, *, reason: 
     root = root or config.data_root()
     if not isinstance(scope, str) or not scope.strip():
         raise ValueError("scope must be a repo label or 'global' — got an empty string")
-    if concept_id not in dream.valid_concept_ids(root):
+    if concept_id not in concepts.valid_concept_ids(root):
         raise ValueError(f"no valid concept {concept_id!r} — set-scope targets the valid set only "
                          f"(a decision on a retired concept would resurrect it)")
-    _record(dream.VERB_SET_SCOPE, concept_id, root, scope=scope.strip(),
+    _record(concepts.VERB_SET_SCOPE, concept_id, root, scope=scope.strip(),
             reason=str(reason)[:ASSESSMENT_MAX], reviewer=reviewer)
 
 
@@ -917,11 +917,11 @@ def refresh(concept_id: str, root: Path | None = None, *, edited: dict | None = 
     keep them lets this one. Returns {concept, concept_hash, before, after}."""
     from . import garden                           # function-local: garden imports review at module load
     root = root or config.data_root()
-    concept = garden._concept_blob(concept_id, root)
+    concept = garden.concept_blob(concept_id, root)
     if concept is None:
         raise ValueError(f"no concept {concept_id!r}")
     d = blobstore.latest_decisions(root).get(concept_id)   # the LIFECYCLE fold load_concepts reads
-    if d and d.get("verb") in dream.CONCEPT_INVALID_VERBS:
+    if d and d.get("verb") in concepts.CONCEPT_INVALID_VERBS:
         raise ValueError(f"concept {concept_id!r} is out of the valid set (latest decision: "
                          f"{d['verb']}) — a refresh decision would become its latest and resurrect "
                          f"it; re-establishing a dead concept is a deliberate call, not a side-effect")
@@ -954,11 +954,11 @@ def refresh(concept_id: str, root: Path | None = None, *, edited: dict | None = 
 
 def valid_concepts(root: Path | None = None) -> list[dict]:
     """The current valid concept set — what dream judges belief-change against and `generate` projects
-    to skills/CLAUDE.md. Same derivation as `dream.load_concepts` (kept there to avoid a review→dream
-    cycle); re-exported here for inspection. Each concept carries its derived `kind` (ADR-0029:
+    to skills/CLAUDE.md. A thin re-export of `concepts.load_concepts`, for inspection. Each concept
+    carries its derived `kind` (ADR-0029:
     latest set_kind decision > the accept's kind > behavioral) and `scope` (ADR-0030: latest
     set_scope decision > the accept's scope > global)."""
-    return dream.load_concepts(root)
+    return concepts.load_concepts(root)
 
 
 # --- the SECOND review tier: the gardener's queued structural-op proposals (3d, ADR-0017) --------
@@ -983,10 +983,10 @@ def _present_proposal(proposal: dict, root: Path, *, context_bytes: int) -> dict
     flag the skill escalates on. A cited concept whose blob is gone shows empty evidence — the gap is shown,
     never silently dropped."""
     from . import garden
-    valid = dream.valid_concept_ids(root)
+    valid = concepts.valid_concept_ids(root)
     cited: list[dict] = []
     for cid in proposal.get("concept_ids") or []:
-        blob = garden._concept_blob(cid, root) or {}    # the latest concept version, valid OR not
+        blob = garden.concept_blob(cid, root) or {}    # the latest concept version, valid OR not
         cited.append({
             "concept_id": cid,
             "title": blob.get("title", ""),
@@ -1013,7 +1013,7 @@ def _proposal_in_source(proposal: dict, source_filter: str, root: Path, cache: d
     handle matching the substring."""
     from . import garden
     for cid in proposal.get("concept_ids") or []:
-        blob = garden._concept_blob(cid, root) or {}
+        blob = garden.concept_blob(cid, root) or {}
         if _evidence_in_source(blob.get("evidence"), source_filter, root, cache):
             return True
     return False
@@ -1102,7 +1102,7 @@ def accept_proposal(proposal_id: str, root: Path | None = None, *, assessment: s
     the takeaway `accept`. Returns {proposal_id, op, status, result}."""
     from . import garden
     root = root or config.data_root()
-    proposal = garden._proposal_blob(proposal_id, root)
+    proposal = garden.proposal_blob(proposal_id, root)
     if proposal is None:
         raise ValueError(f"no garden proposal {proposal_id!r}")
     run_id = config.run_id()
@@ -1123,7 +1123,7 @@ def reject_proposal(proposal_id: str, root: Path | None = None, *, reason: str =
     status}."""
     from . import garden
     root = root or config.data_root()
-    proposal = garden._proposal_blob(proposal_id, root)
+    proposal = garden.proposal_blob(proposal_id, root)
     if proposal is None:
         raise ValueError(f"no garden proposal {proposal_id!r}")
     _record("reject_proposal", proposal_id, root, op=proposal["op"], reviewer=reviewer,
@@ -1187,17 +1187,17 @@ def main(argv=None) -> None:
     ap.add_argument("--source", help="filter the queue to items whose cited SOURCE handle contains this "
                     "substring, case-insensitive — the originating project for transcripts (e.g. taro), "
                     "the file path for documents (e.g. CLAUDE.md)")
-    ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT, metavar="BAR",
+    ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT, metavar="BAR",
                     help=f"the maturity BAR a takeaway's recency-weighted corroboration must cross to surface "
-                         f"in --pending (default {dream.MATURITY_WEIGHT} ≈ {dream.MATURITY_SESSIONS} recent "
+                         f"in --pending (default {temporal.MATURITY_WEIGHT} ≈ {temporal.MATURITY_SESSIONS} recent "
                          f"sessions). LOWER it to review more, RAISE it for only the most-corroborated — the "
                          f"bar is yours, nothing is hidden: --incubating lists what sits below, with the "
                          f"reason. Applies to --pending and --incubating.")
-    ap.add_argument("--coalesce-hours", type=float, default=dream.COALESCE_HOURS, metavar="H",
+    ap.add_argument("--coalesce-hours", type=float, default=temporal.COALESCE_HOURS, metavar="H",
                     help=f"the SITTING window the maturity count groups by: same-repo sessions whose "
                          f"valid-times fall within this many hours count as ONE sitting, so a "
                          f"/clear-split afternoon cannot fake 2-session maturity (default "
-                         f"{dream.COALESCE_HOURS:g}; 0 = off — count every session separately). "
+                         f"{temporal.COALESCE_HOURS:g}; 0 = off — count every session separately). "
                          f"Applies to --pending, --incubating and --contested.")
     ap.add_argument("--split-parts",
                     help="a split accept's per-part EVIDENCE PARTITION: JSON [{title,statement,evidence}] "
@@ -1205,7 +1205,7 @@ def main(argv=None) -> None:
     ap.add_argument("--bytes", type=int, default=None, help="surrounding-context window size")
     ap.add_argument("--edit-title", help="accept with a corrected title")
     ap.add_argument("--edit-why", help="accept with a corrected why")
-    ap.add_argument("--kind", choices=dream.CONCEPT_KINDS,
+    ap.add_argument("--kind", choices=concepts.CONCEPT_KINDS,
                     help="accept with this kind, overriding the claim's proposal (default: the "
                          "proposal, else behavioral). behavioral shapes conduct and projects into "
                          "CLAUDE.md; reference is a fact/mechanism kept for lookup, excluded from "
@@ -1283,23 +1283,23 @@ def main(argv=None) -> None:
         cid = accept(args.accept, edited=edited or None, assessment=args.assessment, note=args.note,
                      kind=args.kind, scope=args.scope, allow_no_evidence=args.allow_no_evidence)
         cv = next((c for c in valid_concepts() if c["id"] == cid), {})
-        kind = cv.get("kind", dream.KIND_BEHAVIORAL)
-        scope = cv.get("scope", dream.SCOPE_GLOBAL)
+        kind = cv.get("kind", concepts.KIND_BEHAVIORAL)
+        scope = cv.get("scope", concepts.SCOPE_GLOBAL)
         print(json.dumps({"accepted": args.accept, "concept": cid, "kind": kind, "scope": scope,
                           "edited": bool(edited)})
               if args.json else f"accepted → concept {cid}"
-                                + (f" ({kind})" if kind != dream.KIND_BEHAVIORAL else "")
-                                + (f" (scope: {scope})" if scope != dream.SCOPE_GLOBAL else "")
+                                + (f" ({kind})" if kind != concepts.KIND_BEHAVIORAL else "")
+                                + (f" (scope: {scope})" if scope != concepts.SCOPE_GLOBAL else "")
                                 + (" (edited)" if edited else ""))
     elif args.set_kind:
         set_kind(args.set_kind[0], args.set_kind[1], reason=args.reason)
         print(f"concept {args.set_kind[0]} re-kinded → {args.set_kind[1]}"
-              + ("" if args.set_kind[1] == dream.KIND_BEHAVIORAL
+              + ("" if args.set_kind[1] == concepts.KIND_BEHAVIORAL
                  else " (kept + queryable; excluded from generate's default projection)"))
     elif args.set_scope:
         set_scope(args.set_scope[0], args.set_scope[1], reason=args.reason)
         print(f"concept {args.set_scope[0]} re-scoped → {args.set_scope[1]}"
-              + ("" if args.set_scope[1] == dream.SCOPE_GLOBAL
+              + ("" if args.set_scope[1] == concepts.SCOPE_GLOBAL
                  else " (out of the global projection; `generate --repo "
                       f"{args.set_scope[1]}` routes it)"))
     elif args.reject:
@@ -1327,9 +1327,9 @@ def main(argv=None) -> None:
         cs = valid_concepts()
         print(json.dumps(cs, ensure_ascii=False, indent=2) if args.json
               else "\n".join(f"  {c['id']}  {c.get('title', '')}"
-                             + (f"  [{c['kind']}]" if c.get("kind") != dream.KIND_BEHAVIORAL else "")
+                             + (f"  [{c['kind']}]" if c.get("kind") != concepts.KIND_BEHAVIORAL else "")
                              + (f"  [scope: {c['scope']}]"
-                                if c.get("scope") not in (None, dream.SCOPE_GLOBAL) else "")
+                                if c.get("scope") not in (None, concepts.SCOPE_GLOBAL) else "")
                              for c in cs) or "  (no valid concepts yet)")
     elif args.proposals:
         q = pending_proposals(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
@@ -1390,10 +1390,10 @@ def _print_queue(q: list[dict], *, total: int | None = None, incubating_count: i
             print(f"  WHY: {t['why']}"
                   + ("  [⚠ why-stale: the live evidence diverged since this prose was written]"
                      if t.get("why_stale") else ""))
-        if t.get("claim_kind") == dream.KIND_REFERENCE:   # only the non-default is worth a card line
+        if t.get("claim_kind") == concepts.KIND_REFERENCE:   # only the non-default is worth a card line
             print("  KIND: reference (proposed) — a fact/mechanism to look up, not conduct; kept but "
                   "excluded from generate's default projection. --accept records it; --kind overrides.")
-        if t.get("scope_repo") not in (None, dream.SCOPE_GLOBAL):   # same judgment: global is noise
+        if t.get("scope_repo") not in (None, concepts.SCOPE_GLOBAL):   # same judgment: global is noise
             print(f"  SCOPE: {t['scope_repo']} (derived) — every live quote sits in this repo; the "
                   f"lesson belongs in its CLAUDE.md, not the global one (`generate --repo "
                   f"{t['scope_repo']}`). --accept records it; --scope overrides.")

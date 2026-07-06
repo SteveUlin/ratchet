@@ -34,7 +34,7 @@ mutated in place (it latched). v3 inverts both:
   REJECT-MERGE (§2.2) — the human "not the same" verdict is ONE compound decision (verb
     `reject-merge`, target = the event). Three folds read the same blob: the edge fold as retraction,
     the working-set fold as reopen (its verb is neither `consolidated` nor `stale`, so
-    `dream.working_set` re-admits the event unchanged), and the candidate filter as a permanent
+    `events.working_set` re-admits the event unchanged), and the candidate filter as a permanent
     pair-block. The done-marker KEY carries an epoch (count of reject-merge decisions naming the
     event) so the Block driver's done-index does not skip a reopened event forever.
 
@@ -57,7 +57,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from . import blobstore, block, completer, config, dream, sig, subject
+from . import blobstore, block, completer, concepts, config, dream, events, sig, subject, temporal
 from .completer import Completer
 from .glean import MARKER_KINDS
 
@@ -174,7 +174,7 @@ RESOLVE_SYSTEM = (
 _VERDICT_RE = re.compile(r"^(same-as|contradicts)-(\d+)$")
 
 
-def _residue_user(rv: dream.ResolvedEvent, shown: list[dict]) -> str:
+def _residue_user(rv: events.ResolvedEvent, shown: list[dict]) -> str:
     """The residue prompt body (prompt v2). Each candidate renders with the SAME evidential standing
     as the observation — full-width title, synthesized `why` when present, and its seed event's
     re-validated verbatim quote (`seed_quote`, resolved at candidate construction; `adjudicate` stays
@@ -183,7 +183,7 @@ def _residue_user(rv: dream.ResolvedEvent, shown: list[dict]) -> str:
     lines = []
     for i, c in enumerate(shown, 1):
         stmt = str(c.get("title", "")).strip()[:RESIDUE_TITLE_MAX]
-        why = str(c.get("why") or "").strip()[:dream.WHY_MAX]
+        why = str(c.get("why") or "").strip()[:concepts.WHY_MAX]
         lines.append(f"[{i}] id={c.get('id')}: {stmt}" + (f" — {why}" if why else ""))
         quote = str(c.get("seed_quote") or "").strip()
         lines.append(f'    quote (verbatim): """{quote[:SEED_QUOTE_MAX]}"""' if quote
@@ -215,7 +215,7 @@ def _clean_verdict(parsed, n: int) -> tuple[str, int | None]:
     return "none", None
 
 
-def adjudicate(rv: dream.ResolvedEvent, shown: list[dict],
+def adjudicate(rv: events.ResolvedEvent, shown: list[dict],
                complete_resolve: Completer) -> tuple[str, int | None, float]:
     """ONE comparative-with-none call over the event's top-K_RESIDUE residue candidates — the entire
     LLM acceptance layer (§0/§3.1). Returns (verdict, candidate_number, cost). A raised completer
@@ -269,9 +269,9 @@ def reject_merge(event_id: str | None = None, *, edge: str | None = None,
                  reason: str = "", reviewer: str = "sulin", root: Path | None = None,
                  run_id: str | None = None) -> dict:
     """The ONE compound human "not the same" verdict (§2.2) — a single append-only decision blob,
-    verb `reject-merge`, TARGET = the event (so `dream.working_set`'s latest-decision fold reopens it
+    verb `reject-merge`, TARGET = the event (so `events.working_set`'s latest-decision fold reopens it
     unchanged — its verb is neither `consolidated` nor `stale`). The body carries the edge to retract
-    and/or the claim pair to block; THREE folds read this one blob: `_live_edges` as retraction,
+    and/or the claim pair to block; THREE folds read this one blob: `live_edges` as retraction,
     the working set as reopen, and the candidate filter as a permanent pair-block. One append, atomic —
     no crash window can strand the event or let the next tick re-form the torn-out merge. REVIEW-only
     by policy (ADR-0008): a permanent negative constraint is a trust-boundary artifact.
@@ -290,7 +290,7 @@ def reject_merge(event_id: str | None = None, *, edge: str | None = None,
     body = {"verb": VERB_REJECT_MERGE, "target": event_id, "event_id": event_id,
             "edge_id": edge, "pair": sorted(pair) if pair else None,   # the STORED field stays edge_id —
             # persisted vocabulary three folds read; only the param avoids shadowing edge_id()
-            "reason": str(reason)[:dream.NOTE_MAX], "reviewer": reviewer,
+            "reason": str(reason)[:concepts.NOTE_MAX], "reviewer": reviewer,
             "at": at, "run_id": run_id or config.run_id(),
             "producer": {"stage": "review", "at": at}}
     s = blobstore.canonical_json(body)
@@ -300,7 +300,7 @@ def reject_merge(event_id: str | None = None, *, edge: str | None = None,
     return body
 
 
-def _reject_merge_facts(root: Path) -> dict:
+def reject_merge_facts(root: Path) -> dict:
     """The three derived reads of the compound decision (§2.2), in ONE scan: `edges` — edge source_ids
     the edge fold treats as retracted (permanently: even a re-written deterministic-keyed edge blob
     stays dead, which is what closes the re-form crash window); `pairs` — frozensets of ids the
@@ -336,7 +336,7 @@ def _reject_merge_facts(root: Path) -> dict:
     return {"edges": edges, "pairs": pairs, "epochs": epochs, "reopen_at": reopen_at}
 
 
-def _live_edges(root: Path, rm: dict) -> dict[str, list[dict]]:
+def live_edges(root: Path, rm: dict) -> dict[str, list[dict]]:
     """claim_id → its LIVE edges: latest version per `event|verb|claim` identity, active:true, minus
     any a reject-merge decision retracted (§2.2 — the decision outlives the blob's own latest-wins).
     Malformed/absent blobs are skipped, never fatal."""
@@ -369,7 +369,7 @@ def corro_fingerprint(claim_id: str, event_ids) -> str:
     return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
 
 
-def _load_event(eid: str, ev_hashes: dict, cache: dict, root: Path) -> dict | None:
+def load_event(eid: str, ev_hashes: dict, cache: dict, root: Path) -> dict | None:
     if eid in cache:
         return cache[eid]
     obj = None
@@ -386,7 +386,7 @@ def _load_event(eid: str, ev_hashes: dict, cache: dict, root: Path) -> dict | No
     return obj
 
 
-def _event_subject(ev: dict, root: Path, cache: dict) -> dict:
+def event_subject(ev: dict, root: Path, cache: dict) -> dict:
     sp = (ev.get("evidence") or [{}])[0]
     sp = sp if isinstance(sp, dict) else {}
     return subject.subject_key(root, ev.get("cleaned_hash"), (sp.get("byte_start"), sp.get("byte_end")),
@@ -412,9 +412,9 @@ def scope_repo_of(subj_keys: list[dict]) -> str:
     repos is de facto general, and one with no known home applies everywhere — pinning narrower is
     exactly what review's `--scope` override is for). Deterministic, no LLM — the mirror of kind's
     synthesize-proposes step: here the EVIDENCE proposes, and the reviewer's decision is what a
-    concept's scope actually reads from (`dream.concept_scopes`)."""
+    concept's scope actually reads from (`concepts.concept_scopes`)."""
     repos = {k.get("repo") for k in subj_keys if k.get("repo")}
-    return next(iter(repos)) if len(repos) == 1 else dream.SCOPE_GLOBAL
+    return next(iter(repos)) if len(repos) == 1 else concepts.SCOPE_GLOBAL
 
 
 def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dict, blobs: dict,
@@ -448,22 +448,22 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         s = e.get("session_id")
         if s and s not in sessions_seen:
             sessions_seen.append(s)
-        ev = _load_event(eid, ev_hashes, ev_cache, root)
+        ev = load_event(eid, ev_hashes, ev_cache, root)
         if ev is None:
             continue
         summary = str(ev.get("summary", ""))
         shingles |= sig.char_shingles(summary)
         ent = max(ent, sig.entropy(summary))
-        sk = _event_subject(ev, root, subj_cache)
+        sk = event_subject(ev, root, subj_cache)
         subj_keys.append(sk)
         if s and sess_repos.get(s) is None:        # first dated repo wins (corro is event-id-sorted →
             sess_repos[s] = sk.get("repo")         # deterministic); a gone blob leaves None (never coalesces)
-        em = dream._event_markers(ev)
+        em = events.event_markers(ev)
         markers = {k: max(markers[k], em[k]) for k in MARKER_KINDS}
         confs.append(completer.clean_score(ev.get("confidence"), 0.5))
-        rv = dream._resolve_event(ev, blobs, sessions, root)
+        rv = events.resolve_event(ev, blobs, sessions, root)
         if rv is not None:
-            evidence.append(dream.evidence_entry(rv, root=root))
+            evidence.append(events.evidence_entry(rv, root=root))
     # the seed event's re-validated verbatim quote — the residue prompt's candidate-side evidence
     # (prompt v2). Derived from the fold's own evidence entries (already validate_span-anchored);
     # None when the seed edge is retracted or the blob/span no longer resolves.
@@ -477,14 +477,14 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
             continue
         contradicted_by.append(eid)
         entry = {"event_id": eid, "session_id": e.get("session_id")}   # session rides even if the blob is gone
-        ev = _load_event(eid, ev_hashes, ev_cache, root)
-        rv = dream._resolve_event(ev, blobs, sessions, root) if ev else None
+        ev = load_event(eid, ev_hashes, ev_cache, root)
+        rv = events.resolve_event(ev, blobs, sessions, root) if ev else None
         if rv is not None:
-            entry = dream.evidence_entry(rv, root=root)
+            entry = events.evidence_entry(rv, root=root)
             entry["session_id"] = e.get("session_id")
         s = e.get("session_id")
         if s and ev is not None and sess_repos.get(s) is None:
-            sess_repos[s] = _event_subject(ev, root, subj_cache).get("repo")   # symmetric (ADR-0012):
+            sess_repos[s] = event_subject(ev, root, subj_cache).get("repo")   # symmetric (ADR-0012):
             # contradicting sessions coalesce by the same repo evidence, so a split sitting can no
             # more fake a 2-session overturn than a 2-session graduation.
         contradiction_evidence.append(entry)
@@ -495,7 +495,7 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         # the PROPOSED typology (ADR-0029), stored by synthesize beside the why: None until prose is
         # minted (nothing proposed yet), else coerced to the closed vocabulary. A proposal only — the
         # reviewer's accept/set_kind decision is what a CONCEPT's kind reads from.
-        "kind": dream.clean_kind(content["kind"]) if content.get("kind") is not None else None,
+        "kind": concepts.clean_kind(content["kind"]) if content.get("kind") is not None else None,
         # the why-staleness derivation (§7.3): synthesize stamped the edge-set fingerprint its prose
         # consumed; if the LIVE corroborates set has since diverged (a retraction, a new merge), the
         # prose no longer describes the evidence — flag it for the review surface. why=null claims and
@@ -527,14 +527,14 @@ def _fold_claim(content: dict, edges: list[dict], ev_hashes: dict, ev_cache: dic
         "stmt_entropy": ent,
         "_subj_keys": subj_keys,                       # in-memory only: the in-batch scope recompute
         "_session_repos": sess_repos,                  # in-memory only: sitting coalescing's repo map
-                                                       # (dream.coalesce_sessions) — recomputed per fold,
+                                                       # (temporal.coalesce_sessions) — recomputed per fold,
                                                        # never stored (ADR-0013)
     }
-    view["contradictions"] = dream._contradiction_stats(view)
+    view["contradictions"] = events.contradiction_stats(view)
     return view
 
 
-def _decision_binds(d: dict, content: dict) -> bool:
+def decision_binds(d: dict, content: dict) -> bool:
     """Does a lifecycle decision BIND this claim? Only if it does not PREDATE the claim's birth. The
     guard exists for one real collision: a claim's deterministic id is `mint_takeaway_id(seed_event)`
     — the SAME id dream v2 minted for the takeaway seeded by that event — so the v2-reset's `retire`
@@ -549,12 +549,12 @@ def _decision_binds(d: dict, content: dict) -> bool:
 def claim_pool(root: Path | None = None) -> list[dict]:
     """The current claim views: `latest_by_kind('claim')` MINUS any whose latest BINDING lifecycle
     decision is retire/reject/merge/supersede (invalidate-don't-delete; pre-birth decisions targeted
-    the same-id v2 takeaway — see `_decision_binds`), each folded over its LIVE edges (§2.1). Sorted
+    the same-id v2 takeaway — see `decision_binds`), each folded over its LIVE edges (§2.1). Sorted
     by id for stable output; malformed blobs skipped, never fatal."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
-    rm = _reject_merge_facts(root)
-    edges_by_claim = _live_edges(root, rm)
+    rm = reject_merge_facts(root)
+    edges_by_claim = live_edges(root, rm)
     ev_hashes = blobstore.latest_by_kind("event", root)
     ev_cache: dict = {}
     blobs: dict = {}
@@ -569,7 +569,7 @@ def claim_pool(root: Path | None = None) -> list[dict]:
         if not (isinstance(content, dict) and isinstance(content.get("id"), str) and content["id"]):
             continue
         d = decisions.get(cid)
-        if d and d.get("verb") in CLAIM_INVALID_VERBS and _decision_binds(d, content):
+        if d and d.get("verb") in CLAIM_INVALID_VERBS and decision_binds(d, content):
             continue
         out.append(_fold_claim(content, edges_by_claim.get(cid, []), ev_hashes, ev_cache,
                                blobs, sessions, subj_cache, root))
@@ -577,15 +577,15 @@ def claim_pool(root: Path | None = None) -> list[dict]:
 
 
 def is_active(view: dict, *, now: str, valid_times: dict, floor: float = ACTIVE_FLOOR,
-              days: float = ACTIVE_DAYS, coalesce_hours: float = dream.COALESCE_HOURS) -> bool:
+              days: float = ACTIVE_DAYS, coalesce_hours: float = temporal.COALESCE_HOURS) -> bool:
     """The ACTIVE-view predicate (§2.1/§3.3) — the pool's derived drain, never a stored status:
     active = recency-weighted net entrenchment >= ACTIVE_FLOOR, OR any evidence within ACTIVE_DAYS.
     Inactive claims fold out of the candidate indexes; their blobs, edges, and history remain, and a
     re-seeded near-duplicate reconciles later through the derived merge-suggestion query at review.
     An undateable session reads as fresh (age 0 — the recall-safe direction, like recency_weight).
-    Entrenchment is the ONE measure (`dream.net_entrenchment`), so `coalesce_hours` threads here too —
+    Entrenchment is the ONE measure (`temporal.net_entrenchment`), so `coalesce_hours` threads here too —
     the active view must not read a split sitting as more entrenched than the maturity gate does."""
-    if dream.net_entrenchment(view, now, valid_times=valid_times, coalesce_hours=coalesce_hours) >= floor:
+    if temporal.net_entrenchment(view, now, valid_times=valid_times, coalesce_hours=coalesce_hours) >= floor:
         return True
     ss = view.get("sessions_seen") or []
     if not ss:
@@ -593,38 +593,38 @@ def is_active(view: dict, *, now: str, valid_times: dict, floor: float = ACTIVE_
     return min(config.age_days(valid_times.get(s), now=now) for s in ss) <= days
 
 
-def current_claims(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
+def current_claims(root: Path | None = None, *, maturity: float = temporal.MATURITY_WEIGHT,
                    now: str | None = None, valid_times: dict | None = None,
-                   coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
-    """The MATURITY GATE over the fold — the single bar (§3.4/§4, `dream.MATURITY_WEIGHT`
+                   coalesce_hours: float = temporal.COALESCE_HOURS) -> list[dict]:
+    """The MATURITY GATE over the fold — the single bar (§3.4/§4, `temporal.MATURITY_WEIGHT`
     single-sourced): claims whose recency-weighted net entrenchment (distinct support SITTINGS minus
     contradicting ones, each valid-time-weighted; same-repo sessions within `coalesce_hours` count as
-    ONE sitting — `dream.net_entrenchment` reads the folded view unchanged) crosses the reviewer's
+    ONE sitting — `temporal.net_entrenchment` reads the folded view unchanged) crosses the reviewer's
     bar. Same shape/semantics as `dream.current_takeaways`."""
     root = root or config.data_root()
     now = now or config.now()
     if valid_times is None:
-        valid_times = dream._session_valid_times(root)
+        valid_times = temporal.session_valid_times(root)
     return [c for c in claim_pool(root)
-            if dream.net_entrenchment(c, now, valid_times=valid_times,
+            if temporal.net_entrenchment(c, now, valid_times=valid_times,
                                       coalesce_hours=coalesce_hours) >= maturity]
 
 
-def high_confidence_view(root: Path | None = None, *, maturity: float = dream.MATURITY_WEIGHT,
-                         coalesce_hours: float = dream.COALESCE_HOURS) -> list[dict]:
+def high_confidence_view(root: Path | None = None, *, maturity: float = temporal.MATURITY_WEIGHT,
+                         coalesce_hours: float = temporal.COALESCE_HOURS) -> list[dict]:
     """The trusted subset (§5) — the ONLY thing generate reads and refine's prior: ONE graph, filtered
     to latest_decision == accept AND net_entrenchment >= the bar AND no live retire/supersede (the pool
     fold already drops those). Review appends a decision FACET; nothing forks."""
     root = root or config.data_root()
     decisions = blobstore.latest_decisions(root)
     now = config.now()
-    valid_times = dream._session_valid_times(root)
+    valid_times = temporal.session_valid_times(root)
     out: list[dict] = []
     for c in claim_pool(root):
         d = decisions.get(c["id"])
-        if not (d and d.get("verb") in ACCEPT_VERBS and _decision_binds(d, c)):
+        if not (d and d.get("verb") in ACCEPT_VERBS and decision_binds(d, c)):
             continue                                   # a pre-birth accept trusted the same-id predecessor
-        if dream.net_entrenchment(c, now, valid_times=valid_times,
+        if temporal.net_entrenchment(c, now, valid_times=valid_times,
                                   coalesce_hours=coalesce_hours) >= maturity:
             out.append(c)
     return out
@@ -702,7 +702,6 @@ def _subj_score(ev_subject: dict, view: dict) -> float:
     """The soft scope signal between an event's subject key and a claim's FOLDED subject union — the
     claim-side generalization of `subject.subject_overlap` (same weights, `tools` fixed at 0). Recorded
     on the edge's match key for audit; never a veto (§3.4)."""
-    from . import concepts                             # lazy: concepts→dream→glean→subject cycle guard
     subj = view.get("subject") or {}
     score = concepts.W_FILE * len(set(ev_subject.get("files") or ()) & set(subj.get("files") or ()))
     if ev_subject.get("repo") and ev_subject["repo"] in (subj.get("repos") or ()):
@@ -721,7 +720,7 @@ def _write_decision(body: dict, *, root: Path | None) -> None:
 
 def _write_consolidated(event_id: str, claim_id: str | None, decision: str, *, run_id: str,
                         root: Path | None) -> None:
-    """The commit point that removes a resolved event from the working set (`dream.working_set` folds
+    """The commit point that removes a resolved event from the working set (`events.working_set` folds
     the same verb, so the two stages share one membership fold). `decision` records the cascade's
     verdict: `seed` (minted its own claim) | `corroborates` | `contradicts`."""
     at = config.now()
@@ -738,8 +737,8 @@ def _write_stale(event_id: str, reason: str, *, run_id: str, root: Path | None) 
 
 # --- forget: straggler eviction, reopen-aware + wall-clock-bounded (§7.3) --------------------------
 
-def forget(root: Path | None = None, *, tau: int = dream.FORGET_TAU,
-           salience_floor: float = dream.FORGET_SALIENCE_FLOOR, min_days: float = FORGET_MIN_DAYS,
+def forget(root: Path | None = None, *, tau: int = events.FORGET_TAU,
+           salience_floor: float = events.FORGET_SALIENCE_FLOOR, min_days: float = FORGET_MIN_DAYS,
            run_id: str) -> list[str]:
     """dream's conservative straggler eviction (never age alone — ADR-0010 §6), re-scoped for v3's
     cheap ticks (§7.3). It cannot live as a call into `dream.forget` because both amendments change
@@ -749,7 +748,7 @@ def forget(root: Path | None = None, *, tau: int = dream.FORGET_TAU,
     the cycle count — frequent cheap ticks must not accelerate eviction. Still the CONJUNCTION with
     low intrinsic salience (relevance orders, never evicts), still a reversible `stale` decision."""
     root = root or config.data_root()
-    ws = dream.working_set(root)
+    ws = events.working_set(root)
     latest = blobstore.latest_by_kind("event", root)
     resolve_decs: list[dict] = []
     reopen_at: dict[str, str] = {}
@@ -771,7 +770,7 @@ def forget(root: Path | None = None, *, tau: int = dream.FORGET_TAU,
         born = max(born, reopen_at.get(rv.id, ""))     # the residency clock restarts at a reopen
         runs = {d.get("run_id") for d in resolve_decs
                 if d.get("run_id") and str(d.get("at", "")) > born}
-        if (len(runs) >= tau and dream._intrinsic_salience(rv.event) < salience_floor
+        if (len(runs) >= tau and events.intrinsic_salience(rv.event) < salience_floor
                 and config.age_days(born or None) >= min_days):
             _write_stale(rv.id, "aged + low salience", run_id=run_id, root=root)
             staled.append(rv.id)
@@ -788,7 +787,7 @@ def reset_v2(root: Path | None = None, *, dry_run: bool = False,
              run_id: str | None = None) -> tuple[list[str], list[str]]:
     """`--reset-v2`: retire every LIVE v2 takeaway (a `retire` decision, review's own verb — the blob
     + history stay) and REOPEN every event whose latest decision is `consolidated` (a `reopen`
-    decision, so `dream.working_set`'s fold re-admits it and resolve re-consolidates it into claims).
+    decision, so `events.working_set`'s fold re-admits it and resolve re-consolidates it into claims).
     Only DREAM-consolidated events qualify (producer.stage — a resolve-consolidated event is v3's own
     verdict, not v2 damage; without the guard a re-run AFTER the drain would reopen the whole store).
     Append-only and IDEMPOTENT: `dream.catalog` already excludes retired takeaways, and a reopened
@@ -852,10 +851,10 @@ class ResolveBlock:
                  facet_df_max: float = FACET_DF_MAX, active_floor: float = ACTIVE_FLOOR,
                  active_days: float = ACTIVE_DAYS, dup_exact: float = DUP_EXACT,
                  quote_min_chars: int = QUOTE_MIN_CHARS, same_session_adjudicate: bool = False,
-                 coalesce_hours: float = dream.COALESCE_HOURS,
+                 coalesce_hours: float = temporal.COALESCE_HOURS,
                  max_usd: float | None = None,
-                 forget: bool = True, forget_tau: int = dream.FORGET_TAU,
-                 forget_floor: float = dream.FORGET_SALIENCE_FLOOR,
+                 forget: bool = True, forget_tau: int = events.FORGET_TAU,
+                 forget_floor: float = events.FORGET_SALIENCE_FLOOR,
                  forget_min_days: float = FORGET_MIN_DAYS) -> None:
         self.complete_resolve = complete_resolve
         self.model = model
@@ -872,7 +871,7 @@ class ResolveBlock:
         self.dup_exact = dup_exact
         self.quote_min_chars = quote_min_chars
         self.same_session_adjudicate = same_session_adjudicate
-        self.coalesce_hours = coalesce_hours           # the sitting window (dream.COALESCE_HOURS; 0 = off)
+        self.coalesce_hours = coalesce_hours           # the sitting window (temporal.COALESCE_HOURS; 0 = off)
         self.max_usd = max_usd                         # the RESIDUE-spend cap (deferral, not break — §7.2)
         self.forget_on = forget
         self.forget_tau = forget_tau
@@ -911,7 +910,7 @@ class ResolveBlock:
         self._subj_cache = {}
         self._spent = 0.0
         now = config.now()
-        valid_times = dream._session_valid_times(root)
+        valid_times = temporal.session_valid_times(root)
         self._valid_times = valid_times
         pool = claim_pool(root)
         self._pool_by_id = {c["id"]: c for c in pool}
@@ -920,35 +919,35 @@ class ResolveBlock:
                                                coalesce_hours=self.coalesce_hours)]
         self._idx = build_indexes(active)
         self.n_pool, self.n_active = len(pool), len(active)
-        rm = _reject_merge_facts(root)
+        rm = reject_merge_facts(root)
         self._blocked = rm["pairs"]
         self._epochs = rm["epochs"]
-        ws = dream.working_set(root, min_confidence=self.min_confidence)
+        ws = events.working_set(root, min_confidence=self.min_confidence)
         if self.source_filter is not None:
-            ws = dream.filter_by_source(ws, self.source_filter, root)
+            ws = events.filter_by_source(ws, self.source_filter, root)
         self.n_events = len(ws)
         return ws
 
-    def key(self, rv: dream.ResolvedEvent) -> str:
+    def key(self, rv: events.ResolvedEvent) -> str:
         """The done-marker key: the event id, EPOCH-suffixed once a reject-merge names it (§2.2). The
         driver's params are per-RUN, so the per-EVENT epoch must ride in the key — a reopened event's
         key is new and the done-index cannot skip it forever; epoch 0 keeps today's bare key."""
         ep = self._epochs.get(rv.id, 0)
         return rv.id if ep == 0 else f"{rv.id}#e{ep}"
 
-    def priority(self, rv: dream.ResolvedEvent) -> float:
-        return dream.salience(rv.event)
+    def priority(self, rv: events.ResolvedEvent) -> float:
+        return events.salience(rv.event)
 
-    def age(self, rv: dream.ResolvedEvent) -> float:
+    def age(self, rv: events.ResolvedEvent) -> float:
         """Age in days for the Aging policy (ADR-0021), exactly dream's: lazy `_event_born_map`, so a
         Greedy run pays nothing."""
         if self._born is None:
-            self._born = dream._event_born_map(self._root)
+            self._born = events.event_born_map(self._root)
         return config.age_days(self._born.get(rv.id))
 
     # -- the cascade -------------------------------------------------------------------------------
 
-    def process(self, rv: dream.ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
+    def process(self, rv: events.ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
         summary = str(rv.event.get("summary", ""))
         ev_sh = sig.char_shingles(summary)
         ev_ent = sig.entropy(summary)
@@ -993,7 +992,7 @@ class ResolveBlock:
                                                        # adjudication — the model judges titles when
                                                        # the quote is noise (the measured [16] family)
             if (not self.same_session_adjudicate and rv.session_id
-                    and dream.same_sitting(
+                    and temporal.same_sitting(
                         rv.session_id, c.get("sessions_seen") or (), self._valid_times,
                         {**(c.get("_session_repos") or {}), rv.session_id: ev_subj.get("repo")},
                         hours=self.coalesce_hours)):
@@ -1003,7 +1002,7 @@ class ResolveBlock:
                 # same-session pairs were the dominant false-accept family (two lessons from one
                 # working session sharing vocabulary/context); with this gate + the noise floor the
                 # live re-tally reads cross-session recall 4/4, false-accept 9%, ~2/3 of residue
-                # calls gone. `dream.same_sitting` extends the exact same-id test to the COALESCED
+                # calls gone. `temporal.same_sitting` extends the exact same-id test to the COALESCED
                 # sitting (same repo, valid-times within COALESCE_HOURS) — the SAME helper the
                 # maturity count groups by, so an event from the second half of a /clear-split
                 # afternoon cannot adjudicate-corroborate the first half's claim and then count as
@@ -1060,7 +1059,7 @@ class ResolveBlock:
         _write_consolidated(rv.id, target["id"], verb, run_id=run_id, root=root)    # decision LAST
         return 1, cost
 
-    def _mint(self, rv: dream.ResolvedEvent, summary: str, ev_sh: frozenset, ev_ent: float,
+    def _mint(self, rv: events.ResolvedEvent, summary: str, ev_sh: frozenset, ev_ent: float,
               ev_subj: dict, *, root: Path, run_id: str) -> dict:
         """MINT a claim NOW (§3.1 step 3): deterministic id (crash-retry re-mints the SAME id — a
         no-op-ish TimeMap version, never an orphan), title = the event summary, why = null (synthesize
@@ -1085,12 +1084,12 @@ class ResolveBlock:
             "seed_quote": rv.quote,                    # the candidate-side evidence, already validated
             "thin_evidence": thin_quote(rv.quote),     # the derived noise-floor badge, exactly the fold's
             "born": content["born"],
-            "cites": [rv.id], "evidence": [dream.evidence_entry(rv, root=root)],
+            "cites": [rv.id], "evidence": [events.evidence_entry(rv, root=root)],
             "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
             "sessions_seen": [rv.session_id] if rv.session_id else [],
             "contradicted_by": [], "contradiction_evidence": [],
             "contradictions": {"events": 0, "sessions": 0},
-            "markers": dream._event_markers(rv.event),
+            "markers": events.event_markers(rv.event),
             "confidence": completer.clean_score(rv.event.get("confidence"), 0.5),
             "subject": {"repos": [ev_subj["repo"]] if ev_subj.get("repo") else [],
                         "files": sorted(ev_subj.get("files") or ())},
@@ -1106,14 +1105,14 @@ class ResolveBlock:
         _write_consolidated(rv.id, cid, "seed", run_id=run_id, root=root)           # decision LAST
         return view
 
-    def _fold_corroboration(self, view: dict, rv: dream.ResolvedEvent, summary: str,
+    def _fold_corroboration(self, view: dict, rv: events.ResolvedEvent, summary: str,
                             ev_sh: frozenset, ev_ent: float, ev_subj: dict) -> None:
         """Fold a fresh corroboration into the ON-INSTANCE view + indexes — the same derivation
         `_fold_claim` would produce from the store, applied incrementally so the next event in the
         tick reads the updated signature/subject (read-your-writes)."""
         if rv.id not in view["cites"]:
             view["cites"].append(rv.id)
-            view["evidence"].append(dream.evidence_entry(rv, root=self._root))
+            view["evidence"].append(events.evidence_entry(rv, root=self._root))
         if rv.session_id and rv.session_id not in view["sessions_seen"]:
             view["sessions_seen"].append(rv.session_id)
         if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
@@ -1131,11 +1130,11 @@ class ResolveBlock:
         view["scope_repo"] = scope_repo_of(view["_subj_keys"])
         for f in _claim_facets(view):
             self._idx["facets"].setdefault(f, set()).add(view["id"])
-        em = dream._event_markers(rv.event)
+        em = events.event_markers(rv.event)
         view["markers"] = {k: max(view["markers"][k], em[k]) for k in MARKER_KINDS}
         view["confidence"] = max(view["confidence"], completer.clean_score(rv.event.get("confidence"), 0.5))
 
-    def _fold_contradiction(self, view: dict, rv: dream.ResolvedEvent, ev_subj: dict) -> None:
+    def _fold_contradiction(self, view: dict, rv: events.ResolvedEvent, ev_subj: dict) -> None:
         """Fold a contradiction into the on-instance view: the symmetric side only — support, title,
         signature ride untouched (ADR-0012; the negation cue never widens the merge basin). The
         session's repo joins the sitting map for the same symmetry: contradicting sessions coalesce
@@ -1143,12 +1142,12 @@ class ResolveBlock:
         if rv.id in view["contradicted_by"]:
             return
         view["contradicted_by"].append(rv.id)
-        entry = dream.evidence_entry(rv, root=self._root)
+        entry = events.evidence_entry(rv, root=self._root)
         entry["session_id"] = rv.session_id
         view["contradiction_evidence"].append(entry)
         if rv.session_id and view.setdefault("_session_repos", {}).get(rv.session_id) is None:
             view["_session_repos"][rv.session_id] = ev_subj.get("repo")
-        view["contradictions"] = dream._contradiction_stats(view)
+        view["contradictions"] = events.contradiction_stats(view)
 
     def finalize(self, *, root: Path, run_id: str) -> None:
         if self.forget_on:
@@ -1196,7 +1195,7 @@ def run(complete_resolve: Completer, *, model: str = RESOLVE_MODEL, min_confiden
         k_rare: int = K_RARE, rare_min: int = RARE_MIN, facet_df_max: float = FACET_DF_MAX,
         active_floor: float = ACTIVE_FLOOR, active_days: float = ACTIVE_DAYS,
         dup_exact: float = DUP_EXACT, quote_min_chars: int = QUOTE_MIN_CHARS,
-        same_session_adjudicate: bool = False, coalesce_hours: float = dream.COALESCE_HOURS,
+        same_session_adjudicate: bool = False, coalesce_hours: float = temporal.COALESCE_HOURS,
         forget: bool = True, max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> ResolveReport:
@@ -1227,7 +1226,7 @@ def main(argv=None) -> None:
     ap.add_argument("--source", help="PROCESSING FOCUS: resolve only events whose SOURCE handle contains "
                     "this substring, case-insensitive — the originating project for transcripts (e.g. taro), "
                     "the file path for documents (e.g. CLAUDE.md); ADR-0022")
-    ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT,
+    ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT,
                     help="shapes ONLY the --dry-run preview's mature-claim count; the bar itself is the "
                          "reviewer's knob and lives with review/synthesize (ADR-0027)")
     ap.add_argument("--j-maybe", type=float, default=sig.J_MAYBE,
@@ -1257,11 +1256,11 @@ def main(argv=None) -> None:
     ap.add_argument("--same-session-adjudicate", action="store_true",
                     help="escape hatch: adjudicate candidates already carrying the event's session "
                          "(default off — a same-session merge adds no distinct-session support)")
-    ap.add_argument("--coalesce-hours", type=float, default=dream.COALESCE_HOURS,
+    ap.add_argument("--coalesce-hours", type=float, default=temporal.COALESCE_HOURS,
                     help=f"the SITTING window: same-repo sessions whose valid-times fall within this "
                          f"many hours count as ONE sitting for support/contradiction/maturity and the "
                          f"same-session gate — a /clear-split afternoon is one sitting, not two "
-                         f"sessions (default {dream.COALESCE_HOURS:g}; 0 = off, the exact per-session "
+                         f"sessions (default {temporal.COALESCE_HOURS:g}; 0 = off, the exact per-session "
                          f"counting)")
     ap.add_argument("--audit-thin", action="store_true",
                     help="read-only: list every live claim whose seed evidence fails the noise floor "
@@ -1320,27 +1319,27 @@ def main(argv=None) -> None:
 
     if args.dry_run:                                   # eyeball the queue + pool before spending
         root = config.ensure_layout()
-        ws = dream.working_set(root, min_confidence=args.min_confidence)
+        ws = events.working_set(root, min_confidence=args.min_confidence)
         if args.source is not None:
-            ws = dream.filter_by_source(ws, args.source, root)
-        born = dream._event_born_map(root) if args.priority == "aging" else {}
+            ws = events.filter_by_source(ws, args.source, root)
+        born = events.event_born_map(root) if args.priority == "aging" else {}
         ws = block.priority_strategy(args.priority).order(
-            ws, lambda rv: dream.salience(rv.event),
+            ws, lambda rv: events.salience(rv.event),
             lambda rv: config.age_days(born.get(rv.id)))
         pool = claim_pool(root)
         now = config.now()
-        valid_times = dream._session_valid_times(root)
+        valid_times = temporal.session_valid_times(root)
         active = [c for c in pool if is_active(c, now=now, valid_times=valid_times,
                                                floor=args.active_floor, days=args.active_days,
                                                coalesce_hours=args.coalesce_hours)]
         mature = [c for c in pool
-                  if dream.net_entrenchment(c, now, valid_times=valid_times,
+                  if temporal.net_entrenchment(c, now, valid_times=valid_times,
                                             coalesce_hours=args.coalesce_hours) >= args.maturity]
         print(f"{len(ws)} un-consolidated events ({args.priority}-ordered) · claim pool {len(pool)} "
               f"({len(active)} active, {len(mature)} mature):")
         for rv in ws[:40]:
             sample = rv.quote.strip().replace("\n", " ")
-            print(f"  [{dream.salience(rv.event):.3f}] {rv.id[:12]}  {sample[:72]!r}")
+            print(f"  [{events.salience(rv.event):.3f}] {rv.id[:12]}  {sample[:72]!r}")
         return
 
     complete_resolve = completer.make_cli_completer(args.model)

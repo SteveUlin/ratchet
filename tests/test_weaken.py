@@ -29,8 +29,10 @@ os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-weaken-")
 from ratchet import blobstore, chunk, config, dream, glean  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 from ratchet.dream import (  # noqa: E402
-    apply, catalog, contradicted_takeaways, current_takeaways, net_sessions, route, synthesize_new,
-    takeaway_content, update_contradictions, working_set, _clean_route, _contradiction_stats)
+    apply, catalog, contradicted_takeaways, current_takeaways, route, synthesize_new,
+    takeaway_content, update_contradictions, _clean_route)
+from ratchet.events import contradiction_stats, working_set  # noqa: E402
+from ratchet.temporal import net_sessions  # noqa: E402
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "weaken_end_state.json"
 
@@ -206,7 +208,7 @@ assert blobstore.canonical_json(takeaway_content(nv2)) == blobstore.canonical_js
 _shared = {"contradicted_by": ["e1", "e2"],
            "contradiction_evidence": [{"event_id": "e1", "session_id": "s1"},
                                       {"event_id": "e2", "session_id": "s1"}]}
-assert _contradiction_stats(_shared) == {"events": 2, "sessions": 1}, \
+assert contradiction_stats(_shared) == {"events": 2, "sessions": 1}, \
     "two distinct contradiction events sharing one session → 2 events / 1 distinct session"
 # a no-contradiction takeaway has net == support (the net change is invisible until a contradiction arrives).
 assert net_sessions(tk) == tk["support"]["sessions"], "net == support when there is no contradiction"

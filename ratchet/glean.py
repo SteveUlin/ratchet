@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import blobstore, block, chunk, completer, config, sig, subject, weave
+from . import blobstore, block, chunk, completer, concepts, config, sig, subject, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
 PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks (idempotency key);
@@ -69,7 +69,7 @@ OUT_NOUN = "events"            # the per-item output noun the Progress bar/line 
 # The VALID-TIME recency term of priority(): a BONUS of `W_RECENT · 0.5^(material_age_days /
 # RECENT_HALF_LIFE_DAYS)` added to the structural score, where material age counts from when the
 # session ACTUALLY HAPPENED — the raw transcript's `origin_ref.mtime` (the valid-time clock,
-# ADR-0023 / dream._session_valid_times), NOT `fetched_at` (when ratchet ingested it). The split is
+# ADR-0023 / temporal.session_valid_times), NOT `fetched_at` (when ratchet ingested it). The split is
 # the whole point under a backfill: hundreds of transcripts ARRIVE in one week, so arrival-time is a
 # flat cohort with nothing to order by, while their session dates spread over months — valid-time is
 # the only clock that can say "mine the owner's recent life first", so the concept layer reflects NOW
@@ -696,7 +696,6 @@ class GleanBlock:
         any failure to BUILD the context degrades to the empty sentinel rather than costing an extraction —
         the model then sees nothing known and defaults every event to `novel` (the recall-safe direction).
         The `concepts` import is FUNCTION-LOCAL: concepts→dream→glean would cycle on a top-level import."""
-        from . import concepts                       # lazy: avoids the concepts→dream→glean import cycle
         if self._digest_failed:                      # a prior build raised → novelty is OFF for the run;
             return concepts.DIGEST_EMPTY             # don't re-attempt the expensive build every chunk
         try:

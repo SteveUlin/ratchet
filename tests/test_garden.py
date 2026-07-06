@@ -124,10 +124,10 @@ assert garden.vocabulary(R) == {}, "vocabulary starts EMPTY (no tag blobs yet)"
 assert garden.concept_tags("c-aaa", R) == [], "an untagged concept folds to no tags"
 
 # _clean_assigned drops a hallucinated slug (one not in vocab ∪ proposed-new); keeps the allowed one.
-assert garden._clean_assigned(["version-control", "ghost"], {"version-control"}) == ["version-control"], \
+assert garden.tag._clean_assigned(["version-control", "ghost"], {"version-control"}) == ["version-control"], \
     "a tag the model neither knows nor proposes is dropped (the _clean_route rule)"
 # _clean_new_tags slugifies, drops a slug already in the frozen vocab, dedups.
-assert garden._clean_new_tags([{"slug": "Nix OS", "gloss": "g"}, {"slug": "version-control"}],
+assert garden.tag._clean_new_tags([{"slug": "Nix OS", "gloss": "g"}, {"slug": "version-control"}],
                               {"version-control": ""}) == [("nix-os", "g")], "novel + slugified only"
 
 

@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-staleness-")
 
-from ratchet import blobstore, config, dream, garden, review, weave  # noqa: E402
+from ratchet import blobstore, concepts, config, garden, review, temporal, weave  # noqa: E402
 from ratchet.garden import STALENESS_DAYS  # noqa: E402
 
 
@@ -109,7 +109,7 @@ def stale_ids(root):
     return {s["concept"]["id"] for s in garden.stale_concepts(root, now=NOW)}
 
 def concept_of(cid, root):
-    return next(c for c in dream.load_concepts(root) if c["id"] == cid)
+    return next(c for c in concepts.load_concepts(root) if c["id"] == cid)
 
 
 # === 0. last-corroborated = the most-recent valid-time; the horizon; undateable → fresh ==============
@@ -123,7 +123,7 @@ mint("c-relived", "re-lived lesson",
 mint("c-undated", "undateable lesson", [seed_cleaned("undated", None, R)], R)
 mint("c-rej", "second quiet lesson", [seed_cleaned("rej", STALE_MTIME, R)], R)
 
-vt = dream._session_valid_times(R)
+vt = temporal.session_valid_times(R)
 assert garden.concept_last_corroborated(concept_of("c-stale", R), vt, R, now=NOW) == STALE_MTIME, \
     "a single-session concept's last-corroborated is that session's valid-time"
 assert garden.concept_last_corroborated(concept_of("c-relived", R), vt, R, now=NOW) == RECENT_MTIME, \

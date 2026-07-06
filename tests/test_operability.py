@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-oper-")
 
-from ratchet import blobstore, block, chunk, config, dream, glean, review, tap  # noqa: E402
+from ratchet import blobstore, block, chunk, config, dream, events, glean, review, tap  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 JJ = "always commit with jj and never use git for version control"
@@ -158,14 +158,14 @@ cs_n = make_session("d-nix", JJ, NIX, R2)
 glean.run([cs_r], GleanFake(JJ), model="fake", root=R2)
 glean.run([cs_n], GleanFake(JJ), model="fake", root=R2)
 
-ws = dream.working_set(R2)
+ws = events.working_set(R2)
 assert len(ws) == 2, "two un-consolidated events, one per project"
 # the project hop resolves for each event (cleaned_hash → raw origin_ref.project).
 projs = {blobstore.project_of(rv.event["cleaned_hash"], R2) for rv in ws}
 assert projs == {RAT, NIX}, f"each event resolves to its source project: {projs}"
 
 # filter_by_source (the focus filter) and DreamBlock.items() both keep only the matching project.
-only_rat = dream.filter_by_source(ws, "ratchet", R2)
+only_rat = events.filter_by_source(ws, "ratchet", R2)
 assert {rv.event["cleaned_hash"] for rv in only_rat} == \
     {rv.event["cleaned_hash"] for rv in ws if blobstore.project_of(rv.event["cleaned_hash"], R2) == RAT}, \
     "filter_by_source keeps only ratchet-project events"

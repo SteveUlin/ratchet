@@ -30,7 +30,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .. import blobstore, config, dream, review
+from .. import blobstore, concepts, config, review
 from . import slugify
 
 # The asserted-edge kinds, ONE canonical direction each — `generalizes` is the hierarchy spine (its
@@ -42,7 +42,7 @@ ASSERTED_EDGE_KINDS = ("generalizes", "supersedes", "relates-to")
 EDGE_KIND = "concept_edge"             # an asserted inter-concept edge blob (vs 3a's derived edges)
 EDGE_SEP = "|"                         # edge identity = src|kind|dst (concept ids + kinds carry no `|`)
 TAG_CURATION_KIND = "tag_curation"     # a vocab-curation redirect blob (merge_tags / retire_tag)
-NOTE_MAX = 160                         # a short human note on an op/edge (matches dream's NOTE_MAX)
+NOTE_MAX = 160                         # a short human note on an op/edge (matches concepts.NOTE_MAX)
 
 
 # --- asserted edges: append-only `concept_edge` blobs, latest-wins, retract = active:false --------
@@ -178,7 +178,7 @@ def retire_tag(slug: str, *, note: str = "", root: Path | None = None,
 
 # --- concept helpers: load a version, the valid set, RE-VALIDATE evidence (the trust chain) -------
 
-def _concept_blob(concept_id: str, root: Path) -> dict | None:
+def concept_blob(concept_id: str, root: Path) -> dict | None:
     """The latest VERSION of a concept source — its raw blob, valid OR not (an op reads a loser's blob to
     union its evidence even as it invalidates it). A gone/malformed source → None, never fatal."""
     h = blobstore.latest_version(concept_id, root)
@@ -249,7 +249,7 @@ def _ingest_concept(concept_id: str, title: str, statement: str, evidence: list[
 def _write_concept_decision(verb: str, target: str, root: Path, *, run_id: str, **fields) -> None:
     """Append a lifecycle decision over a concept — written exactly like review._record / dream._write_decision
     (source_id == blob_hash(body), prev=None, fetched_at == body['at'], so the audited + folded timelines
-    agree). `dream.load_concepts` folds `supersede`/`split` (with `retire`) out of the valid set — the
+    agree). `concepts.load_concepts` folds `supersede`/`split` (with `retire`) out of the valid set — the
     invalidate-don't-delete fold: the concept blob + history stay, only the latest decision moves it."""
     at = config.now()
     body = {"verb": verb, "target": target, "at": at, "run_id": run_id,
@@ -293,8 +293,8 @@ def merge(loser_ids: list[str], winner_id: str, *, title: str | None = None,
     Returns winner_id."""
     root = root or config.data_root()
     run_id = run_id or config.run_id()
-    valid = dream.valid_concept_ids(root)               # the membership gate — winner AND losers
-    winner = _concept_blob(winner_id, root)
+    valid = concepts.valid_concept_ids(root)               # the membership gate — winner AND losers
+    winner = concept_blob(winner_id, root)
     if winner is None or winner_id not in valid:
         raise ValueError(f"merge winner {winner_id!r} is not a valid concept")
     pooled = list(winner.get("evidence") or [])
@@ -307,7 +307,7 @@ def merge(loser_ids: list[str], winner_id: str, *, title: str | None = None,
         if lid not in valid:
             continue                                    # an already-invalidated loser re-introduces
                                                         # moved-away evidence — skip (mirror the winner guard)
-        lc = _concept_blob(lid, root)
+        lc = concept_blob(lid, root)
         if lc is None:
             continue                                    # a gone loser is a no-op, never fatal
         pooled.extend(lc.get("evidence") or [])
@@ -323,7 +323,7 @@ def merge(loser_ids: list[str], winner_id: str, *, title: str | None = None,
     for lid in losers:                                  # carry edges, then record lineage + invalidate
         _carry_edges(lid, winner_id, root, run_id=run_id, op="merge")
         assert_edge(lid, "supersedes", winner_id, root=root, run_id=run_id, op="merge")
-        _write_concept_decision(dream.VERB_SUPERSEDE, lid, root, run_id=run_id, into=winner_id, op="merge")
+        _write_concept_decision(concepts.VERB_SUPERSEDE, lid, root, run_id=run_id, into=winner_id, op="merge")
     return winner_id
 
 
@@ -338,8 +338,8 @@ def split(concept_id: str, parts: list[dict], *, root: Path | None = None,
     Append-only, invalidate-don't-delete (ADR-0015). Returns the new ids."""
     root = root or config.data_root()
     run_id = run_id or config.run_id()
-    orig = _concept_blob(concept_id, root)
-    if orig is None or concept_id not in dream.valid_concept_ids(root):
+    orig = concept_blob(concept_id, root)
+    if orig is None or concept_id not in concepts.valid_concept_ids(root):
         raise ValueError(f"split target {concept_id!r} is not a valid concept")
     new_ids: list[str] = []
     for i, p in enumerate(parts):
@@ -355,7 +355,7 @@ def split(concept_id: str, parts: list[dict], *, root: Path | None = None,
                         extra_origin={"split_from": concept_id})
         assert_edge(concept_id, "supersedes", pid, root=root, run_id=run_id, op="split")
         new_ids.append(pid)
-    _write_concept_decision(dream.VERB_SPLIT, concept_id, root, run_id=run_id, parts=new_ids, op="split")
+    _write_concept_decision(concepts.VERB_SPLIT, concept_id, root, run_id=run_id, parts=new_ids, op="split")
     return new_ids
 
 
@@ -369,14 +369,14 @@ def abstract(child_ids: list[str], title: str, statement: str, *, evidence: list
     edges form the hierarchy spine (ADR-0015). Returns the parent id."""
     root = root or config.data_root()
     run_id = run_id or config.run_id()
-    valid = dream.valid_concept_ids(root)
-    children = [c for c in child_ids if c in valid and _concept_blob(c, root) is not None]
+    valid = concepts.valid_concept_ids(root)
+    children = [c for c in child_ids if c in valid and concept_blob(c, root) is not None]
     if not children:
         raise ValueError("abstract needs at least one valid child concept")
     if evidence is None:                                # default: UNION the children's evidence
         pooled: list[dict] = []
         for c in children:
-            pooled.extend((_concept_blob(c, root) or {}).get("evidence") or [])
+            pooled.extend((concept_blob(c, root) or {}).get("evidence") or [])
     else:
         pooled = list(evidence)                         # a curated subset the caller chose
     ev = _revalidate_evidence(pooled, root)
@@ -398,7 +398,7 @@ def reparent(concept_id: str, new_parent_id: str, *, root: Path | None = None,
     edge (byte-identical no-op) and finds nothing left to retract (ADR-0015)."""
     root = root or config.data_root()
     run_id = run_id or config.run_id()
-    valid = dream.valid_concept_ids(root)
+    valid = concepts.valid_concept_ids(root)
     if concept_id not in valid or new_parent_id not in valid:
         raise ValueError("reparent needs a valid concept and a valid new parent")
     for e in asserted_edges(root):                      # retract the OLD parent edge(s)
@@ -485,7 +485,7 @@ def mint_proposal_id(desc: dict) -> str:
     return PROPOSAL_PREFIX + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
 
 
-def _proposal_blob(proposal_id: str, root: Path | None = None) -> dict | None:
+def proposal_blob(proposal_id: str, root: Path | None = None) -> dict | None:
     """The latest VERSION of a `garden_proposal` source — its raw content dict, or None if unknown/malformed.
     The single loader the queue fold and the 3d gate both go through, so they agree on what "the proposal" is.
     The proposal carries NO lifecycle field; its resolution is a separate decision (`RESOLVE_VERBS`)."""

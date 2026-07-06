@@ -335,7 +335,7 @@ def raw_meta_of(cleaned_hash: str, root: Path | None = None, cache: dict | None 
     `derived_from` → raw meta), single-sourced. Every lineage read is a field off this one dict: the
     session id (`source_id`, `session_of`), the source handle (`origin_ref.project`/`.path`,
     `project_of`), the two clock stamps (`fetched_at` + `origin_ref.mtime`, glean's stamp fill), the
-    repo facet (`origin_ref` → `concepts._repo_label`, subject) — so the hop and its degrade policy
+    repo facet (`origin_ref` → `concepts.repo_label`, subject) — so the hop and its degrade policy
     live in exactly one spelling. An optional `cache` (keyed by cleaned_hash, holding the meta dict
     or None) memoizes across calls; sharing ONE cache across different field reads pays the hop once
     per cleaned blob. Absent/broken meta anywhere along the hop → None, never fatal — a lineage read
@@ -373,7 +373,7 @@ def project_of(cleaned_hash: str, root: Path | None = None, cache: dict | None =
     One meta hop per call, no content read, no LLM.
 
     A DOCUMENT source (ADR-0031) carries no `project` — deliberately, because `origin_ref.project`
-    also feeds the repo facet (`concepts._repo_label`) and a document must stay subject-empty — so
+    also feeds the repo facet (`concepts.repo_label`) and a document must stay subject-empty — so
     its FOCUS handle falls back to `origin_ref.path`: `--source CLAUDE.md` selects the document's
     chunks/events without ever granting it a repo identity."""
     m = raw_meta_of(cleaned_hash, root, cache)

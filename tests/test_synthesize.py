@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-synthesize-")
 
-from ratchet import blobstore, block, chunk, config, dream, glean, resolve, sig, synthesize  # noqa: E402
+from ratchet import blobstore, block, chunk, concepts, config, glean, resolve, sig, synthesize, temporal  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 from ratchet.resolve import claim_pool  # noqa: E402
 
@@ -194,8 +194,8 @@ seed_events([("cs-s1", JJ_SEED, JJ_SEED, M_HI, 0.85, "alpha")], R1)
 resolve.run(SynthNever(), model="fake", forget=False, root=R1)      # $0 path: mints the claim
 cold = claim_pool(R1)
 assert len(cold) == 1 and cold[0]["why"] is None and cold[0]["support"]["sessions"] == 1
-net1 = dream.net_entrenchment(cold[0], config.now(), root=R1)
-assert net1 < dream.MATURITY_WEIGHT, f"a 1-session seed sits below the bar: {net1:.2f}"
+net1 = temporal.net_entrenchment(cold[0], config.now(), root=R1)
+assert net1 < temporal.MATURITY_WEIGHT, f"a 1-session seed sits below the bar: {net1:.2f}"
 blk1 = synthesize.SynthesizeBlock(SynthNever(), model="fake")
 assert list(blk1.items(R1)) == [], \
     "THE cold-start property: a fresh 1-session why-null claim on a cold corpus → ZERO items"
@@ -227,7 +227,7 @@ assert after["why"] == GOOD["why"].strip(), "why filled with the clipped prose"
 assert after["title"] == "jj is the version-control interface", "title improved (stripped, capped)"
 assert after["kind"] == "reference", "the proposed kind is stored on the version and folds through"
 assert after["relation"] == {"kind": "new", "concept_id": None, "note": "covers the jj rule"}, \
-    "an unknown concept_id coerces the relation to new (dream._clean_relation)"
+    "an unknown concept_id coerces the relation to new (concepts.clean_relation)"
 assert after["support"] == before["support"] and after["cites"] == before["cites"] \
     and after["sessions_seen"] == before["sessions_seen"] and after["scope"] == before["scope"], \
     "synthesis mints a claim VERSION only — every edge-derived attribute is unchanged"

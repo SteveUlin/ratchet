@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-garden-propose-")
 
-from ratchet import blobstore, config, dream, garden, weave  # noqa: E402
+from ratchet import blobstore, concepts, config, garden, weave  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 R = config.ensure_layout()
@@ -77,7 +77,7 @@ def mint(cid, title, evidence):
 
 
 def valid_ids():
-    return {c["id"] for c in dream.load_concepts(R)}
+    return {c["id"] for c in concepts.load_concepts(R)}
 
 def active_edge(src, kind, dst):
     return any(e["src"] == src and e["kind"] == kind and e["dst"] == dst for e in garden.asserted_edges(R))
@@ -125,19 +125,19 @@ SCRIPT = [
 # === 0. pure coercion + stakes routing (no LLM) =====================================================
 
 members, valid = {"c-k1", "c-k2", "c-k3"}, valid_ids()
-assert garden._clean_op(SCRIPT[0], member_ids=members, valid_ids=valid, cluster_tags=set())["op"] == "merge", \
+assert garden.propose._clean_op(SCRIPT[0], member_ids=members, valid_ids=valid, cluster_tags=set())["op"] == "merge", \
     "a well-formed merge over in-cluster valid ids survives coercion"
-assert garden._clean_op(SCRIPT[2], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
+assert garden.propose._clean_op(SCRIPT[2], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
     "a merge whose winner is a VALID concept OUTSIDE the cluster is dropped"
-assert garden._clean_op(SCRIPT[3], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
+assert garden.propose._clean_op(SCRIPT[3], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
     "a relate citing a nonexistent id is dropped"
-assert garden._clean_op(SCRIPT[4], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
+assert garden.propose._clean_op(SCRIPT[4], member_ids=members, valid_ids=valid, cluster_tags=set()) is None, \
     "an unknown op kind is dropped"
 # the stakes gradient routes merge HIGH (queue), relate LOW (auto) around the recall-first threshold.
-merge_desc = garden._clean_op(SCRIPT[0], member_ids=members, valid_ids=valid, cluster_tags=set())
-relate_desc = garden._clean_op(SCRIPT[1], member_ids=members, valid_ids=valid, cluster_tags=set())
-assert garden._op_stakes_of(merge_desc) > garden.AUTO_APPLY_MAX_STAKES, "merge is above the auto cut → queues"
-assert garden._op_stakes_of(relate_desc) <= garden.AUTO_APPLY_MAX_STAKES, "relate is at/below the cut → auto"
+merge_desc = garden.propose._clean_op(SCRIPT[0], member_ids=members, valid_ids=valid, cluster_tags=set())
+relate_desc = garden.propose._clean_op(SCRIPT[1], member_ids=members, valid_ids=valid, cluster_tags=set())
+assert garden.propose._op_stakes_of(merge_desc) > garden.AUTO_APPLY_MAX_STAKES, "merge is above the auto cut → queues"
+assert garden.propose._op_stakes_of(relate_desc) <= garden.AUTO_APPLY_MAX_STAKES, "relate is at/below the cut → auto"
 # the proposal id is deterministic on the op IDENTITY (kind + params), not the rationale.
 other = dict(merge_desc, rationale="a totally different justification")
 assert garden.mint_proposal_id(merge_desc) == garden.mint_proposal_id(other), \
@@ -220,9 +220,9 @@ SPLIT_OP = {"op": "split", "concept_id": "c-k1",
             "parts": [{"title": "split part a", "statement": "the narrower lesson a"},
                       {"title": "split part b", "statement": "the narrower lesson b"}],
             "rationale": "c-k1 conflates two distinct lessons"}
-split_desc = garden._clean_op(SPLIT_OP, member_ids={"c-k1", "c-k2", "c-k3"}, valid_ids=valid_ids(),
+split_desc = garden.propose._clean_op(SPLIT_OP, member_ids={"c-k1", "c-k2", "c-k3"}, valid_ids=valid_ids(),
                               cluster_tags=set())
-assert split_desc is not None and garden._op_stakes_of(split_desc) > garden.AUTO_APPLY_MAX_STAKES, \
+assert split_desc is not None and garden.propose._op_stakes_of(split_desc) > garden.AUTO_APPLY_MAX_STAKES, \
     "the split survives coercion and scores HIGH on the stakes gradient"
 
 split_proposer = ProposerFake([SPLIT_OP])

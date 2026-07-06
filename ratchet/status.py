@@ -13,7 +13,7 @@ could desync):
   PREP      cleaned blobs woven, chunksets materialized, and the glean done-split: chunks with a
             `processed` marker under the CURRENT prompt_version (`block.done_index` — a prompt
             bump honestly re-opens the backlog) vs pending.
-  EVENTS    total extracted vs still in `dream.working_set` (un-consolidated → resolve's queue).
+  EVENTS    total extracted vs still in `events.working_set` (un-consolidated → resolve's queue).
   CLAIMS    the L1 pool (`resolve.claim_pool`) split by the derived predicates: active/dormant
             (`is_active`), mature (net entrenchment >= the bar), matured-awaiting-synthesize
             (mature AND why=null — the §7.3 "why pending" population, counted explicitly),
@@ -42,7 +42,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from . import blobstore, block, chunk, config, dream, glean, resolve, tap, weave
+from . import blobstore, block, chunk, concepts, config, events, glean, resolve, tap, temporal, weave
 
 # The zero shape of every section — what a data-less (or failing) stage reports. One source of
 # truth for both the graceful degrade and the --json schema (a consumer can rely on the keys).
@@ -102,7 +102,7 @@ def _prep(root: Path) -> dict:
 
 def _events(root: Path) -> dict:
     return {"total": len(blobstore.latest_by_kind("event", root)),
-            "awaiting_resolve": len(dream.working_set(root))}
+            "awaiting_resolve": len(events.working_set(root))}
 
 
 def _claims(root: Path, maturity: float) -> dict:
@@ -111,21 +111,21 @@ def _claims(root: Path, maturity: float) -> dict:
     them. `awaiting_synthesize` = mature AND why=null — the §7.3 deferred-synthesize queue, bounded
     by the graduation rate; it is also review's "why pending" badge population (§6)."""
     now = config.now()
-    valid_times = dream._session_valid_times(root)
+    valid_times = temporal.session_valid_times(root)
     decisions = blobstore.latest_decisions(root)
     pool = resolve.claim_pool(root)
     active = sum(1 for c in pool
                  if resolve.is_active(c, now=now, valid_times=valid_times))
     mature = [c for c in pool
-              if dream.net_entrenchment(c, now, valid_times=valid_times) >= maturity]
+              if temporal.net_entrenchment(c, now, valid_times=valid_times) >= maturity]
     awaiting = sum(1 for c in mature if c.get("why") is None)
     accepted = 0
     for c in pool:
         d = decisions.get(c["id"])
-        if d and d.get("verb") in resolve.ACCEPT_VERBS and resolve._decision_binds(d, c):
+        if d and d.get("verb") in resolve.ACCEPT_VERBS and resolve.decision_binds(d, c):
             accepted += 1
     contested = sum(1 for c in pool if c.get("contradicted_by"))
-    edges = [e for es in resolve._live_edges(root, resolve._reject_merge_facts(root)).values()
+    edges = [e for es in resolve.live_edges(root, resolve.reject_merge_facts(root)).values()
              for e in es]
     llm = sum(1 for e in edges if (e.get("match") or {}).get("by") == "llm")
     return {"total": len(pool), "active": active, "dormant": len(pool) - active,
@@ -159,10 +159,10 @@ def _concepts(root: Path) -> dict:
     the global projection and routes via `generate --repo`. Same derivation the projection filters
     on (`load_concepts` attaches each concept's decision-folded kind + scope), so the splits and
     the region always agree."""
-    cs = dream.load_concepts(root)
-    ref = sum(1 for c in cs if c.get("kind") == dream.KIND_REFERENCE)
-    scopes = Counter(dream.clean_scope(c.get("scope")) for c in cs)
-    scopes.pop(dream.SCOPE_GLOBAL, None)
+    cs = concepts.load_concepts(root)
+    ref = sum(1 for c in cs if c.get("kind") == concepts.KIND_REFERENCE)
+    scopes = Counter(concepts.clean_scope(c.get("scope")) for c in cs)
+    scopes.pop(concepts.SCOPE_GLOBAL, None)
     return {"valid": len(cs), "behavioral": len(cs) - ref, "reference": ref,
             "scoped": sum(scopes.values()), "scopes": dict(sorted(scopes.items()))}
 
@@ -181,7 +181,7 @@ def _generate(root: Path) -> dict:
 
 
 def census(root: Path | None = None, *, datastore: Path = tap.DEFAULT_DATASTORE,
-           maturity: float = dream.MATURITY_WEIGHT) -> dict:
+           maturity: float = temporal.MATURITY_WEIGHT) -> dict:
     """The whole census as ONE object (the --json payload; the text render reads this same dict —
     one derivation, two presentations). Read-only, no LLM; every section degrades to `ZEROS`."""
     root = root or config.data_root()
@@ -231,9 +231,9 @@ def main(argv=None) -> None:
     ap.add_argument("--json", action="store_true", help="emit the census as one JSON object")
     ap.add_argument("--datastore", type=Path, default=tap.DEFAULT_DATASTORE,
                     help=f"transcript root the SOURCES line sweeps (default: {tap.DEFAULT_DATASTORE})")
-    ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT, metavar="BAR",
+    ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT, metavar="BAR",
                     help=f"the maturity bar the mature/pending counts use (default "
-                         f"{dream.MATURITY_WEIGHT} — the reviewer's knob, ADR-0027; keep it in step "
+                         f"{temporal.MATURITY_WEIGHT} — the reviewer's knob, ADR-0027; keep it in step "
                          f"with the bar you review at so the census and the queue agree)")
     args = ap.parse_args(argv)
     c = census(datastore=args.datastore, maturity=args.maturity)

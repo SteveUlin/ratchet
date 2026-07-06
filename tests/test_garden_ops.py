@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-garden-ops-")
 
-from ratchet import blobstore, concepts, config, dream, garden, review, weave  # noqa: E402
+from ratchet import blobstore, concepts, config, garden, review, weave  # noqa: E402
 
 R = config.ensure_layout()
 RUN = "op-test"
@@ -82,11 +82,11 @@ def mint(cid, title, evidence):
 
 
 def valid_ids():
-    return {c["id"] for c in dream.load_concepts(R)}
+    return {c["id"] for c in concepts.load_concepts(R)}
 
 def concept_evidence(cid):
     """The cleaned_hashes a (latest version of a) concept currently cites — a set, for union/subset checks."""
-    obj = garden._concept_blob(cid, R)
+    obj = garden.concept_blob(cid, R)
     return {e["cleaned_hash"] for e in (obj.get("evidence") or [])} if obj else set()
 
 def active_edge(src, kind, dst):
@@ -94,7 +94,7 @@ def active_edge(src, kind, dst):
 
 def trust_chain_holds(cid):
     """Every evidence pointer of a concept re-validates against its immutable blob (review's verified gate)."""
-    obj = garden._concept_blob(cid, R)
+    obj = garden.concept_blob(cid, R)
     resolved = review.resolve_evidence({"evidence": obj.get("evidence") or []}, R)
     return len(resolved) == len(obj.get("evidence") or []) and all(e["verified"] for e in resolved)
 
@@ -162,7 +162,7 @@ print("OK §1 — merge unions+re-validates evidence, invalidates-not-deletes lo
 
 ch_s1, ch_s2, ch_s3 = cleaned("s1"), cleaned("s2"), cleaned("s3")
 mint("c-split", "splittable", [ev_ptr("ev-s1", ch_s1), ev_ptr("ev-s2", ch_s2), ev_ptr("ev-s3", ch_s3)])
-orig_ev = garden._concept_blob("c-split", R)["evidence"]
+orig_ev = garden.concept_blob("c-split", R)["evidence"]
 parts = [{"title": "part one", "statement": "first half", "evidence": [orig_ev[0]]},          # subset {s1}
          {"title": "part two", "statement": "second half", "evidence": orig_ev[1:]}]           # subset {s2,s3}
 
@@ -179,8 +179,8 @@ for pid in new_ids:
     assert trust_chain_holds(pid), f"part {pid} evidence re-validates — the trust chain reaches each part"
 # determinism: the part ids are a deterministic function of the op inputs (incl. the part INDEX —
 # resumable crash-retry re-mints the same ids).
-assert garden._mint_op_concept_id("c-split|split|0|part one") == new_ids[0], "part ids are deterministic"
-assert garden._mint_op_concept_id("c-split|split|1|part two") == new_ids[1], "the index folds into the id"
+assert garden.ops._mint_op_concept_id("c-split|split|0|part one") == new_ids[0], "part ids are deterministic"
+assert garden.ops._mint_op_concept_id("c-split|split|1|part two") == new_ids[1], "the index folds into the id"
 # safety: re-splitting a now-INVALID original is refused cleanly (no double-split, state unchanged).
 try:
     garden.split("c-split", parts, run_id="rerun")
@@ -289,7 +289,7 @@ assert active_edge("c-lose1", "supersedes", "c-win"), "...but the supersedes edg
 assert any("shared" in e for e in graph["edges"]) or all("asserted" in e for e in graph["edges"]), \
     "derived edges keep their `shared` shape alongside asserted ones"
 # the trust chain re-validates for EVERY valid concept (no minted/versioned concept floats free of evidence).
-assert all(trust_chain_holds(c["id"]) for c in dream.load_concepts(R)), \
+assert all(trust_chain_holds(c["id"]) for c in concepts.load_concepts(R)), \
     "every valid concept's evidence re-validates against its immutable blobs"
 print("OK §7 — concept_graph folds asserted edges + the hierarchy; supersedes-of-invalid drops out; trust chain holds.")
 
@@ -354,7 +354,7 @@ print("OK §9 — merge/split/abstract refuse an empty re-validated evidence poo
 # === 10. SPLIT part-id collision: same/empty-title parts mint DISTINCT ids (the index disambiguates) ==
 ch_c1, ch_c2 = cleaned("col1"), cleaned("col2")
 mint("c-collide", "collidable", [ev_ptr("ev-c1", ch_c1), ev_ptr("ev-c2", ch_c2)])
-oev = garden._concept_blob("c-collide", R)["evidence"]
+oev = garden.concept_blob("c-collide", R)["evidence"]
 # two parts with the SAME (empty) title: without the part INDEX in the mint material the second collides
 # onto the first's id and silently overwrites it, losing a part.
 cparts = [{"title": "", "statement": "first", "evidence": [oev[0]]},

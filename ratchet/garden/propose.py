@@ -26,7 +26,7 @@ import argparse
 from itertools import combinations
 from pathlib import Path
 
-from .. import blobstore, block, completer, concepts, config, dream, review
+from .. import blobstore, block, completer, concepts, config, review, temporal
 from ..completer import Completer
 from . import slugify
 from .ops import (
@@ -363,7 +363,7 @@ def concept_last_corroborated(concept: dict, valid_times: dict, root: Path | Non
     """The MOST-RECENT valid-time among a concept's evidence's sessions — when this concept was last RE-LIVED
     (ADR-0024). The hop is the trust chain's, read-side: each evidence pointer's `cleaned_hash` →
     `blobstore.session_of` (cleaned → raw → session id) → `valid_times[sid]` (the session's date, via
-    `dream._session_valid_times`, recompute-on-read). Returns the newest such valid-time, or None when NO
+    `temporal.session_valid_times`, recompute-on-read). Returns the newest such valid-time, or None when NO
     evidence dates — recall-safe: an undateable concept is treated as FRESH downstream (never proposed for
     retire on a date we cannot read), mirroring `recency_weight`'s missing-date → 1.0. `now` only pins the
     ordering reference (the RESULT is now-invariant — a constant offset cancels); threaded for one-clock
@@ -389,15 +389,15 @@ def concept_last_corroborated(concept: dict, valid_times: dict, root: Path | Non
 def stale_concepts(root: Path | None = None, *, days: float = STALENESS_DAYS,
                    now: str | None = None) -> list[dict]:
     """The QUIET concepts — valid concepts whose last-corroborated valid-time is more than `days` old
-    (ADR-0024). RECOMPUTE-ON-READ: the session valid-times are folded ONCE (`dream._session_valid_times`) and
+    (ADR-0024). RECOMPUTE-ON-READ: the session valid-times are folded ONCE (`temporal.session_valid_times`) and
     `now` is pinned ONCE, so every concept ages against the same clock (deterministic when a test injects
     `now`). A concept with NO datable evidence is SKIPPED (treated fresh — recall-safe). Returns
     [{concept, last_corroborated, age_days}] — the substrate `propose_stale` queues retire proposals from."""
     root = root or config.data_root()
-    valid_times = dream._session_valid_times(root)
+    valid_times = temporal.session_valid_times(root)
     sessions: dict = {}
     out: list[dict] = []
-    for concept in dream.load_concepts(root):
+    for concept in concepts.load_concepts(root):
         last = concept_last_corroborated(concept, valid_times, root, sessions=sessions, now=now)
         if last is None:
             continue                                    # undateable → fresh; never flag what we cannot date
@@ -507,7 +507,7 @@ class GardenProposeBlock:
         `source_id` is ignored (the gardener is a global pass). Only clusters of >= `min_cluster` concepts are
         worth a sharp call (a singleton has nothing to merge/relate)."""
         graph = concepts.concept_graph(root)
-        self._blob_by_id = {c["id"]: c for c in dream.load_concepts(root)}
+        self._blob_by_id = {c["id"]: c for c in concepts.load_concepts(root)}
         self._valid = set(self._blob_by_id)
         self._facets_by_id = {n["id"]: n["facets"] for n in graph["nodes"]}
         self._asserted = asserted_edges(root)

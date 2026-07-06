@@ -35,13 +35,13 @@ from .ops import (                                   # noqa: E402  (must follow 
     ASSERTED_EDGE_KINDS, AUTO_APPLY_MAX_STAKES, PROPOSAL_KIND, RESOLVE_VERBS,
     abstract, assert_edge, asserted_edges, edge_id, merge, merge_tags, mint_proposal_id,
     op_stakes, open_proposals, queue_proposal, reparent, retire, retire_tag, retract_edge,
-    split, tag_curation, _concept_blob, _mint_op_concept_id, _proposal_blob,
+    concept_blob, proposal_blob, split, tag_curation,
 )
 from .tag import (                                   # noqa: E402
     ASSIGN_PREFIX, VOCAB_MAX, GardenBlock, add_tag, all_concept_tags, assign_tags, concept_tags,
-    main, run, vocab_fingerprint, vocabulary, _clean_assigned, _clean_new_tags,
+    main, run, vocab_fingerprint, vocabulary,
 )
 from .propose import (                               # noqa: E402
     STALENESS_DAYS, GardenProposeBlock, concept_last_corroborated, propose_main, propose_stale,
-    run_propose, stale_concepts, _clean_op, _op_stakes_of,
+    run_propose, stale_concepts,
 )

@@ -3,7 +3,7 @@ KNOWN write-tool geometry, weave them (so the write lines are weave's real rende
 `→ Edit: /path`, NotebookEdit's JSON-arg line), locate evidence spans as byte offsets into the
 cleaned blob (glean's exact representation), and assert: narrowing (a span near one Edit keeps just
 that file), the whole-session-union fallback (a span far from every write, or an invalid span), the
-empty key of a no-edit/no-cwd session (`is_empty`), repo naming via `_repo_label` (cwd basename),
+empty key of a no-edit/no-cwd session (`is_empty`), repo naming via `repo_label` (cwd basename),
 the batch `cache`, and the `subject_overlap` math (W_FILE/W_REPO reused; tools fixed at 0;
 empty∩empty = 0).
 
@@ -83,13 +83,13 @@ assert lesson[0] - alpha_line[1] > subject.SPAN_WINDOW, "geometry: lesson must c
 assert beta_line[0] - lesson[1] < subject.SPAN_WINDOW, "geometry: lesson must sit inside beta's window"
 
 
-# === (a) narrowing: a span near ONE Edit line yields just that file; (d) repo via _repo_label ======
+# === (a) narrowing: a span near ONE Edit line yields just that file; (d) repo via repo_label ======
 
 k_lesson = subject.subject_key(R, ch1, lesson)
 assert k_lesson == {"repo": "widget", "files": ["/w/beta.py"]}, \
     f"the lesson's co-located write is beta.py alone (alpha is a window away): {k_lesson}"
 assert not subject.is_empty(k_lesson)
-# repo is the origin CWD's basename (concepts._repo_label), not the datastore slug.
+# repo is the origin CWD's basename (concepts.repo_label), not the datastore slug.
 assert k_lesson["repo"] == "widget", k_lesson
 
 

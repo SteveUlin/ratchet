@@ -1,60 +1,24 @@
-"""dream v2 — incremental WORKING-SET CONSOLIDATION: route each un-consolidated glean event to one of
-NEW / STRENGTHEN / WEAKEN / NOOP and maintain a small, live CATALOG of durable, evidence-cited
-**takeaways** (ADR-0010, superseding 0006's global re-cluster).
+"""dream — the TOMBSTONED v2 consolidation stage (ADR-0010), superseded by `resolve` (ADR-0028's
+statement-first entity resolution) and dissected to its legacy arm (ADR-0032).
 
-    … chunk → chunkset → glean → events → dream → takeaways → [human review] → concepts → generate
-                                            (consolidation: a cheap router + a rare synthesizer)
+The live kernel that grew up here moved home: the event fold + working set → `events`, the
+valid-time/maturity oracle → `temporal`, the concept loaders + field schema → `concepts`. What
+remains IS this file's purpose now:
 
-v1 clustered the WHOLE event pile every run, then one Sonnet call per cluster. It under-merged (lexical
-TF-IDF over short quotes is too sparse), churned (a new event shifted cluster signatures and re-fired
-synthesis), and never "failed in the middle." v2 inverts it into a bounded, iterative, ORDER-aware loop
-— and, with no embeddings available (only the authed claude CLI), uses the LLM ITSELF as the similarity
-oracle over an IN-PROMPT catalog, not a vector index.
+  THE LEGACY ARM — `catalog` / `current_takeaways` / `contradicted_takeaways`, the v2 takeaway views
+  review still UNIONS into its queue beside v3 claims (claims preferred on a shared id), and
+  `mint_takeaway_id`, the `t-…` id mint v3 claims deliberately reuse so the v2-reset's `retire`
+  decisions land on the re-minted ids (`resolve.decision_binds` guards the collision).
 
-The model (ADR-0010):
+  THE SUPERSEDED MACHINERY — everything below the V2 banner: the route/apply consolidator
+  (ADR-0010/0012's NEW/STRENGTHEN/WEAKEN/NOOP over an in-prompt catalog, stable takeaway ids,
+  BIRCH-style support/contradiction stats, demotion by net entrenchment, never deletion), its
+  prompts, forget/merge maintenance, `DreamBlock`, and the CLI. Runnable and tested, but no live
+  stage calls into it — its recorded failure (corroboration measured co-occurrence, not recurrence,
+  and a wrong merge latched) is ADR-0028's Context.
 
-  WORKING SET — a DERIVED query: every glean event (latest version) MINUS those whose latest lifecycle
-  decision is `consolidated` or `stale`. Ordered by SALIENCE (markers × confidence) into a PRIORITY
-  QUEUE, so the strongest evidence seeds/corroborates first and stragglers wait (and are forgotten
-  first). This is `DreamBlock.items()`.
-
-  CATALOG — the current takeaways: `latest_by_kind('takeaway')` minus any with a merge/retire/reject
-  decision. Small by design (forgetting + the maturity gate bound it), so the WHOLE catalog renders into
-  the route prompt — NO retrieval, NO top-K, NO embeddings; the router reads it all.
-
-  ROUTE — one cheap Haiku call per event: given the event's VERIFIED verbatim quote + summary and the
-  catalog as a numbered list, return {decision: new|strengthen|weaken|noop, takeaway_id}. A strengthen
-  naming an id not in the catalog is coerced to `new`; a weaken naming an unknown id is coerced to `noop`
-  (never mint a 'negative' takeaway — defensive, like `_clean_relation`).
-
-  APPLY —
-    new        → SYNTHESIZE (one Sonnet call): mint a STABLE takeaway id (`t-`+sha256(seed_event)[:12]),
-                 write the takeaway with the cited event's evidence (span + verbatim quote + context),
-                 support {events:1, sessions:1}; then a `consolidated` decision for the event.
-    strengthen → BUMP SUPPORT (cheap, NO LLM by default): a NEW VERSION of that takeaway id (the
-                 blobstore TimeMap versions it, latest wins) — append the new event's evidence (dedup by
-                 event_id), union distinct sessions, recompute support (the BIRCH sufficient-statistic),
-                 max-merge markers, bump last_seen. RE-SYNTHESIZE the `why` only when lexical drift
-                 crosses a threshold; else just bump. Then a `consolidated` decision.
-    weaken     → BUMP CONTRADICTIONS (ALWAYS NO LLM — ADR-0012): the SYMMETRIC half — append the
-                 contradicting event to contradicted_by/contradiction_evidence (dedup by event_id),
-                 recompute the contradictions stat; support/why/title ride untouched. A takeaway demotes
-                 by NET entrenchment (support.sessions − contradictions.sessions < the maturity bar), never
-                 by deletion — contested, quarantined, retained, re-graduatable. Then a `consolidated`
-                 decision (the event is incorporated AS a contradiction).
-    noop       → nothing durable; the event stays un-consolidated (later forgotten).
-
-  TAKEAWAY IDENTITY — the key change from v1: `source_id` is a STABLE MINTED id, so an UPDATE is a new
-  VERSION of the same id (no membership churn). The v1 coverage-conditioned supersession is GONE; the
-  current set is `latest_by_kind('takeaway')` latest-per-id minus merged/retired. The stored content is a
-  strict SUPERSET of what review reads, so review.py and the trust chain are UNCHANGED.
-
-dream v2 is a `block.Block` (ADR-0009) that commits PER ITEM (the inversion of v1's per-run finalize):
-`items()` yields the salience-ordered working set; `priority()` orders it; `process()` routes + applies,
-committing each event's takeaway version + `consolidated` decision immediately (resumable, fail-in-the-
-middle), and folds the result into the ON-INSTANCE catalog so the NEXT event routes against the updated
-catalog. `finalize()` runs a conservative `forget` pass. The route and synth calls are SEPARATE injected
-`Completer`s (Haiku + Sonnet), so the whole loop is offline-testable with fakes.
+The module deletes entirely in a future ADR once the legacy takeaway queue empties (after the
+`resolve --reset-v2` drain): tests and history ride jj, not the tree.
 """
 from __future__ import annotations
 
@@ -65,12 +29,86 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
-from . import blobstore, block, completer, config
+from . import blobstore, block, completer, concepts, config, events, temporal
 from .completer import Completer
-from .glean import MARKER_KINDS, clean_relevance   # the marker + relevance vocab is glean's; dream carries it up
+from .glean import MARKER_KINDS      # the marker vocab is glean's; the takeaway folds max-merge over it
+
+# --- the legacy arm review still reads: the takeaway views + the shared t-… id space --------------
+
+def catalog(root: Path | None = None) -> list[dict]:
+    """The full LIVE routing catalog: `latest_by_kind('takeaway')` (latest version per stable id) MINUS
+    any takeaway whose latest lifecycle decision is in {merge, retire, reject}. INCLUDES incubating
+    takeaways (sessions < the maturity bar) so the router can strengthen them toward maturity. Small by
+    design (forgetting + the maturity gate bound it) → the whole list renders into the route prompt; no
+    retrieval, no embeddings. This REPLACES v1's supersede-fold for routing."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    out: list[dict] = []
+    for sid, h in blobstore.latest_by_kind("takeaway", root).items():
+        d = decisions.get(sid)
+        if d and d.get("verb") in ("merge", "retire", "reject"):
+            continue
+        try:
+            t = json.loads(blobstore.get(h, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(t, dict) and (t.get("id") or sid):
+            t.setdefault("id", sid)
+            out.append(t)
+    return out
+
+
+def current_takeaways(root: Path | None = None, *, min_weight: float = temporal.MATURITY_WEIGHT,
+                      now: str | None = None, valid_times: dict | None = None) -> list[dict]:
+    """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways by
+    RECENCY-WEIGHTED net entrenchment (`net_entrenchment >= min_weight`, ADR-0023 — the float that weights
+    each support/contradiction session by its valid-time, superseding the raw `net_sessions` count at the
+    gate, ADR-0012). `review.pending()` calls this with the default bar, so only takeaways corroborated
+    across enough DISTINCT, RECENT-ENOUGH sessions NET of contradictions reach the human gate; incubating
+    (and CONTESTED) ones stay live (routable via `catalog()`) but invisible to review. A strongly-,
+    recently-corroborated takeaway survives a lone (or aged) contradiction; a contested one un-graduates yet
+    is never retired — it re-graduates if RECENT corroboration returns. A months-old backfill can neither
+    re-mature a stale takeaway (its weight decayed below the bar) nor strongly overturn a current one. With
+    FRESH evidence `net_entrenchment == net_sessions`, so this graduates exactly the takeaways the old
+    `net_sessions >= MATURITY_SESSIONS` gate did. Same name/return type — review.py rides it unchanged.
+
+    `valid_times` (built once, threaded) and `now` (a pinned instant) make the scan-once + deterministic
+    properties explicit; absent, both default — one transcript scan + real now."""
+    root = root or config.data_root()
+    if valid_times is None:
+        valid_times = temporal.session_valid_times(root)
+    return [t for t in catalog(root)
+            if temporal.net_entrenchment(t, now, valid_times=valid_times) >= min_weight]
+
+
+def contradicted_takeaways(root: Path | None = None) -> list[dict]:
+    """The live takeaways carrying a recorded contradiction: `catalog()` filtered to
+    `contradictions.events > 0` (ADR-0012). A contested/demoted takeaway is NEVER silently lost — it stays
+    in `catalog()` (routable, re-graduatable) but is surfaced here for spot-checking and a future review
+    surface (quarantine, not delete). Read defensively: a dream/2 blob with no field reads as zero."""
+    return [t for t in catalog(root)
+            if ((t.get("contradictions") or {}).get("events", 0)) > 0]
+
+
+def mint_takeaway_id(seed_event_id: str) -> str:
+    """The STABLE id of a new takeaway — DETERMINISTIC on the seeding event id (NOT random, NOT a
+    cluster signature). Determinism is load-bearing for resumability: a crash-retry of the same `new`
+    event re-mints the SAME id, so the duplicate is absorbed as a no-op TimeMap version (latest wins)
+    instead of orphaning a second takeaway. Independent of prompt/model (a prompt bump never re-routes a
+    consolidated event, so the id need not vary by params). Distinct event_ids → distinct ids; 12 hex of
+    sha256 makes collision risk negligible."""
+    return "t-" + hashlib.sha256(seed_event_id.encode("utf-8")).hexdigest()[:12]
+
+
+# ===================================================================================================
+# THE SUPERSEDED V2 MACHINERY (ADR-0028/0032): everything below is dream v2's route/apply consolidator
+# — prompts, similarity, the takeaway write path, forget/merge maintenance, DreamBlock, the CLI. No
+# live stage calls INTO it; review's queue union above is the only production reader of its OUTPUT
+# (the stored takeaways). Kept runnable until the legacy takeaway queue empties; then the whole
+# module deletes (ADR-0032).
+# ===================================================================================================
 
 PROMPT_VERSION = "dream/3"               # bump to re-route NOT-yet-consolidated events with a sharper prompt
                                          # (dream/3 adds the WEAKEN verdict — ADR-0012)
@@ -78,131 +116,7 @@ ROUTE_MODEL = "haiku"                    # the router is cheap + per-event → t
 SYNTH_MODEL = "sonnet"                   # synthesis is rare (new + drift) → afford a sharper model
 OUT_NOUN = "takeaways"                   # the per-event output noun the Progress bar/line shows
 
-MATURITY_SESSIONS = 2                    # the raw distinct-session count kept for audit/back-compat (net_sessions)
-
-# Recency-trust weighting (ADR-0023): entrenchment is weighted by each evidence's VALID-TIME (the session's
-# date — when the conversation happened), so a months-long backfill of OLD conversations can neither
-# re-entrench a stale takeaway nor strongly overturn a current one. "Newer = higher trust", a continuous
-# curve, not a gate. Both dials are UNTUNED — they want a gold set, like every weight in dream.
-RECENCY_HALF_LIFE_DAYS = 180.0          # UNTUNED — "how fast does the world change": the age at which a piece
-                                        # of evidence is worth HALF a fresh one. A months scale (~6mo) so a
-                                        # year-old corroboration counts ~1/4, a 2-year-old ~1/16. One edit retunes.
-MATURITY_WEIGHT = 1.5                   # UNTUNED — the FLOAT review bar net_entrenchment must cross. Sits in the
-                                        # integer gap [MATURITY_SESSIONS-1, MATURITY_SESSIONS): with FRESH evidence
-                                        # (every weight ≈1, net_entrenchment integer-valued) `>= 1.5` is byte-
-                                        # identical to the old `net_sessions >= 2`, so today's graduations are
-                                        # preserved — yet it leaves headroom so mildly-aged-but-recent evidence
-                                        # still matures (2 sessions a few weeks old don't fall under the bar).
-COALESCE_HOURS = 12.0                   # UNTUNED — the SITTING window (hours). A /clear-split or crash-
-                                        # restarted afternoon writes 2+ transcript files, which read as 2+
-                                        # "distinct sessions" — so ONE sitting of work could mature a claim
-                                        # at the ~2-session bar (the cheapest fake-maturity path; the
-                                        # ADR-0028 backlog line, closed here). Wherever distinct sessions
-                                        # are COUNTED (support, contradictions, maturity, resolve's
-                                        # same-session gate), same-repo sessions whose valid-times fall
-                                        # within this window coalesce into ONE sitting; different repos stay
-                                        # distinct — a repo jump is a genuine context switch, the very
-                                        # independence distinct-session support measures. 12h spans a long
-                                        # working day; sleep is the natural sitting boundary. 0 = off (the
-                                        # escape hatch); --coalesce-hours on resolve/review overrides per run.
 DRIFT_THRESHOLD = 0.5                    # lexical drift above which a strengthen re-synthesizes the why
-FORGET_TAU = 4                           # dream cycles an event may sit un-consolidated before forget-eligible
-FORGET_SALIENCE_FLOOR = 0.05             # AND its salience must be below this (never age alone — ADR-0010 §6)
-CONTEXT_BYTES = 160                      # surrounding-context window stored alongside each evidence quote
-
-TITLE_MAX = 80
-WHY_MAX = 280
-NOTE_MAX = 160
-
-
-def _clip(text: str, limit: int = WHY_MAX) -> str:
-    """Length-cap a synthesized field WITHOUT chopping mid-word. A hard `[:limit]` once shipped a rule
-    ending `…evaluates the s` — the why becomes the concept STATEMENT becomes the CLAUDE.md rule, so a
-    guillotined sentence lands verbatim in a human's config. Prefer the last SENTENCE boundary that fits
-    (a complete thought, no ellipsis); else the last WORD boundary + `…` (clearly abbreviated, never
-    broken). Stays within `limit`."""
-    t = text.strip()
-    if len(t) <= limit:
-        return t
-    cut = t[:limit]
-    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-    if end >= limit // 2:                          # a real sentence break, not a stray early period
-        return cut[:end + 1].rstrip()
-    sp = cut.rfind(" ")
-    base = cut[:sp] if sp >= limit // 2 else cut[:limit - 1]
-    return base.rstrip() + "…"
-
-# Salience weights: surprise highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
-W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
-
-# Relevance multipliers (4b/ADR-0019): glean's Bayesian-surprise-vs-the-store verdict SCALES salience so
-# the queue drains NOVEL/CONTRADICTING events first and ALREADY-KNOWN ones last. RECALL-FIRST — `known`
-# only SINKS (deferred under budget), it never hard-drops; the invisible false-negative (silently dropping
-# a learning we wrongly called known) is the costly error (ADR-0005). `novel` is the NEUTRAL ×1.0 default,
-# so a pre-4b event with no relevance field — coerced to `novel` — keeps its EXACT prior salience (the
-# 4b change perturbs only events glean marked `known`/`contradicts`). `contradicts` boosts highest: a
-# belief change is the most valuable to surface, the cheap-early echo of dream's precise LATE weaken
-# judgment (ADR-0012). Untuned, like every weight here — pending a gold set.
-W_REL = {"contradicts": 1.5, "novel": 1.0, "known": 0.4}
-
-_RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
-
-# The verbs whose latest decision drops a concept from the valid set — the concept-side mirror of
-# `catalog`'s merge/retire/reject filter. `retire` is review's human gate (ADR-0008); `supersede`/`split`
-# are the gardener's structural ops (3c/ADR-0015) — a merge-loser is superseded INTO its winner, a split
-# original is dissolved INTO its parts. All three are invalidate-don't-delete: the blob + history stay,
-# only the latest-decision FOLD takes the concept out of `load_concepts`/`valid_concepts`.
-#
-# SINGLE-SOURCED CONTRACT: the gardener WRITES these decision verbs (`garden.merge`/`split` reference
-# `VERB_SUPERSEDE`/`VERB_SPLIT`) and this fold READS them — one spelling, so a typo can't silently leave a
-# merge-loser in the valid set (a trust-corruption). The constants live here (garden→dream already holds,
-# no cycle); garden imports them.
-VERB_RETIRE = "retire"
-VERB_SUPERSEDE = "supersede"
-VERB_SPLIT = "split"
-CONCEPT_INVALID_VERBS = (VERB_RETIRE, VERB_SUPERSEDE, VERB_SPLIT)
-
-# The concept TYPOLOGY (ADR-0029): faithfulness and generation-usefulness are ORTHOGONAL. A claim can
-# be true, worth keeping, and still not belong in CLAUDE.md — "ultracode = env-set effort level" is a
-# fact you'd look up; "verify the fix is in the exact artifact before the risky action" shapes conduct.
-# So every concept carries a KIND: `behavioral` (shapes conduct — generate projects it) or `reference`
-# (a mechanism/fact — kept, queried, never projected by default). The LLM PROPOSES a kind at
-# synthesize; the reviewer's decision is authoritative (recorded on the accept, re-kindable later via
-# review's `set_kind` — the fold below). Coercion is RECALL-FIRST: an unknown/absent kind reads
-# `behavioral`, because a wrongly-behavioral rule is caught at the review/diff gates while a
-# wrongly-reference lesson silently vanishes from generation.
-KIND_BEHAVIORAL = "behavioral"
-KIND_REFERENCE = "reference"
-CONCEPT_KINDS = (KIND_BEHAVIORAL, KIND_REFERENCE)
-VERB_SET_KIND = "set_kind"     # review's re-kinding decision verb — written there, folded here
-
-
-def clean_kind(v) -> str:
-    """Coerce a proposed kind to the closed vocabulary — unknown/absent → `behavioral` (recall-first,
-    see CONCEPT_KINDS above). The coercion idiom of `_clean_relation`/`clean_score`, for the typology."""
-    return v if v in CONCEPT_KINDS else KIND_BEHAVIORAL
-
-
-# The concept SCOPE (ADR-0030) — the kind's mirror axis: WHERE a lesson applies, not what shape it
-# has. A lesson about one repo's harness belongs in THAT repo's CLAUDE.md, not the global one. Unlike
-# kind, no LLM proposes: the proposal DERIVES deterministically from the claim's live evidence's
-# subject keys (`resolve.scope_repo_of` — every quote in one repo → that repo's label; 2+ repos or
-# none → `global`, because a multi-repo lesson is de facto general and pinning narrower is what the
-# reviewer's override is for). The same trust boundary as kind: the derivation is a default, the
-# accept records the confirmed scope (`--scope` overrides), and review's `set_scope` re-scopes later,
-# outranking the accept in the fold below. The vocabulary is OPEN — any repo label the reviewer
-# names — so the only guard is emptiness, never membership.
-SCOPE_GLOBAL = "global"
-VERB_SET_SCOPE = "set_scope"   # review's re-scoping decision verb — written there, folded here
-
-
-def clean_scope(v) -> str:
-    """Coerce a scope to the open vocabulary's one invariant — a non-empty label. Absent/blank →
-    `global` (a lesson with no stated home applies everywhere; narrowing it is the reviewer's
-    explicit call). `clean_kind`'s sibling, minus the closed-set check: repo labels are free text."""
-    s = v.strip() if isinstance(v, str) else ""
-    return s or SCOPE_GLOBAL
-
 
 ROUTE_SYSTEM = (
     "You are the ROUTER for a developer's long-term memory. A new OBSERVATION arrived from a Claude "
@@ -252,457 +166,11 @@ _STOPWORDS = frozenset(
     "use used using user about which who what why how out up down off here there".split())
 
 
-# --- the concept seam: dream reads the curated-knowledge layer the review gate writes ----------
-
-def concept_kinds(root: Path | None = None) -> dict[str, str]:
-    """concept id → its reviewer-confirmed KIND, folded from DECISIONS only (ADR-0029): the latest
-    `set_kind` decision targeting the concept wins over the `kind` the latest accept/edit decision
-    recorded (the accept references its minted concept via its `concept` field); a concept in NEITHER
-    map is absent here and defaults `behavioral` at the caller (legacy concepts predate the facet).
-    The kind lives on decisions, never the concept blob, so a garden op re-versioning the blob
-    (merge's evidence union) cannot silently drop it — and the reviewer's `set_kind` outranks the
-    accept because re-kinding is a LATER, deliberate call on the same trust boundary. One scan;
-    same (fetched_at, content_hash) recency tie-break as `latest_decisions`. ("accept", "edit") are
-    review's promote verbs — resolve.ACCEPT_VERBS, spelled here to keep dream import-cycle-free."""
-    root = root or config.data_root()
-    set_best: dict[str, tuple[tuple[str, str], str]] = {}
-    acc_best: dict[str, tuple[tuple[str, str], str]] = {}
-    for d in blobstore.decisions_for(None, root):
-        if d.get("kind") not in CONCEPT_KINDS:
-            continue                                   # kind-less (legacy) or foreign — nothing to fold
-        key = (d.get("fetched_at", ""), d.get("content_hash", ""))
-        verb = d.get("verb")
-        if verb == VERB_SET_KIND and isinstance(d.get("target"), str):
-            t = d["target"]
-            if t not in set_best or key > set_best[t][0]:
-                set_best[t] = (key, d["kind"])
-        elif verb in ("accept", "edit") and isinstance(d.get("concept"), str):
-            c = d["concept"]
-            if c not in acc_best or key > acc_best[c][0]:
-                acc_best[c] = (key, d["kind"])
-    out = {c: k for c, (_, k) in acc_best.items()}
-    out.update({c: k for c, (_, k) in set_best.items()})   # set_kind > accept — the later, deliberate call
-    return out
-
-
-def concept_scopes(root: Path | None = None) -> dict[str, str]:
-    """concept id → its reviewer-confirmed SCOPE, folded from DECISIONS only (ADR-0030) —
-    `concept_kinds`' mirror on the scope axis, same precedence for the same reason: the latest
-    `set_scope` decision targeting the concept outranks the `scope` the latest accept/edit recorded,
-    because re-scoping is a LATER, deliberate call on the same trust boundary. A concept in neither
-    map is absent here and defaults `global` at the caller (legacy concepts predate the axis). The
-    vocabulary is open, so the fold keeps any non-blank label; blank/foreign decisions are skipped."""
-    root = root or config.data_root()
-    set_best: dict[str, tuple[tuple[str, str], str]] = {}
-    acc_best: dict[str, tuple[tuple[str, str], str]] = {}
-    for d in blobstore.decisions_for(None, root):
-        s = d.get("scope")
-        if not isinstance(s, str) or not s.strip():
-            continue                                   # scope-less (legacy) or blank — nothing to fold
-        s = s.strip()
-        key = (d.get("fetched_at", ""), d.get("content_hash", ""))
-        verb = d.get("verb")
-        if verb == VERB_SET_SCOPE and isinstance(d.get("target"), str):
-            t = d["target"]
-            if t not in set_best or key > set_best[t][0]:
-                set_best[t] = (key, s)
-        elif verb in ("accept", "edit") and isinstance(d.get("concept"), str):
-            c = d["concept"]
-            if c not in acc_best or key > acc_best[c][0]:
-                acc_best[c] = (key, s)
-    out = {c: s for c, (_, s) in acc_best.items()}
-    out.update({c: s for c, (_, s) in set_best.items()})   # set_scope > accept — the later call wins
-    return out
-
-
-def load_concepts(root: Path | None = None) -> list[dict]:
-    """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
-    against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
-    derived: the latest version of each concept source, minus any whose latest decision carries a
-    `CONCEPT_INVALID_VERBS` verb (retire / supersede / split — each takes the concept out of the valid set).
-    This is the loop closing — review's accepts become the concepts dream reads next run. Empty until
-    review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal.
-
-    Each returned concept carries a derived `kind` (ADR-0029): latest set_kind decision > the accept
-    decision's kind > `behavioral` (the legacy default — concepts predating the facet shape conduct
-    until the reviewer says otherwise) — and a derived `scope` (ADR-0030, the same fold shape on the
-    open vocabulary): latest set_scope > the accept's scope > `global`. Attached here, on the ONE
-    valid-concept view, so every consumer (generate's projection filters, status's census, review's
-    listing) reads one derivation."""
-    root = root or config.data_root()
-    decisions = blobstore.latest_decisions(root)
-    kinds = concept_kinds(root)
-    scopes = concept_scopes(root)
-    out: list[dict] = []
-    for sid, h in blobstore.latest_by_kind("concept", root).items():
-        d = decisions.get(sid)
-        if d and d.get("verb") in CONCEPT_INVALID_VERBS:   # retired/superseded/split out of the valid set
-            continue                                        # (ADR-0007 §4; the gardener's ops, ADR-0015)
-        try:
-            obj = json.loads(blobstore.get(h, root))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
-            obj["kind"] = kinds.get(obj["id"], KIND_BEHAVIORAL)
-            obj["scope"] = scopes.get(obj["id"], SCOPE_GLOBAL)
-            out.append(obj)
-    return out
-
-
-def valid_concept_ids(root: Path | None = None) -> set[str]:
-    """The IDS of the current valid concept set — `{c["id"] for c in load_concepts(root)}`. The membership
-    test the gardener's structural ops (an op never targets a dead concept) and the concept-graph folds
-    gate on; single-sourced HERE, next to `load_concepts` (its source — kept in dream to avoid a
-    dream↔concepts cycle, per `review.valid_concepts`), so the call sites never re-spell the comprehension."""
-    return {c["id"] for c in load_concepts(root)}
-
-
 # The flat `_render_concepts` is GONE (4a/ADR-0018): dream now injects `concepts.concept_digest` — a
 # bounded, STRUCTURED render of the concept graph (clustered, with tags + asserted relations) so synth
 # judges belief-change against what we already know AND its structure, not a flat bag. The digest is built
-# ONCE per run in `DreamBlock.items` (a function-local import breaks the dream↔concepts cycle) and threaded
-# down as a pre-rendered string; the standalone synth fns take that string verbatim.
-
-
-# --- the resolved event: a glean event re-anchored to its TRUSTED verbatim quote -----------------
-
-@dataclass
-class ResolvedEvent:
-    event: dict
-    quote: str               # the verbatim evidence, resolved + re-validated from the cleaned blob
-    span: tuple[int, int]    # the VALIDATED [start, end) byte span the quote came from (emitted as evidence)
-    session_id: str | None   # the originating session (support weighting by DISTINCT sessions)
-
-    @property
-    def id(self) -> str:
-        return self.event["id"]
-
-
-def _resolve_event(e: dict, blobs: dict, sessions: dict, root: Path) -> ResolvedEvent | None:
-    """Re-anchor one event to its trusted quote at the READ boundary. dream must NOT trust the recorded
-    span: an event is a blob version (model output + a span), and a buggy producer or out-of-band write
-    can plant a malformed span, while Python slicing silently accepts `None` (the whole blob) and clamps
-    overshoot. So the span is accepted only after `validate_span` proves it in-bounds ints and the bytes
-    decode — re-establishing "the quote is real bytes of an immutable blob." A gone blob (TTL) or a
-    failing span drops the event."""
-    ch = e.get("cleaned_hash")
-    ev = e.get("evidence") or []
-    sp = ev[0] if ev and isinstance(ev[0], dict) else None
-    if not ch or sp is None:
-        return None
-    try:
-        data = blobs.get(ch)
-        if data is None:
-            data = blobstore.get(ch, root).encode("utf-8")
-            blobs[ch] = data
-    except (FileNotFoundError, OSError):
-        return None
-    span = blobstore.validate_span(data, sp.get("byte_start"), sp.get("byte_end"))   # the read-side anchor
-    if span is None:
-        return None
-    try:
-        quote = data[span[0]:span[1]].decode("utf-8")
-    except UnicodeDecodeError:    # a span splitting a multibyte char is not a real quote
-        return None
-    if not quote.strip():
-        return None
-    return ResolvedEvent(event=e, quote=quote, span=span,
-                         session_id=blobstore.session_of(ch, root, sessions))
-
-
-# --- working set + catalog: the two DERIVED views the loop runs over ------------------------------
-
-def working_set(root: Path | None = None, *, min_confidence: float = 0.0) -> list[ResolvedEvent]:
-    """The un-consolidated events = `latest_by_kind('event')` (latest version per event_id) MINUS every
-    event whose latest LIFECYCLE decision is `consolidated` or `stale`. Rides `latest_decisions`, which
-    already EXCLUDES the producer `processed` markers — exactly right: a per-item `processed` marker is
-    bookkeeping, not membership state (and reusing the fold avoids the resurrection-bug class review
-    already guards). Each survivor is re-anchored to its trusted quote (`validate_span` at the read
-    boundary). This is `DreamBlock.items()`'s source; the driver sorts it by `priority` (salience)."""
-    root = root or config.data_root()
-    decisions = blobstore.latest_decisions(root)
-    blobs: dict[str, bytes] = {}
-    sessions: dict[str, str | None] = {}
-    out: list[ResolvedEvent] = []
-    for sid, h in blobstore.latest_by_kind("event", root).items():
-        d = decisions.get(sid)
-        if d and d.get("verb") in ("consolidated", "stale"):
-            continue
-        try:
-            e = json.loads(blobstore.get(h, root))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(e, dict):
-            continue
-        e.setdefault("id", sid)                       # source_id is authoritative; mirror it
-        if _score(e.get("confidence"), 0.0) < min_confidence:
-            continue
-        rv = _resolve_event(e, blobs, sessions, root)
-        if rv is not None:
-            out.append(rv)
-    return out
-
-
-def filter_by_source(events: list[ResolvedEvent], source_filter: str, root: Path) -> list[ResolvedEvent]:
-    """PROCESSING FOCUS (`dream --source`, ADR-0022): keep only events whose SOURCE handle CONTAINS
-    `source_filter` (case-insensitive substring) — the originating project for transcripts, the file path
-    for documents. The handle is reached by the SAME lineage hop the stage already walks for age/facets —
-    event → `cleaned_hash` → raw `origin_ref.project` (`blobstore.project_of`, one cached meta read per
-    event, no LLM/content). An event whose handle can't be resolved does NOT match (focus NARROWS — an
-    unknowable origin is excluded, not waved through). Default (no filter) skips this entirely. A semantic
-    TAG filter (focus by garden vocabulary, not the source handle) is the deferred richer sibling knob —
-    this is the cheap provenance substring."""
-    t = source_filter.lower()
-    cache: dict = {}
-    return [rv for rv in events
-            if (p := blobstore.project_of(rv.event.get("cleaned_hash"), root, cache)) and t in p.lower()]
-
-
-def _event_born_map(root: Path | None = None) -> dict[str, str | None]:
-    """event_id → its blob's `fetched_at` (the recency stamp) — the AGE source for the `Aging` priority
-    policy (ADR-0021): an event's age = `now() - born`. ONE scan over `latest_by_kind('event')` + a meta
-    read per event; built LAZILY (only when Aging is selected — Greedy never reads age) and shared by
-    `DreamBlock.age` and the `--dry-run` preview so the preview can't lie about the aging order. A gone /
-    unreadable meta maps to None → `config.age_days` treats it as fresh (0.0); never raises."""
-    root = root or config.data_root()
-    out: dict[str, str | None] = {}
-    for sid, h in blobstore.latest_by_kind("event", root).items():
-        try:
-            out[sid] = blobstore.get_meta(h, root).get("fetched_at")
-        except (OSError, json.JSONDecodeError):
-            out[sid] = None
-    return out
-
-
-def catalog(root: Path | None = None) -> list[dict]:
-    """The full LIVE routing catalog: `latest_by_kind('takeaway')` (latest version per stable id) MINUS
-    any takeaway whose latest lifecycle decision is in {merge, retire, reject}. INCLUDES incubating
-    takeaways (sessions < the maturity bar) so the router can strengthen them toward maturity. Small by
-    design (forgetting + the maturity gate bound it) → the whole list renders into the route prompt; no
-    retrieval, no embeddings. This REPLACES v1's supersede-fold for routing."""
-    root = root or config.data_root()
-    decisions = blobstore.latest_decisions(root)
-    out: list[dict] = []
-    for sid, h in blobstore.latest_by_kind("takeaway", root).items():
-        d = decisions.get(sid)
-        if d and d.get("verb") in ("merge", "retire", "reject"):
-            continue
-        try:
-            t = json.loads(blobstore.get(h, root))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(t, dict) and (t.get("id") or sid):
-            t.setdefault("id", sid)
-            out.append(t)
-    return out
-
-
-def net_sessions(tk: dict) -> int:
-    """NET distinct-session entrenchment, the RAW INTEGER COUNT (ADR-0012): supporting distinct sessions
-    MINUS contradicting distinct sessions. Kept for AUDIT / back-compat and as the human-legible "sessions
-    to go" signal (`incubating.needs`); the maturity GATE itself now reads the recency-WEIGHTED
-    `net_entrenchment` (ADR-0023), which reduces to this count when all evidence is fresh. Read defensively:
-    a dream/2 blob with no `contradictions` field reads as 0, so net == support and behaviour is identical
-    to before any contradiction arrives. NO clamp: net may go NEGATIVE (a strongly-contested takeaway)."""
-    sup = (tk.get("support") or {}).get("sessions", 0)
-    con = (tk.get("contradictions") or {}).get("sessions", 0)
-    return sup - con
-
-
-def recency_weight(valid_time: str | None, now: str | None = None) -> float:
-    """The recency TRUST of ONE piece of evidence, by its VALID-TIME age (ADR-0023): exponential decay,
-    `0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)` — weight 1.0 at age 0, 0.5 at one half-life, halving every
-    half-life thereafter and → 0 as the evidence recedes. "Newer = higher trust", a smooth curve, not a
-    cliff. A missing/unparseable valid-time → 1.0: `config.age_days` degrades a missing stamp to 0.0 age →
-    weight 1.0, so we treat undateable evidence as FRESH — RECALL-SAFE (never silently DISCOUNT evidence we
-    can't date; the costly error is dropping a real learning). `now` is the reference instant (default real
-    now); net_entrenchment pins one `now` and threads it so every session decays against the same clock."""
-    return 0.5 ** (config.age_days(valid_time, now=now) / RECENCY_HALF_LIFE_DAYS)
-
-
-def _session_valid_times(root: Path | None = None) -> dict[str, str | None]:
-    """session_id → its raw transcript's VALID-TIME — `origin_ref.mtime`, when the conversation ACTUALLY
-    happened (the session's date), NOT when ratchet ingested it (`fetched_at`). The valid-time/transaction-
-    time split is the whole point: a months-late backfill has a recent `fetched_at` but an OLD valid-time,
-    and entrenchment must weight by the latter (ADR-0023).
-
-    RECOMPUTE-ON-READ in ONE scan over the transcript metas (ADR-0013 ethos — never stored on the takeaway):
-    a takeaway already lists its support/contradiction SESSION IDS (`sessions_seen`/`contradiction_evidence`),
-    so the dates recompute from those exactly like `concepts._cleaned_facets` recompute facets from evidence
-    — no date field to desync. The session id IS the raw transcript's `source_id`; a transcript appended-to
-    over time has multiple versions, so keep the LATEST version's mtime (most recent session activity, the
-    same recency fold `latest_version` does). A session with no transcript / no mtime → None → weight 1.0
-    (fresh) downstream. Built ONCE per gate pass and threaded into `net_entrenchment` so the scan is paid
-    once, not per takeaway."""
-    root = root or config.data_root()
-    best: dict[str, tuple[tuple[str, str], str | None]] = {}
-    for m in blobstore.iter_meta(root):
-        # both SESSION-bearing raw kinds: a transcript session is dated by its file's mtime, and a
-        # DOCUMENT session (its stable path, ADR-0031) by the file's save time — its valid-time.
-        # Latest version wins = the newest save, so a long-untouched rules file decays exactly like
-        # an unlived lesson (documents joined decay tracking on purpose).
-        if m.get("kind", "raw") != "raw" or m.get("source_kind") not in ("transcript", "document"):
-            continue
-        sid = m.get("source_id")
-        if not sid:
-            continue
-        key = (m.get("fetched_at", ""), m.get("content_hash", ""))     # the latest-version recency fold
-        if sid not in best or key > best[sid][0]:
-            best[sid] = (key, (m.get("origin_ref") or {}).get("mtime"))
-    return {sid: vt for sid, (key, vt) in best.items()}
-
-
-def _parse_time(stamp) -> datetime | None:
-    """An ISO valid-time as an AWARE datetime, or None (absent/unparseable) — the coalescing twin of
-    `config.age_days`'s degrade path: a stamp we can't read must never crash the fold, it just refuses
-    to coalesce. A naive stamp reads as UTC (tap stamps tz-aware; this guards hand-written bodies)."""
-    if not stamp:
-        return None
-    try:
-        ts = datetime.fromisoformat(stamp)
-    except (ValueError, TypeError):
-        return None
-    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
-
-
-def coalesce_sessions(session_ids, valid_times: dict, session_repos: dict, *,
-                      hours: float = COALESCE_HOURS) -> list[list[str]]:
-    """Group sessions into SITTINGS — the distinct-support unit the maturity fold counts. A /clear or
-    a crash-restart splits one afternoon's work across 2+ transcript files; counting those as 2
-    "distinct sessions" lets a single sitting mature a claim at the ~2-session bar (the ADR-0028
-    backlog's cheapest fake-maturity path). So sessions sharing a REPO whose valid-times sit within
-    `hours` of each other coalesce into ONE group — a greedy chain over the repo's sorted timeline:
-    each session joins the current sitting if its gap FROM THE PREVIOUS session fits the window, so a
-    long sitting extends session by session. Different repos stay distinct even minutes apart: a repo
-    jump is a genuine context switch, the very independence distinct-session support measures. A
-    session with NO known repo or NO parseable valid-time never coalesces (the sharing/ordering can't
-    be established; recall-safe — never suppress support on doubt, the mirror of recency_weight's
-    undated=fresh). `hours <= 0` is the OFF escape hatch: every session its own group, the exact
-    pre-sitting counting. Deterministic (ids de-duped + sorted; timeline ties break by id), and
-    recomputed at fold time from the threaded maps — nothing stored (ADR-0013)."""
-    sids = sorted({s for s in session_ids if s})
-    if hours <= 0:
-        return [[s] for s in sids]
-    groups: list[list[str]] = []
-    by_repo: dict[str, list[tuple[datetime, str]]] = {}
-    for s in sids:
-        repo, ts = (session_repos or {}).get(s), _parse_time((valid_times or {}).get(s))
-        if not repo or ts is None:
-            groups.append([s])                     # unhomed/undateable: its own sitting, never merged
-        else:
-            by_repo.setdefault(repo, []).append((ts, s))
-    for repo in sorted(by_repo):
-        last: datetime | None = None
-        for ts, s in sorted(by_repo[repo]):
-            if last is not None and (ts - last).total_seconds() <= hours * 3600.0:
-                groups[-1].append(s)               # within the window of the sitting's LAST activity
-            else:
-                groups.append([s])
-            last = ts
-    return groups
-
-
-def _sitting_valid_time(group: list[str], valid_times: dict) -> str | None:
-    """One sitting's valid-time = its LATEST member's stamp — the same most-recent-activity fold
-    `_session_valid_times` applies across one transcript's versions, lifted to the sitting: recency
-    trust keys on when the sitting last touched the lesson. A lone undateable session yields None
-    (→ weight 1.0 downstream, the recall-safe fresh default)."""
-    stamps = [(ts, valid_times.get(s)) for s in group
-              if (ts := _parse_time(valid_times.get(s))) is not None]
-    return max(stamps)[1] if stamps else None
-
-
-def same_sitting(session_id: str | None, others, valid_times: dict, session_repos: dict, *,
-                 hours: float = COALESCE_HOURS) -> bool:
-    """Would `session_id` coalesce into a sitting with ANY of `others`? Resolve's same-session gate
-    reads THIS — one helper for the gate and the count, so the two can never disagree: an event from
-    the second half of a split sitting must not adjudicate-corroborate the first half's claim, for
-    exactly the reason the count groups them — its "yes" buys no distinct-sitting support. An exact
-    same id is same-sitting at ANY hours (including the hours<=0 escape hatch, which restores the
-    plain same-session membership test byte-exact)."""
-    others = {s for s in others if s}
-    if session_id in others:
-        return True
-    if not session_id or hours <= 0:
-        return False
-    for g in coalesce_sessions(others | {session_id}, valid_times, session_repos, hours=hours):
-        if session_id in g:
-            return len(g) > 1                      # any co-member is one of `others` (groups partition)
-    return False
-
-
-def net_entrenchment(tk: dict, now: str | None = None, *, valid_times: dict | None = None,
-                     root: Path | None = None, coalesce_hours: float = COALESCE_HOURS) -> float:
-    """The RECENCY-WEIGHTED net entrenchment the maturity gate now reads (ADR-0023) — the recency-aware
-    replacement for `net_sessions` AT THE GATE, counted over SITTINGS (`coalesce_sessions`): same-repo
-    sessions within `coalesce_hours` fold into one, so a /clear-split or crash-restarted afternoon
-    cannot fake 2-session maturity. Each supporting DISTINCT SITTING contributes
-    `recency_weight(the sitting's LATEST valid-time)`, each contradicting sitting SUBTRACTS the same
-    (grouped identically — the ADR-0012 symmetry: a split sitting can no more fake a 2-session
-    overturn than a 2-session graduation), all evaluated at one pinned `now`:
-
-        Σ recency_weight(latest valid_time(g)) over support sittings  −  Σ over contradiction sittings
-
-    So recent corroboration matures a takeaway while OLD-only corroboration decays below the bar (a stale
-    backfill can't re-entrench), and a RECENT contradiction subtracts hard while a years-old one barely
-    moves (a stale backfill can't overturn a current belief). The self-sorting consequence: a still-true
-    preference keeps getting RE-LIVED — fresh evidence sustains its weight — while a moved-on fact simply
-    stops being re-evidenced and fades on its own, so no timeless-vs-changing classification is needed.
-
-    Reads the session-ID LISTS (`sessions_seen`; `contradiction_evidence[].session_id`) — the same ground
-    truth `support.sessions`/`_contradiction_stats` count — so with FRESH, cross-sitting evidence (every
-    weight ≈1, nothing coalesces) this REDUCES to `net_sessions` as a float, and the gate behaves exactly
-    as today. `net_sessions` (the raw int) is kept for audit/back-compat. Each session's REPO folds off
-    the claim's own evidence (`_session_repos`, the in-memory field `resolve._fold_claim` derives — never
-    stored, ADR-0013); a view without it (a v2 takeaway, a hand-built dict) coalesces nothing, so v2
-    counting is byte-identical. `coalesce_hours=0` is the off switch — every session its own sitting, the
-    exact pre-sitting sum. `valid_times` is built once per gate pass and threaded in; absent, it recomputes
-    from `root`. `now` is pinned ONCE (default real now) so every sitting decays against the same
-    reference (deterministic when a test injects it)."""
-    now = now or config.now()
-    if valid_times is None:
-        valid_times = _session_valid_times(root)
-    repos = tk.get("_session_repos") or {}
-    sup = {s for s in (tk.get("sessions_seen") or []) if s}
-    con = {e.get("session_id") for e in (tk.get("contradiction_evidence") or []) if e.get("session_id")}
-
-    def weight(ids) -> float:
-        return sum(recency_weight(_sitting_valid_time(g, valid_times), now)
-                   for g in coalesce_sessions(ids, valid_times, repos, hours=coalesce_hours))
-
-    return weight(sup) - weight(con)
-
-
-def current_takeaways(root: Path | None = None, *, min_weight: float = MATURITY_WEIGHT,
-                      now: str | None = None, valid_times: dict | None = None) -> list[dict]:
-    """The MATURITY GATE, and review's unchanged feed: `catalog(root)` filtered to MATURE takeaways by
-    RECENCY-WEIGHTED net entrenchment (`net_entrenchment >= min_weight`, ADR-0023 — the float that weights
-    each support/contradiction session by its valid-time, superseding the raw `net_sessions` count at the
-    gate, ADR-0012). `review.pending()` calls this with the default bar, so only takeaways corroborated
-    across enough DISTINCT, RECENT-ENOUGH sessions NET of contradictions reach the human gate; incubating
-    (and CONTESTED) ones stay live (routable via `catalog()`) but invisible to review. A strongly-,
-    recently-corroborated takeaway survives a lone (or aged) contradiction; a contested one un-graduates yet
-    is never retired — it re-graduates if RECENT corroboration returns. A months-old backfill can neither
-    re-mature a stale takeaway (its weight decayed below the bar) nor strongly overturn a current one. With
-    FRESH evidence `net_entrenchment == net_sessions`, so this graduates exactly the takeaways the old
-    `net_sessions >= MATURITY_SESSIONS` gate did. Same name/return type — review.py rides it unchanged.
-
-    `valid_times` (built once, threaded) and `now` (a pinned instant) make the scan-once + deterministic
-    properties explicit; absent, both default — one transcript scan + real now."""
-    root = root or config.data_root()
-    if valid_times is None:
-        valid_times = _session_valid_times(root)
-    return [t for t in catalog(root) if net_entrenchment(t, now, valid_times=valid_times) >= min_weight]
-
-
-def contradicted_takeaways(root: Path | None = None) -> list[dict]:
-    """The live takeaways carrying a recorded contradiction: `catalog()` filtered to
-    `contradictions.events > 0` (ADR-0012). A contested/demoted takeaway is NEVER silently lost — it stays
-    in `catalog()` (routable, re-graduatable) but is surfaced here for spot-checking and a future review
-    surface (quarantine, not delete). Read defensively: a dream/2 blob with no field reads as zero."""
-    return [t for t in catalog(root)
-            if ((t.get("contradictions") or {}).get("events", 0)) > 0]
-
+# ONCE per run in `DreamBlock.items` and threaded down as a pre-rendered string; the standalone synth fns
+# take that string verbatim.
 
 def render_catalog(cat: list[dict]) -> str:
     """The in-prompt routing list — a numbered list of `[N] id=<id>: <title> — <why>` (truncated). The
@@ -712,47 +180,15 @@ def render_catalog(cat: list[dict]) -> str:
         return "(no takeaways yet — every observation is new)"
     lines = []
     for i, t in enumerate(cat, 1):
-        title = str(t.get("title", "")).strip()[:TITLE_MAX]
-        why = str(t.get("why", "")).strip()[:WHY_MAX]
+        title = str(t.get("title", "")).strip()[:concepts.TITLE_MAX]
+        why = str(t.get("why", "")).strip()[:concepts.WHY_MAX]
         lines.append(f"[{i}] id={t.get('id')}: {title} — {why}")
     return "\n".join(lines)
 
 
-# --- scoring + similarity (pure, stdlib): salience for the queue, drift/merge for maintenance -----
+# --- lexical similarity (pure, stdlib): the drift gate + the merge de-dup hint --------------------
 
 _score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
-
-
-def _intrinsic_salience(event: dict) -> float:
-    """The relevance-FREE salience: confidence × weighted marker mass (with its +EPS floor) — the event's
-    OWN durable-value score, no novelty term. Surprise weighed highest among markers — a corrective/failure
-    signal is the highest-value cue (ADR-0010 §8). Each untrusted field is scrubbed through `clean_score`.
-    This is the pre-4b salience; `salience` scales it by relevance to order the QUEUE, but `forget` gates
-    eviction on THIS — so a `known` verdict (×0.4) can re-ORDER an event yet never EVICT it. Relevance
-    orders, it never drops (recall-first; the ADR-0019 invariant)."""
-    conf = _score(event.get("confidence"), 0.5)
-    m = event.get("markers") or {}
-    return conf * (W_SURPRISE * _score(m.get("surprise")) + W_INSIGHT * _score(m.get("insight"))
-                   + W_RESEARCH * _score(m.get("research")) + EPS)
-
-
-def salience(event: dict) -> float:
-    """A pure score of an un-consolidated event for the priority QUEUE: `_intrinsic_salience` × the
-    RELEVANCE multiplier. The relevance term (4b/ADR-0019) is glean's novelty-vs-the-store verdict:
-    `contradicts`/`novel` BOOST (drain first), `known` SINKS (deferred under budget) — RECALL-FIRST, so
-    `known` only reorders, it never hard-drops, and a missing field coerces to `novel` (×1.0), never
-    sinking an event on doubt. Relevance scales the queue ORDER ONLY — NOT the forget gate: `forget` reads
-    `_intrinsic_salience`, so a `known` verdict can never DRIVE an eviction (a pre-4b event reads novel×1.0
-    → salience == intrinsic, byte-identical). The recurrence bonus (does the event already match a catalog
-    takeaway) is DEFERRED. `DreamBlock.priority` delegates here."""
-    rel = W_REL[clean_relevance(event.get("relevance"))]   # missing/unknown → novel (×1.0): never sink on doubt
-    return _intrinsic_salience(event) * rel
-
-
-def _event_markers(event: dict) -> dict:
-    """The event's marker vector, each field scrubbed — the per-takeaway markers aggregate (max) these."""
-    em = event.get("markers") or {}
-    return {k: _score(em.get(k)) for k in MARKER_KINDS}
 
 
 def _tokens(text: str) -> list[str]:
@@ -786,7 +222,7 @@ def _cos(a: dict[str, float], b: dict[str, float]) -> float:
     return sum(w * b.get(t, 0.0) for t, w in a.items())
 
 
-def _drift(rv: ResolvedEvent, tk: dict) -> float:
+def _drift(rv: events.ResolvedEvent, tk: dict) -> float:
     """Lexical distance of a strengthening event from the takeaway it bumps: `1 - cos` over TF-IDF of
     (event quote + summary) vs (takeaway title + why + its evidence quotes). High-distance evidence means
     the takeaway's `why` may no longer cover it → re-synthesize; near evidence is a cheap bump. Lexical
@@ -800,56 +236,7 @@ def _drift(rv: ResolvedEvent, tk: dict) -> float:
     return 1.0 - _cos(_vec(docs[0], idf), _vec(docs[1], idf))
 
 
-# --- the takeaway: stable minted id, robust-anchored evidence, BIRCH support stats ----------------
-
-def mint_takeaway_id(seed_event_id: str) -> str:
-    """The STABLE id of a new takeaway — DETERMINISTIC on the seeding event id (NOT random, NOT a
-    cluster signature). Determinism is load-bearing for resumability: a crash-retry of the same `new`
-    event re-mints the SAME id, so the duplicate is absorbed as a no-op TimeMap version (latest wins)
-    instead of orphaning a second takeaway. Independent of prompt/model (a prompt bump never re-routes a
-    consolidated event, so the id need not vary by params). Distinct event_ids → distinct ids; 12 hex of
-    sha256 makes collision risk negligible."""
-    return "t-" + hashlib.sha256(seed_event_id.encode("utf-8")).hexdigest()[:12]
-
-
-def evidence_entry(rv: ResolvedEvent, *, context_bytes: int = CONTEXT_BYTES,
-                   root: Path | None = None) -> dict:
-    """A ROBUST ANCHOR (W3C Web Annotation) for one cited event: the byte span AND the verbatim quote +
-    a little surrounding context. The span is RE-VALIDATED via `validate_span` at WRITE — the same
-    immutable, content-addressed blob `working_set` resolved, so this re-anchors at the write boundary
-    too (`root` threads the caller's store, so an injected root re-validates against the SAME store the
-    span resolved from). If the blob is gone, the (already-validated) span + quote still ship; only the
-    context window is best-effort."""
-    ch = rv.event.get("cleaned_hash")
-    entry = {"event_id": rv.id, "cleaned_hash": ch,
-             "byte_start": rv.span[0], "byte_end": rv.span[1],
-             "quote": rv.quote, "context": rv.quote}
-    try:
-        data = blobstore.get(ch, root).encode("utf-8")
-    except (FileNotFoundError, OSError):
-        return entry
-    span = blobstore.validate_span(data, rv.span[0], rv.span[1])   # re-validate at WRITE
-    if span is None:
-        return entry
-    bs, be = span
-    cs, ce = max(0, bs - context_bytes), min(len(data), be + context_bytes)
-    entry["context"] = data[cs:ce].decode("utf-8", errors="replace")   # window edges may split a char
-    return entry
-
-
-def _clean_relation(v, known_ids: set[str]) -> dict:
-    """Coerce the untrusted relation: an unknown kind → `new`, and a `concept_id` that isn't a real known
-    concept → null (which forces `new` — you cannot strengthen/refine/contradict a concept that does not
-    exist, so today, with no concepts, every relation is `new`). Unchanged from v1; powers review's
-    loop-close."""
-    v = v if isinstance(v, dict) else {}
-    kind = v.get("kind") if v.get("kind") in _RELATION_KINDS else "new"
-    cid = v.get("concept_id")
-    cid = cid if isinstance(cid, str) and cid in known_ids else None
-    if cid is None and kind != "new":
-        kind = "new"
-    return {"kind": kind, "concept_id": cid, "note": str(v.get("note", "")).strip()[:NOTE_MAX]}
-
+# --- the takeaway write path: the run-invariant projection + the version ingest -------------------
 
 def takeaway_content(tk: dict) -> dict:
     """The run-invariant STORED projection of a takeaway version — drops the in-memory `producer`/cost,
@@ -869,16 +256,6 @@ def takeaway_content(tk: dict) -> dict:
     return base
 
 
-def _contradiction_stats(tk: dict) -> dict:
-    """The BIRCH sufficient-statistic for the CONTRADICTION side, mirroring `support`: distinct
-    contradicting events (by event_id) and distinct contradicting sessions (each contradiction_evidence
-    entry carries the `session_id` it came from — so the count needs no parallel session list). Closed
-    over the summary, correct without the raw events."""
-    by = tk.get("contradicted_by") or []
-    sess = {e.get("session_id") for e in (tk.get("contradiction_evidence") or []) if e.get("session_id")}
-    return {"events": len(set(by)), "sessions": len(sess)}
-
-
 def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) -> None:
     """Freeze one takeaway as a RAW blob VERSION keyed on its STABLE minted id (ADR-0007). The content is
     `takeaway_content(tk)` (run-invariant → an unchanged re-version no-ops); `producer` is mirrored into
@@ -894,14 +271,14 @@ def _ingest_takeaway(tk: dict, *, model: str, run_id: str, root: Path | None) ->
 
 # --- ROUTE: one cheap Haiku call per event over the in-prompt catalog -----------------------------
 
-def _route_user(rv: ResolvedEvent, cat: list[dict]) -> str:
+def _route_user(rv: events.ResolvedEvent, cat: list[dict]) -> str:
     return (f'OBSERVATION\nquote: """{rv.quote}"""\n'
             f'summary: {str(rv.event.get("summary", "")).strip()!r}\n\n'
             f'CATALOG\n{render_catalog(cat)}')
 
 
 def _clean_route(parsed: dict, catalog_ids: set[str]) -> dict:
-    """Defensive coercion of the untrusted router JSON, mirroring `_clean_relation`. Rules: a decision
+    """Defensive coercion of the untrusted router JSON, mirroring `concepts.clean_relation`. Rules: a decision
     not in {new, strengthen, weaken, noop} → `noop` (safest: no write, the event stays routable on a
     prompt bump); a `strengthen`/`weaken` needs a REAL catalog id, and an unknown/null id resolves
     ASYMMETRICALLY: a `strengthen` of an unknown id → `new` (it is still a lesson, re-routed as a fresh
@@ -920,7 +297,7 @@ def _clean_route(parsed: dict, catalog_ids: set[str]) -> dict:
     return {"decision": "new" if decision == "strengthen" else "noop", "takeaway_id": None}
 
 
-def route(rv: ResolvedEvent, cat: list[dict], complete_route: Completer) -> tuple[dict, float]:
+def route(rv: events.ResolvedEvent, cat: list[dict], complete_route: Completer) -> tuple[dict, float]:
     """ONE cheap Haiku call (the injected ROUTER) per event: system = the routing instruction; user =
     the event (verbatim quote + summary) + the WHOLE catalog as a numbered list. Returns (route_result,
     cost). The router may answer with a catalog list-NUMBER instead of the id (a common mis-naming) — map
@@ -941,13 +318,13 @@ def route(rv: ResolvedEvent, cat: list[dict], complete_route: Completer) -> tupl
 
 # --- APPLY: synthesize a new takeaway, or bump an existing one's support ---------------------------
 
-def _synth_user(rv: ResolvedEvent, concept_digest: str) -> str:
+def _synth_user(rv: events.ResolvedEvent, concept_digest: str) -> str:
     return (f"Known concepts:\n{concept_digest}\n\n"
             f'OBSERVATION\nquote: """{rv.quote}"""\n'
             f'summary: {str(rv.event.get("summary", "")).strip()!r}')
 
 
-def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
+def synthesize_new(rv: events.ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
                    known_concept_ids: set[str], model: str, run_id: str,
                    root: Path | None = None) -> tuple[dict | None, float]:
     """Mint a takeaway from ONE event (the injected SYNTH Completer, Sonnet). `drop` or no usable `why`
@@ -961,22 +338,22 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest:
     parsed = completer.parse_json_object(comp.text) or {}
     if not parsed or parsed.get("drop"):
         return None, cost
-    why = _clip(str(parsed.get("why", "")))
+    why = concepts.clip(str(parsed.get("why", "")))
     if not why:                                    # no usable principle → treat as noise
         return None, cost
     tk = {
         "id": mint_takeaway_id(rv.id),
-        "title": str(parsed.get("title", "")).strip()[:TITLE_MAX],
+        "title": str(parsed.get("title", "")).strip()[:concepts.TITLE_MAX],
         "why": why,
-        "relation": _clean_relation(parsed.get("relation"), known_concept_ids),
+        "relation": concepts.clean_relation(parsed.get("relation"), known_concept_ids),
         "cites": [rv.id],
-        "evidence": [evidence_entry(rv, root=root)],
+        "evidence": [events.evidence_entry(rv, root=root)],
         "support": {"events": 1, "sessions": 1 if rv.session_id else 0},
         "sessions_seen": [rv.session_id] if rv.session_id else [],
         "contradictions": {"events": 0, "sessions": 0},    # the symmetric side, born empty (ADR-0012)
         "contradicted_by": [],
         "contradiction_evidence": [],
-        "markers": _event_markers(rv.event),
+        "markers": events.event_markers(rv.event),
         "confidence": _score(parsed.get("confidence"), 0.5),
         "last_seen": config.now(),
         "producer": {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
@@ -985,7 +362,7 @@ def synthesize_new(rv: ResolvedEvent, complete_synth: Completer, concept_digest:
     return tk, cost
 
 
-def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
+def update_support(tk: dict, rv: events.ResolvedEvent, complete_synth: Completer, concept_digest: str, *,
                    known_concept_ids: set[str], drift_threshold: float,
                    model: str, run_id: str, root: Path | None = None) -> tuple[dict, float]:
     """BUMP SUPPORT — the cheap path (NO LLM by default). Build a NEW VERSION of `tk` (same id): append
@@ -1010,16 +387,16 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
         "contradicted_by": list(tk.get("contradicted_by") or []),
         "contradiction_evidence": [dict(e) for e in (tk.get("contradiction_evidence") or [])],
     }
-    nv["contradictions"] = _contradiction_stats(nv)
+    nv["contradictions"] = events.contradiction_stats(nv)
     cited = {e.get("event_id") for e in nv["evidence"]}
     if rv.id in cited:                             # already incorporated → idempotent, byte-stable no-op
         nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
         return nv, 0.0
-    nv["evidence"].append(evidence_entry(rv, root=root))
+    nv["evidence"].append(events.evidence_entry(rv, root=root))
     nv["cites"].append(rv.id)
     if rv.session_id and rv.session_id not in nv["sessions_seen"]:
         nv["sessions_seen"].append(rv.session_id)
-    em = _event_markers(rv.event)
+    em = events.event_markers(rv.event)
     nv["markers"] = {k: max(nv["markers"][k], em[k]) for k in MARKER_KINDS}
     nv["support"] = {"events": len(set(nv["cites"])), "sessions": len(set(nv["sessions_seen"]))}
     nv["last_seen"] = config.now()
@@ -1028,16 +405,16 @@ def update_support(tk: dict, rv: ResolvedEvent, complete_synth: Completer, conce
         comp = complete_synth(SYNTH_SYSTEM, _synth_user(rv, concept_digest))
         cost = completer.cost_of(comp)
         parsed = completer.parse_json_object(comp.text) or {}
-        why = _clip(str(parsed.get("why", "")))
+        why = concepts.clip(str(parsed.get("why", "")))
         if why:
             nv["why"] = why
-            nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
-            nv["relation"] = _clean_relation(parsed.get("relation"), known_concept_ids)
+            nv["title"] = str(parsed.get("title", "")).strip()[:concepts.TITLE_MAX] or nv["title"]
+            nv["relation"] = concepts.clean_relation(parsed.get("relation"), known_concept_ids)
             nv["confidence"] = _score(parsed.get("confidence"), nv["confidence"])
     return nv, cost
 
 
-def update_contradictions(tk: dict, rv: ResolvedEvent, root: Path | None = None) -> tuple[dict, float]:
+def update_contradictions(tk: dict, rv: events.ResolvedEvent, root: Path | None = None) -> tuple[dict, float]:
     """WEAKEN — the demotion half `update_support` lacked: dream could accrue support but never be DEMOTED
     by contradicting evidence (ExpeL's downvote, in dream's additive-sufficient-statistic style; ADR-0012).
     ALWAYS NO LLM (cost 0.0): a contradiction RECORDS the conflict, it does NOT rewrite the `why` — support,
@@ -1067,18 +444,18 @@ def update_contradictions(tk: dict, rv: ResolvedEvent, root: Path | None = None)
     }
     against = {e.get("event_id") for e in nv["contradiction_evidence"]}
     if rv.id in against:                           # already recorded → idempotent, byte-stable no-op
-        nv["contradictions"] = _contradiction_stats(nv)
+        nv["contradictions"] = events.contradiction_stats(nv)
         return nv, 0.0
-    entry = evidence_entry(rv, root=root)
+    entry = events.evidence_entry(rv, root=root)
     entry["session_id"] = rv.session_id            # the session rides WITH the evidence (powers the count)
     nv["contradiction_evidence"].append(entry)
     nv["contradicted_by"].append(rv.id)
-    nv["contradictions"] = _contradiction_stats(nv)
+    nv["contradictions"] = events.contradiction_stats(nv)
     nv["last_seen"] = config.now()
     return nv, 0.0
 
 
-def apply(rv: ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concept_digest: str,
+def apply(rv: events.ResolvedEvent, rr: dict, cat_by_id: dict, complete_synth: Completer, concept_digest: str,
           *, known_concept_ids: set[str], drift_threshold: float, model: str, run_id: str,
           root: Path) -> tuple[int, float, dict | None]:
     """Route-result → commits. The COMMIT ORDER is the crash invariant: the takeaway version FIRST
@@ -1171,18 +548,18 @@ def _write_merge(loser_id: str, winner_id: str, *, run_id: str, root: Path | Non
 
 # --- forget: conservative straggler eviction (never age alone — ADR-0010 §6) ----------------------
 
-def forget(root: Path | None = None, *, tau: int = FORGET_TAU,
-           salience_floor: float = FORGET_SALIENCE_FLOOR, run_id: str) -> list[str]:
+def forget(root: Path | None = None, *, tau: int = events.FORGET_TAU,
+           salience_floor: float = events.FORGET_SALIENCE_FLOOR, run_id: str) -> list[str]:
     """Stale the stragglers: for each un-consolidated event, `cycles_resident` = the count of DISTINCT
     dream run_ids in the stored dream-stage decisions whose `at` postdates the event blob (no mutable
-    per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (`_intrinsic_salience`
+    per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (`intrinsic_salience`
     < floor) — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Gates on the
     relevance-FREE intrinsic salience, NOT `salience`: relevance (4b/ADR-0019) orders the queue but must
     never DRIVE an eviction — a `known` ×0.4 verdict can re-order an event yet never evict it (recall-first;
     4b adds no new drop path). Reversible. Cheap, no LLM — runs in `DreamBlock.finalize`. Returns the
     staled event ids."""
     root = root or config.data_root()
-    ws = working_set(root)
+    ws = events.working_set(root)
     latest = blobstore.latest_by_kind("event", root)
     dream_decs = list(blobstore.decisions_for(None, root, stage="dream"))
     staled: list[str] = []
@@ -1196,7 +573,7 @@ def forget(root: Path | None = None, *, tau: int = FORGET_TAU,
                 born = ""
         runs = {d.get("run_id") for d in dream_decs
                 if d.get("run_id") and str(d.get("at", "")) > born}
-        if len(runs) >= tau and _intrinsic_salience(rv.event) < salience_floor:
+        if len(runs) >= tau and events.intrinsic_salience(rv.event) < salience_floor:
             _write_stale(rv.id, "aged + low salience", run_id=run_id, root=root)
             staled.append(rv.id)
     return staled
@@ -1268,7 +645,7 @@ def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, mo
             nv["contradiction_evidence"].append(dict(e))
             cseen.add(e.get("event_id"))
     nv["contradicted_by"] = sorted({e.get("event_id") for e in nv["contradiction_evidence"] if e.get("event_id")})
-    nv["contradictions"] = _contradiction_stats(nv)
+    nv["contradictions"] = events.contradiction_stats(nv)
     cost = 0.0
     if resynth and complete_synth is not None and loser is not None:
         user = ("Two takeaways describe the SAME lesson; merge them into ONE.\n"
@@ -1278,10 +655,10 @@ def merge(loser_id: str, winner_id: str, complete_synth: Completer | None, *, mo
         comp = complete_synth(SYNTH_SYSTEM, user)
         cost = completer.cost_of(comp)
         parsed = completer.parse_json_object(comp.text) or {}
-        why = _clip(str(parsed.get("why", "")))
+        why = concepts.clip(str(parsed.get("why", "")))
         if why:
             nv["why"] = why
-            nv["title"] = str(parsed.get("title", "")).strip()[:TITLE_MAX] or nv["title"]
+            nv["title"] = str(parsed.get("title", "")).strip()[:concepts.TITLE_MAX] or nv["title"]
     nv["producer"] = {"stage": "dream", "model": model, "prompt_version": PROMPT_VERSION,
                       "run_id": run_id, "cost_usd": round(cost, 8)}
     _ingest_takeaway(nv, model=model, run_id=run_id, root=root)     # winner version FIRST
@@ -1313,7 +690,7 @@ class DreamBlock:
                  route_model: str = ROUTE_MODEL, synth_model: str = SYNTH_MODEL,
                  min_confidence: float = 0.0, drift_threshold: float = DRIFT_THRESHOLD,
                  forget: bool = True,
-                 forget_tau: int = FORGET_TAU, forget_floor: float = FORGET_SALIENCE_FLOOR,
+                 forget_tau: int = events.FORGET_TAU, forget_floor: float = events.FORGET_SALIENCE_FLOOR,
                  source_filter: str | None = None) -> None:
         self.complete_route = complete_route
         self.complete_synth = complete_synth
@@ -1353,40 +730,39 @@ class DreamBlock:
         """Load the concepts + the ON-INSTANCE catalog ONCE, then yield the salience-ordered working set.
         `source_id` is ignored (dream is a global pass). The driver eager-lists this, sorts by `priority`,
         and caps by --limit."""
-        from .concepts import concept_digest          # lazy: breaks the dream↔concepts cycle (ADR-0018)
         self._root = root                              # capture for age() (called during ordering, post-items)
         self._born = None                              # reset the lazy age map: a fresh run re-reads recency
-        self._concepts = load_concepts(root)
+        self._concepts = concepts.load_concepts(root)
         self._known_ids = {c["id"] for c in self._concepts}      # all str (load_concepts guarantees it)
-        self._digest = concept_digest(root)            # the STRUCTURED render synth judges belief-change on
+        self._digest = concepts.concept_digest(root)   # the STRUCTURED render synth judges belief-change on
         self._cat = catalog(root)
         self._cat_by_id = {t["id"]: t for t in self._cat}
-        ws = working_set(root, min_confidence=self.min_confidence)
+        ws = events.working_set(root, min_confidence=self.min_confidence)
         if self.source_filter is not None:             # PROCESSING FOCUS: only this source's events (ADR-0022)
-            ws = filter_by_source(ws, self.source_filter, root)
+            ws = events.filter_by_source(ws, self.source_filter, root)
         self.n_events = len(ws)
         return ws
 
-    def key(self, rv: ResolvedEvent) -> str:
+    def key(self, rv: events.ResolvedEvent) -> str:
         return rv.id
 
-    def priority(self, rv: ResolvedEvent) -> float:
-        return salience(rv.event)
+    def priority(self, rv: events.ResolvedEvent) -> float:
+        return events.salience(rv.event)
 
-    def age(self, rv: ResolvedEvent) -> float:
+    def age(self, rv: events.ResolvedEvent) -> float:
         """The event's AGE in DAYS for the Aging policy (ADR-0021): `now() - fetched_at` of the event blob —
         how long this learning has waited un-consolidated. dream is budget-gated (route + synth LLM calls,
         `--max-usd`), so under a months-long backlog Greedy's lowest-salience events could starve forever;
         aging lets an old event's `salience + λ·age` eventually overtake fresher salient ones (bounded
         latency, the anti-starvation complement to `forget`'s straggler eviction). The event→`fetched_at`
-        map is built ONCE on the first call (`_event_born_map`) and reused — O(1) per item after, so ordering
+        map is built ONCE on the first call (`events.event_born_map`) and reused — O(1) per item after, so ordering
         stays O(n log n). 0.0 ("fresh") if the stamp is missing/unparseable. Only Aging calls this; Greedy
         ignores age, so dream stays byte-identical."""
         if self._born is None:                         # lazy: only an Aging run pays the scan (Greedy never calls age)
-            self._born = _event_born_map(self._root)
+            self._born = events.event_born_map(self._root)
         return config.age_days(self._born.get(rv.id))
 
-    def process(self, rv: ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
+    def process(self, rv: events.ResolvedEvent, *, root: Path, run_id: str) -> tuple[int, float]:
         """Route the event against the on-instance catalog, apply the verdict (committing the takeaway +
         `consolidated` decision), then FOLD the result back into the catalog so the next event sees it.
         Returns (n_outputs, cost) for the driver's budget gate. A raised route/synth propagates — the
@@ -1483,7 +859,7 @@ def main(argv=None) -> None:
                     "is the deferred sibling knob")
     ap.add_argument("--drift-threshold", type=float, default=DRIFT_THRESHOLD,
                     help="lexical drift above which a strengthen re-synthesizes the why")
-    ap.add_argument("--maturity", type=float, default=MATURITY_WEIGHT,
+    ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT,
                     help="shapes ONLY the --dry-run preview's mature-takeaway count; the bar itself is the "
                          "reviewer's knob and lives with review/synthesize (ADR-0027)")
     ap.add_argument("--max-usd", type=float, help="stop the run before spend exceeds this")
@@ -1513,12 +889,12 @@ def main(argv=None) -> None:
 
     if args.dry_run:                                # eyeball the queue + catalog before spending
         root = config.ensure_layout()
-        ws = working_set(root, min_confidence=args.min_confidence)
+        ws = events.working_set(root, min_confidence=args.min_confidence)
         if args.source is not None:                    # mirror the real run's FOCUS so the preview can't lie about order
-            ws = filter_by_source(ws, args.source, root)
-        born = _event_born_map(root) if args.priority == "aging" else {}   # only Aging needs the recency read
+            ws = events.filter_by_source(ws, args.source, root)
+        born = events.event_born_map(root) if args.priority == "aging" else {}   # only Aging needs the recency read
         ws = block.priority_strategy(args.priority).order(   # mirror the real run's POLICY (incl. age) so the
-            ws, lambda rv: salience(rv.event),               # preview can't lie about order
+            ws, lambda rv: events.salience(rv.event),        # preview can't lie about order
             lambda rv: config.age_days(born.get(rv.id)))
         cat = catalog(root)
         mature = current_takeaways(root, min_weight=args.maturity)
@@ -1526,7 +902,7 @@ def main(argv=None) -> None:
               f"({len(mature)} mature):")
         for rv in ws[:40]:
             sample = rv.quote.strip().replace("\n", " ")
-            print(f"  [{salience(rv.event):.3f}] {rv.id[:12]}  {sample[:72]!r}")
+            print(f"  [{events.salience(rv.event):.3f}] {rv.id[:12]}  {sample[:72]!r}")
         return
 
     complete_route = completer.make_cli_completer(args.route_model)

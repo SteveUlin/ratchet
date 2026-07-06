@@ -3,14 +3,14 @@ suite runs offline with FAKE route + synth Completers. Load-bearing checks, in o
 changed and what review must still guarantee:
 
   THE MATURITY GATE (the v2 headline) — `pending` shows ONLY takeaways corroborated across
-    `dream.MATURITY_SESSIONS` (=2) DISTINCT sessions; a one-session takeaway INCUBATES (live + routable,
+    `temporal.MATURITY_SESSIONS` (=2) DISTINCT sessions; a one-session takeaway INCUBATES (live + routable,
     but out of the human gate) and surfaces via `incubating`. Strengthening it across the bar (a real
     second-session dream run) moves it INTO the queue — the loop that feeds review.
   THE TRUST CHAIN — the queue is a DERIVED query over references (no stored list); each cited span
     re-resolves AND re-validates against its immutable cleaned blob ("verified real"); a malformed/foreign
     span is dropped at the read boundary, never shown verified; accept bakes ONLY re-validated spans into
     the concept.
-  THE LOOP CLOSE — accept mints a concept `dream.load_concepts` then reads; a strengthens/refines accept
+  THE LOOP CLOSE — accept mints a concept `concepts.load_concepts` then reads; a strengthens/refines accept
     versions the NAMED concept (same id); decisions are append-only and drive every transition
     (accept/reject/snooze/edit/retire), latest decision wins; a producer `processed` marker cannot
     resurrect a reviewed takeaway.
@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-review-")
 
-from ratchet import blobstore, chunk, config, dream, glean, review  # noqa: E402
+from ratchet import blobstore, chunk, concepts, config, dream, glean, review, temporal  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 
 ROOT = config.ensure_layout()
@@ -145,7 +145,7 @@ def seed_events(specs):
 def seed_takeaway(*, id, title, why, relation, evidence, support):
     """Ingest a v2-shape takeaway BLOB directly (source_id == the stable minted-style id), bypassing
     synthesis, to drive the lifecycle folds deterministically. `support['sessions']` decides whether the
-    maturity gate lets it reach review (>= dream.MATURITY_SESSIONS). v2 shape: NO cluster_signature/
+    maturity gate lets it reach review (>= temporal.MATURITY_SESSIONS). v2 shape: NO cluster_signature/
     member_events/supersedes; ADD sessions_seen + last_seen; cites derive from the evidence event ids."""
     sessions_seen = [f"sess-{id}-{i}" for i in range(support.get("sessions", 0))]
     rec_ = {"id": id, "title": title, "why": why, "relation": relation,
@@ -185,14 +185,14 @@ inc = review.incubating(ROOT)
 assert {t["takeaway_id"] for t in inc} == {nix_tk["id"]}, "the incubating view = catalog minus the mature set"
 inc_nix = inc[0]
 assert inc_nix["title"] == NIX_TITLE and inc_nix["support"]["sessions"] == 1, "incubating projects title + support"
-assert inc_nix["needs"] == dream.MATURITY_SESSIONS - 1 == 1, "`needs` = further distinct sessions to mature"
+assert inc_nix["needs"] == temporal.MATURITY_SESSIONS - 1 == 1, "`needs` = further distinct sessions to mature"
 print("OK 1 — maturity gate: only the 2-session takeaway is reviewable; the 1-session one incubates "
       "(live, out of the queue) and shows in `--incubating` with its shortfall.")
 
 # --- 1b. THE BAR IS THE REVIEWER'S KNOB, and TRANSPARENT (ADR-0027): not a hidden constant -----------
 # Every surfaced takeaway carries its score-vs-bar rationale — pending AND incubating.
 jj_view = [t for t in review.pending(ROOT) if t["takeaway_id"] == jj_tk["id"]][0]
-assert jj_view["bar"] == dream.MATURITY_WEIGHT and jj_view["entrenchment"] >= jj_view["bar"], \
+assert jj_view["bar"] == temporal.MATURITY_WEIGHT and jj_view["entrenchment"] >= jj_view["bar"], \
     "a pending takeaway shows its entrenchment >= the bar"
 assert jj_view["mature"] and "≥ bar" in jj_view["rationale"], "pending carries a plain why it cleared the bar"
 assert "rationale" in inc_nix and inc_nix["entrenchment"] < inc_nix["bar"], \
@@ -241,14 +241,14 @@ print("OK 3 — queue: a derived query over references; each cited span re-resol
       "its immutable blob (verified real).")
 
 
-# --- 4. accept mints a concept and CLOSES THE LOOP (dream.load_concepts then sees it) ----------------
+# --- 4. accept mints a concept and CLOSES THE LOOP (concepts.load_concepts then sees it) ----------------
 
-assert dream.load_concepts(ROOT) == [], "no concepts before any accept"
+assert concepts.load_concepts(ROOT) == [], "no concepts before any accept"
 cid = review.accept(jj_tk["id"], assessment="why follows the cited quotes", note="clear accept")
 assert cid.startswith("c-")
-concepts = dream.load_concepts(ROOT)
-assert [c["id"] for c in concepts] == [cid], "the accepted takeaway is now a concept dream reads (loop closed)"
-c = concepts[0]
+cs = concepts.load_concepts(ROOT)
+assert [c["id"] for c in cs] == [cid], "the accepted takeaway is now a concept dream reads (loop closed)"
+c = cs[0]
 assert c["title"] == JJ_TITLE and c["statement"] == JJ_WHY, "the concept carries the synthesis"
 # the concept's stored evidence must itself RE-RESOLVE to real bytes — accept bakes only the verified spans.
 ce = c["evidence"][0]
@@ -257,7 +257,7 @@ assert blobstore.get(ce["cleaned_hash"]).encode("utf-8")[ce["byte_start"]:ce["by
 assert jj_tk["id"] not in pending_ids(), "an accepted takeaway leaves the queue"
 d = blobstore.latest_decision(jj_tk["id"], ROOT)
 assert d["verb"] == "accept" and d["concept"] == cid and d["assessment"].startswith("why follows")
-print("OK 4 — accept: takeaway → concept blob; dream.load_concepts sees it (loop closed); decision "
+print("OK 4 — accept: takeaway → concept blob; concepts.load_concepts sees it (loop closed); decision "
       "records provenance; only verified spans are baked in.")
 
 
@@ -270,8 +270,8 @@ seed_takeaway(id="grow-jj", title="jj over git (more)", why="more evidence sulin
 cid2 = review.accept("grow-jj")
 assert cid2 == cid, "a strengthens accept reuses the concept id from the relation (does not mint a new one)"
 assert blobstore.latest_version(cid, ROOT) != before_h, "the concept gained a NEW version (refinement)"
-assert dream.load_concepts(ROOT)[0]["statement"] == "more evidence sulin uses jj.", "latest version wins"
-assert len([c for c in dream.load_concepts(ROOT) if c["id"] == cid]) == 1, "still one valid concept per id"
+assert concepts.load_concepts(ROOT)[0]["statement"] == "more evidence sulin uses jj.", "latest version wins"
+assert len([c for c in concepts.load_concepts(ROOT) if c["id"] == cid]) == 1, "still one valid concept per id"
 print("OK 5 — accept (strengthens): updates the named concept as a new version; latest wins; one per id.")
 
 
@@ -309,7 +309,7 @@ ed = seed_takeaway(id="editme", title="loose claim", why="overgeneralized.",
                    support={"events": 2, "sessions": 2})
 ecid = review.accept(ed, edited={"title": "tight claim", "why": "narrowed to what the evidence supports."},
                      assessment="why overreached; narrowed it")
-econcept = [c for c in dream.load_concepts(ROOT) if c["id"] == ecid][0]
+econcept = [c for c in concepts.load_concepts(ROOT) if c["id"] == ecid][0]
 assert econcept["title"] == "tight claim" and econcept["statement"].startswith("narrowed"), "concept uses the edit"
 edec = blobstore.latest_decision(ed, ROOT)
 assert edec["verb"] == "edit" and edec["edited"]["before"]["title"] == "loose claim", "edit captures before/after"
@@ -318,9 +318,9 @@ print("OK 8 — edit: the corrected synthesis becomes the concept; before/after 
 
 # --- 9. retire drops a concept from the valid set (not a deletion) -----------------------------------
 
-assert cid in {c["id"] for c in dream.load_concepts(ROOT)}, "concept is valid before retire"
+assert cid in {c["id"] for c in concepts.load_concepts(ROOT)}, "concept is valid before retire"
 review.retire(cid, reason="superseded by a clearer concept")
-assert cid not in {c["id"] for c in dream.load_concepts(ROOT)}, "a retired concept leaves the valid set"
+assert cid not in {c["id"] for c in concepts.load_concepts(ROOT)}, "a retired concept leaves the valid set"
 assert blobstore.has(blobstore.latest_version(cid, ROOT), ROOT), "but the concept blob + history remain (no deletion)"
 print("OK 9 — retire: concept leaves the valid set via the latest decision; the immutable history is kept.")
 
@@ -345,7 +345,7 @@ mix = seed_takeaway(id="mixev", title="mixed", why="one good, one bad span.",
                                         "byte_start": None, "byte_end": 999999}],
                     support={"events": 1, "sessions": 1})
 mcid = review.accept(mix, assessment="kept the verifiable span")
-mconcept = [c for c in dream.load_concepts(ROOT) if c["id"] == mcid][0]
+mconcept = [c for c in concepts.load_concepts(ROOT) if c["id"] == mcid][0]
 assert len(mconcept["evidence"]) == 1, "the malformed span is filtered OUT of the concept (only verified spans)"
 me = mconcept["evidence"][0]
 assert blobstore.get(me["cleaned_hash"]).encode("utf-8")[me["byte_start"]:me["byte_end"]].decode() == JJ

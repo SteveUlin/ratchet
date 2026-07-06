@@ -14,8 +14,8 @@ rate, not the new-event rate — an all-NEW cold-start corpus pays Sonnet for no
   ONE CALL PER CLAIM — system = the matured-claim variant of dream's SYNTH_SYSTEM; user = the claim's
     derived evidence quotes (folded from LIVE corroborates edges, spans re-validated at the fold's
     read boundary) + `concepts.concept_digest` as the trusted prior. The verdict {title, why,
-    relation, confidence, drop} parses through dream's coercion idioms (`_clip`, `_clean_relation`,
-    `clean_score`; unparseable/drop/empty-why → no version, never garbage prose).
+    relation, confidence, drop} parses through the shared coercion idioms (`concepts.clip`,
+    `concepts.clean_relation`, `clean_score`; unparseable/drop/empty-why → no version, never garbage prose).
 
   A NEW CLAIM VERSION, NEVER AN EDGE — the blob keeps seed identity ({id, seed_event, born}) and
     gains the prose (title improved, why filled) plus `why_fingerprint`: the live corroborates-edge-
@@ -42,7 +42,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from . import blobstore, block, completer, config, dream, resolve
+from . import blobstore, block, completer, concepts, config, resolve, temporal
 from .completer import Completer
 
 PROMPT_VERSION = "synth/2"     # bump to re-synthesize NOT-yet-prosed claims with a sharper prompt
@@ -100,7 +100,7 @@ def synthesize_claim(claim: dict, complete_synth: Completer, concept_digest: str
     no durable prose: NO version is minted, the claim keeps its provisional title (review shows it with
     a "why pending" badge, §6), and the driver's marker stops the automatic path from re-paying —
     `--claim` re-demands it. The quotes were re-validated at the fold's read boundary
-    (`dream._resolve_event` / `validate_span`); a claim with NO surviving quote raises — Sonnet must
+    (`events.resolve_event` / `validate_span`); a claim with NO surviving quote raises — Sonnet must
     never write prose without verbatim ground truth (the event blobs are gone; retried, not marked)."""
     quotes = [e for e in (claim.get("evidence") or []) if str(e.get("quote", "")).strip()]
     if not quotes:
@@ -110,18 +110,18 @@ def synthesize_claim(claim: dict, complete_synth: Completer, concept_digest: str
     parsed = completer.parse_json_object(comp.text) or {}
     if not parsed or parsed.get("drop"):
         return None, cost
-    why = dream._clip(str(parsed.get("why", "")))
+    why = concepts.clip(str(parsed.get("why", "")))
     if not why:                                    # no usable principle → decline, never garbage prose
         return None, cost
     content = {
         "id": claim["id"],
-        "title": str(parsed.get("title", "")).strip()[:dream.TITLE_MAX] or str(claim.get("title", "")),
+        "title": str(parsed.get("title", "")).strip()[:concepts.TITLE_MAX] or str(claim.get("title", "")),
         "why": why,
         # the PROPOSED typology (ADR-0029): behavioral (shapes conduct) vs reference (lookup material).
         # A proposal only — review confirms it on accept; unknown coerces behavioral (recall-first:
         # wrongly-behavioral is caught at the gate, wrongly-reference vanishes from generation).
-        "kind": dream.clean_kind(parsed.get("kind")),
-        "relation": dream._clean_relation(parsed.get("relation"), known_concept_ids),
+        "kind": concepts.clean_kind(parsed.get("kind")),
+        "relation": concepts.clean_relation(parsed.get("relation"), known_concept_ids),
         "seed_event": claim.get("seed_event"),
         "born": claim.get("born"),
         # the edge set this prose consumed (§7.3): the fold recomputes it from live edges and flags
@@ -156,7 +156,7 @@ class SynthesizeBlock:
     age = block.no_age                             # the queue is graduation-bounded; starvation is moot
 
     def __init__(self, complete_synth: Completer, *, model: str = SYNTH_MODEL,
-                 maturity: float = dream.MATURITY_WEIGHT, claim: str | None = None) -> None:
+                 maturity: float = temporal.MATURITY_WEIGHT, claim: str | None = None) -> None:
         self.complete_synth = complete_synth
         self.model = model
         self.maturity = maturity
@@ -181,13 +181,12 @@ class SynthesizeBlock:
     def items(self, root: Path, *, source_id: str | None = None):
         """Build the digest + the entrenchment map once, then yield the matured why-null queue (or the
         one demanded claim). `source_id` is ignored (synthesize is a global pass)."""
-        from .concepts import concept_digest           # lazy: the dream↔concepts cycle guard (ADR-0018)
-        self._digest = concept_digest(root)
-        self._known_ids = dream.valid_concept_ids(root)
+        self._digest = concepts.concept_digest(root)
+        self._known_ids = concepts.valid_concept_ids(root)
         now = config.now()
-        valid_times = dream._session_valid_times(root)
+        valid_times = temporal.session_valid_times(root)
         pool = resolve.claim_pool(root)
-        self._net = {c["id"]: dream.net_entrenchment(c, now, valid_times=valid_times) for c in pool}
+        self._net = {c["id"]: temporal.net_entrenchment(c, now, valid_times=valid_times) for c in pool}
         if self.claim_id is not None:                  # review demand: the bar does not gate it
             picked = [c for c in pool if c["id"] == self.claim_id]
             if not picked:
@@ -239,7 +238,7 @@ class SynthesizeReport(block.ProxyReport):
 
 
 def run(complete_synth: Completer, *, model: str = SYNTH_MODEL,
-        maturity: float = dream.MATURITY_WEIGHT, claim: str | None = None,
+        maturity: float = temporal.MATURITY_WEIGHT, claim: str | None = None,
         max_usd: float | None = None, limit: int | None = None,
         priority: block.PriorityStrategy | None = None,
         progress: block.Progress | None = None, root: Path | None = None) -> SynthesizeReport:
@@ -261,9 +260,9 @@ def main(argv=None) -> None:
                     "per-event; the queue is bounded by the graduation rate). --claim re-synthesizes "
                     "on review demand, bypassing both the bar and the done-marker.")
     ap.add_argument("--model", default=SYNTH_MODEL, help=f"prose model (default: {SYNTH_MODEL})")
-    ap.add_argument("--maturity", type=float, default=dream.MATURITY_WEIGHT,
+    ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT,
                     help="recency-weighted net-entrenchment bar a claim must have crossed to be "
-                         "synthesized (the single bar, dream.MATURITY_WEIGHT — the reviewer's knob, "
+                         "synthesized (the single bar, temporal.MATURITY_WEIGHT — the reviewer's knob, "
                          "ADR-0027)")
     ap.add_argument("--claim", help="explicit review demand: synthesize THIS claim id regardless of "
                     "the bar; the done-key gains a per-run demand param, so an existing marker never "
@@ -309,7 +308,7 @@ def main(argv=None) -> None:
         return
     if args.show:
         for c in report.claims:
-            tag = f" · {c['kind']}" if c.get("kind") != dream.KIND_BEHAVIORAL else ""
+            tag = f" · {c['kind']}" if c.get("kind") != concepts.KIND_BEHAVIORAL else ""
             print(f"\n  • {c['title']}  [{c['relation']['kind']}{tag}]")
             print(f"    {c['why']}")
     tail = "  [stopped: budget]" if report.stopped_on_budget else ""

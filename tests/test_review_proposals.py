@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-review-proposals-")
 
-from ratchet import blobstore, config, dream, garden, review, weave  # noqa: E402
+from ratchet import blobstore, concepts, config, garden, review, weave  # noqa: E402
 
 R = config.ensure_layout()
 RUN = "proposals-test"
@@ -78,7 +78,7 @@ def mint(cid, title, evidence):
 
 
 def valid_ids():
-    return {c["id"] for c in dream.load_concepts(R)}
+    return {c["id"] for c in concepts.load_concepts(R)}
 
 def queue_ids():
     return {p["proposal_id"] for p in review.pending_proposals(R)}
@@ -127,7 +127,7 @@ assert res["status"] == "accepted" and res["op"] == "merge" and res["result"] ==
 assert "c-b" not in valid_ids(), "the merge loser left the valid set (invalidate-don't-delete)"
 assert "c-a" in valid_ids(), "the merge winner stays valid"
 assert blobstore.latest_version("c-a", R) != a_before, "the winner concept was re-versioned (the merge applied)"
-winner = [c for c in dream.load_concepts(R) if c["id"] == "c-a"][0]
+winner = [c for c in concepts.load_concepts(R) if c["id"] == "c-a"][0]
 assert len(winner["evidence"]) == 2, f"the winner unioned BOTH concepts' evidence: {len(winner['evidence'])}"
 assert any(e["src"] == "c-b" and e["kind"] == "supersedes" and e["dst"] == "c-a" for e in garden.asserted_edges(R)), \
     "the merge asserted the supersedes lineage edge loser→winner"

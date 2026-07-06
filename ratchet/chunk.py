@@ -224,7 +224,7 @@ def _show(cs_hash: str, h: str, chunks: list[Chunk], full: bool) -> None:
         print(f"  [{c.turn_start:>3}–{c.turn_end:<3}] seg{c.segment} "
               f"{c.byte_end - c.byte_start:>6}B {'/'.join(c.kinds):<18} {head[:60]}")
         if full:
-            print(weave._truncate(text, 400), "\n")
+            print(weave.truncate(text, 400), "\n")
 
 
 def main(argv=None) -> None:

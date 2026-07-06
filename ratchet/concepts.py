@@ -14,6 +14,12 @@ cleaned blob gets its facets for free, no migration (ADR-0013). Two concepts tha
 file, repo, or tool, or that happened close in time, are RELATED; the strength is a weighted SET
 OVERLAP, not a cosine over short quotes (the metric that sank dream v1 — ADR-0010 §Context).
 
+This module also OWNS the valid concept set itself (ADR-0032 moved the loaders home from dream): the
+decision folds (`concept_kinds`/`concept_scopes`), `load_concepts`/`valid_concept_ids`, the closed
+vocabularies (kinds, scopes, lifecycle verbs), and the claim→concept field schema (the prose caps +
+defensive coercers every producer shares). The concept layer's one module, so no consumer transits a
+superseded stage to read it.
+
 Everything here is a REBUILDABLE VIEW — computed on read from the blobs, never stored, exactly like
 `dream.current_takeaways` / `load_concepts`. `concept_graph` returns `{nodes, edges, clusters}`:
   - nodes  — each valid concept with its facets.
@@ -37,8 +43,208 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from . import blobstore, config, dream
+from . import blobstore, config
 from .weave import active_path, parse
+
+# The verbs whose latest decision drops a concept from the valid set — the concept-side mirror of
+# `catalog`'s merge/retire/reject filter. `retire` is review's human gate (ADR-0008); `supersede`/`split`
+# are the gardener's structural ops (3c/ADR-0015) — a merge-loser is superseded INTO its winner, a split
+# original is dissolved INTO its parts. All three are invalidate-don't-delete: the blob + history stay,
+# only the latest-decision FOLD takes the concept out of `load_concepts`/`valid_concepts`.
+#
+# SINGLE-SOURCED CONTRACT: the gardener WRITES these decision verbs (`garden.merge`/`split` reference
+# `VERB_SUPERSEDE`/`VERB_SPLIT`) and this fold READS them — one spelling, so a typo can't silently leave a
+# merge-loser in the valid set (a trust-corruption). The constants live HERE, beside the fold that reads
+# them; garden imports them (garden→concepts holds, no cycle).
+VERB_RETIRE = "retire"
+VERB_SUPERSEDE = "supersede"
+VERB_SPLIT = "split"
+CONCEPT_INVALID_VERBS = (VERB_RETIRE, VERB_SUPERSEDE, VERB_SPLIT)
+
+# The concept TYPOLOGY (ADR-0029): faithfulness and generation-usefulness are ORTHOGONAL. A claim can
+# be true, worth keeping, and still not belong in CLAUDE.md — "ultracode = env-set effort level" is a
+# fact you'd look up; "verify the fix is in the exact artifact before the risky action" shapes conduct.
+# So every concept carries a KIND: `behavioral` (shapes conduct — generate projects it) or `reference`
+# (a mechanism/fact — kept, queried, never projected by default). The LLM PROPOSES a kind at
+# synthesize; the reviewer's decision is authoritative (recorded on the accept, re-kindable later via
+# review's `set_kind` — the fold below). Coercion is RECALL-FIRST: an unknown/absent kind reads
+# `behavioral`, because a wrongly-behavioral rule is caught at the review/diff gates while a
+# wrongly-reference lesson silently vanishes from generation.
+KIND_BEHAVIORAL = "behavioral"
+KIND_REFERENCE = "reference"
+CONCEPT_KINDS = (KIND_BEHAVIORAL, KIND_REFERENCE)
+VERB_SET_KIND = "set_kind"     # review's re-kinding decision verb — written there, folded here
+
+
+def clean_kind(v) -> str:
+    """Coerce a proposed kind to the closed vocabulary — unknown/absent → `behavioral` (recall-first,
+    see CONCEPT_KINDS above). The coercion idiom of `clean_relation`/`clean_score`, for the typology."""
+    return v if v in CONCEPT_KINDS else KIND_BEHAVIORAL
+
+
+# The concept SCOPE (ADR-0030) — the kind's mirror axis: WHERE a lesson applies, not what shape it
+# has. A lesson about one repo's harness belongs in THAT repo's CLAUDE.md, not the global one. Unlike
+# kind, no LLM proposes: the proposal DERIVES deterministically from the claim's live evidence's
+# subject keys (`resolve.scope_repo_of` — every quote in one repo → that repo's label; 2+ repos or
+# none → `global`, because a multi-repo lesson is de facto general and pinning narrower is what the
+# reviewer's override is for). The same trust boundary as kind: the derivation is a default, the
+# accept records the confirmed scope (`--scope` overrides), and review's `set_scope` re-scopes later,
+# outranking the accept in the fold below. The vocabulary is OPEN — any repo label the reviewer
+# names — so the only guard is emptiness, never membership.
+SCOPE_GLOBAL = "global"
+VERB_SET_SCOPE = "set_scope"   # review's re-scoping decision verb — written there, folded here
+
+
+def clean_scope(v) -> str:
+    """Coerce a scope to the open vocabulary's one invariant — a non-empty label. Absent/blank →
+    `global` (a lesson with no stated home applies everywhere; narrowing it is the reviewer's
+    explicit call). `clean_kind`'s sibling, minus the closed-set check: repo labels are free text."""
+    s = v.strip() if isinstance(v, str) else ""
+    return s or SCOPE_GLOBAL
+
+
+# --- the claim→concept field schema: prose caps + defensive coercers ------------------------------
+# These bound and scrub the fields that flow TOWARD a concept — a takeaway/claim's title/why/relation
+# — so every producer (dream's legacy synth, synthesize's deferred prose) shares one spelling. Homed
+# here (ADR-0032) because the schema is the concept layer's: `clean_relation` validates against the
+# valid concept set, and `clip` caps prose whose destination is the concept STATEMENT.
+
+TITLE_MAX = 80
+WHY_MAX = 280
+NOTE_MAX = 160
+
+_RELATION_KINDS = ("new", "strengthens", "refines", "contradicts")
+
+
+def clip(text: str, limit: int = WHY_MAX) -> str:
+    """Length-cap a synthesized field WITHOUT chopping mid-word. A hard `[:limit]` once shipped a rule
+    ending `…evaluates the s` — the why becomes the concept STATEMENT becomes the CLAUDE.md rule, so a
+    guillotined sentence lands verbatim in a human's config. Prefer the last SENTENCE boundary that fits
+    (a complete thought, no ellipsis); else the last WORD boundary + `…` (clearly abbreviated, never
+    broken). Stays within `limit`."""
+    t = text.strip()
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end >= limit // 2:                          # a real sentence break, not a stray early period
+        return cut[:end + 1].rstrip()
+    sp = cut.rfind(" ")
+    base = cut[:sp] if sp >= limit // 2 else cut[:limit - 1]
+    return base.rstrip() + "…"
+
+
+def clean_relation(v, known_ids: set[str]) -> dict:
+    """Coerce the untrusted relation: an unknown kind → `new`, and a `concept_id` that isn't a real known
+    concept → null (which forces `new` — you cannot strengthen/refine/contradict a concept that does not
+    exist, so today, with no concepts, every relation is `new`). Unchanged from v1; powers review's
+    loop-close."""
+    v = v if isinstance(v, dict) else {}
+    kind = v.get("kind") if v.get("kind") in _RELATION_KINDS else "new"
+    cid = v.get("concept_id")
+    cid = cid if isinstance(cid, str) and cid in known_ids else None
+    if cid is None and kind != "new":
+        kind = "new"
+    return {"kind": kind, "concept_id": cid, "note": str(v.get("note", "")).strip()[:NOTE_MAX]}
+
+
+# --- the valid concept set: the decision folds + loaders ------------------------------------------
+
+def _facet_fold(root: Path | None, *, set_verb: str, clean) -> dict[str, str]:
+    """The ONE decision fold behind `concept_kinds`/`concept_scopes` — the two facets share the exact
+    precedence shape, so the mechanics live once: `clean(decision)` reads the facet value off a
+    decision (None = facet-less/blank/foreign — nothing to fold), and the latest `set_verb` decision
+    targeting the concept wins over the facet the latest accept/edit decision recorded. One scan; same
+    (fetched_at, content_hash) recency tie-break as `latest_decisions`. ("accept", "edit") are
+    review's promote verbs — resolve.ACCEPT_VERBS, spelled here to keep concepts import-cycle-free."""
+    root = root or config.data_root()
+    set_best: dict[str, tuple[tuple[str, str], str]] = {}
+    acc_best: dict[str, tuple[tuple[str, str], str]] = {}
+    for d in blobstore.decisions_for(None, root):
+        v = clean(d)
+        if v is None:
+            continue
+        key = (d.get("fetched_at", ""), d.get("content_hash", ""))
+        verb = d.get("verb")
+        if verb == set_verb and isinstance(d.get("target"), str):
+            t = d["target"]
+            if t not in set_best or key > set_best[t][0]:
+                set_best[t] = (key, v)
+        elif verb in ("accept", "edit") and isinstance(d.get("concept"), str):
+            c = d["concept"]
+            if c not in acc_best or key > acc_best[c][0]:
+                acc_best[c] = (key, v)
+    out = {c: k for c, (_, k) in acc_best.items()}
+    out.update({c: k for c, (_, k) in set_best.items()})   # set_* > accept — the later, deliberate call
+    return out
+
+
+def concept_kinds(root: Path | None = None) -> dict[str, str]:
+    """concept id → its reviewer-confirmed KIND, folded from DECISIONS only (ADR-0029): the latest
+    `set_kind` decision targeting the concept wins over the `kind` the latest accept/edit decision
+    recorded (the accept references its minted concept via its `concept` field); a concept in NEITHER
+    map is absent here and defaults `behavioral` at the caller (legacy concepts predate the facet).
+    The kind lives on decisions, never the concept blob, so a garden op re-versioning the blob
+    (merge's evidence union) cannot silently drop it — and the reviewer's `set_kind` outranks the
+    accept because re-kinding is a LATER, deliberate call on the same trust boundary."""
+    return _facet_fold(root, set_verb=VERB_SET_KIND,
+                       clean=lambda d: d["kind"] if d.get("kind") in CONCEPT_KINDS else None)
+
+
+def concept_scopes(root: Path | None = None) -> dict[str, str]:
+    """concept id → its reviewer-confirmed SCOPE, folded from DECISIONS only (ADR-0030) —
+    `concept_kinds`' mirror on the scope axis, same precedence for the same reason: the latest
+    `set_scope` decision targeting the concept outranks the `scope` the latest accept/edit recorded,
+    because re-scoping is a LATER, deliberate call on the same trust boundary. A concept in neither
+    map is absent here and defaults `global` at the caller (legacy concepts predate the axis). The
+    vocabulary is open, so the fold keeps any non-blank label; blank/foreign decisions are skipped."""
+    def clean(d):
+        s = d.get("scope")
+        return s.strip() if isinstance(s, str) and s.strip() else None
+    return _facet_fold(root, set_verb=VERB_SET_SCOPE, clean=clean)
+
+
+def load_concepts(root: Path | None = None) -> list[dict]:
+    """The current VALID concept set — the human-reviewed source of truth dream judges belief-change
+    against (ADR-0006/0007). A concept is a versioned blob the `review` stage ingests; "valid" is
+    derived: the latest version of each concept source, minus any whose latest decision carries a
+    `CONCEPT_INVALID_VERBS` verb (retire / supersede / split — each takes the concept out of the valid set).
+    This is the loop closing — review's accepts become the concepts dream reads next run. Empty until
+    review runs, so every takeaway is `new`. Malformed/absent → skipped, never fatal.
+
+    Each returned concept carries a derived `kind` (ADR-0029): latest set_kind decision > the accept
+    decision's kind > `behavioral` (the legacy default — concepts predating the facet shape conduct
+    until the reviewer says otherwise) — and a derived `scope` (ADR-0030, the same fold shape on the
+    open vocabulary): latest set_scope > the accept's scope > `global`. Attached here, on the ONE
+    valid-concept view, so every consumer (generate's projection filters, status's census, review's
+    listing) reads one derivation."""
+    root = root or config.data_root()
+    decisions = blobstore.latest_decisions(root)
+    kinds = concept_kinds(root)
+    scopes = concept_scopes(root)
+    out: list[dict] = []
+    for sid, h in blobstore.latest_by_kind("concept", root).items():
+        d = decisions.get(sid)
+        if d and d.get("verb") in CONCEPT_INVALID_VERBS:   # retired/superseded/split out of the valid set
+            continue                                        # (ADR-0007 §4; the gardener's ops, ADR-0015)
+        try:
+            obj = json.loads(blobstore.get(h, root))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("id"), str) and obj["id"]:
+            obj["kind"] = kinds.get(obj["id"], KIND_BEHAVIORAL)
+            obj["scope"] = scopes.get(obj["id"], SCOPE_GLOBAL)
+            out.append(obj)
+    return out
+
+
+def valid_concept_ids(root: Path | None = None) -> set[str]:
+    """The IDS of the current valid concept set — `{c["id"] for c in load_concepts(root)}`. The membership
+    test the gardener's structural ops (an op never targets a dead concept) and the concept-graph folds
+    gate on; single-sourced HERE, next to `load_concepts` (its source), so the call sites never re-spell
+    the comprehension."""
+    return {c["id"] for c in load_concepts(root)}
+
 
 # Facet-overlap weights — a shared FILE is the strongest co-location signal (two concepts that wrote
 # the same file are almost certainly about the same code), a shared REPO weaker (a repo holds many
@@ -102,7 +308,7 @@ def session_facts(spine: list[dict]) -> dict:
     return {"files_edited": sorted(files), "tools": sorted(tools)}
 
 
-def _repo_label(origin: dict) -> str | None:
+def repo_label(origin: dict) -> str | None:
     """The repo facet — a CLEAN repo name. Prefer the transcript's `cwd` basename (`ratchet` from
     `/home/sulin/ratchet`): unambiguous, and what a human calls the repo. Fall back to the datastore
     project-dir slug (`-home-sulin-ratchet`) only when no cwd was recorded — that slug is a lossy
@@ -138,7 +344,7 @@ def _cleaned_facets(cleaned_hash: str, root: Path, cache: dict | None = None) ->
             origin = m.get("origin_ref") or {}
             sf = session_facts(active_path(parse(blobstore.get(raw, root))))
             facets = {
-                "repo": _repo_label(origin),
+                "repo": repo_label(origin),
                 "session": origin.get("session_id") or m.get("source_id"),
                 "files": set(sf["files_edited"]),
                 "tools": set(sf["tools"]),
@@ -314,13 +520,13 @@ def leader_clusters(ids: list[str], facets: dict[str, dict]) -> list[dict]:
 def _facet_index(root: Path) -> tuple[list[dict], list[str], dict[str, dict]]:
     """The shared spine of every view: the valid concepts (sorted by id), their ids, and their facets —
     computed ONCE per call with a per-call cleaned-blob cache so a concept cited by many edges resolves
-    its sidecars once. Valid concepts = `dream.load_concepts` (latest version per id, minus retired). The
+    its sidecars once. Valid concepts = `load_concepts` (latest version per id, minus retired). The
     gardener's managed tags (3b/ADR-0014) are folded ONCE here and threaded into each concept's facets as
     the second grouping axis. The `garden` import is LAZY (function-local): garden imports `concept_facets`
     from this module, so a top-level import here would be a cycle — the tag-FOLD readers carry no Block, so
     a runtime import breaks it cleanly."""
     from . import garden                          # lazy: avoids the garden <-> concepts import cycle
-    concepts = sorted(dream.load_concepts(root), key=lambda c: c["id"])
+    concepts = sorted(load_concepts(root), key=lambda c: c["id"])
     tag_map = garden.all_concept_tags(root)        # concept_id -> current tags, one scan
     cache: dict = {}
     facets = {c["id"]: concept_facets(c, root, cache=cache, tags=tag_map.get(c["id"]))
@@ -353,7 +559,7 @@ def concept_hierarchy(root: Path | None = None) -> dict:
     and its golden — stay unchanged. Empty until an `abstract`/`reparent` asserts a `generalizes` edge."""
     root = root or config.data_root()
     from . import garden
-    valid = dream.valid_concept_ids(root)
+    valid = valid_concept_ids(root)
     children: dict[str, list[str]] = {}
     for e in garden.asserted_edges(root):
         if e["kind"] == "generalizes" and e["src"] in valid and e["dst"] in valid:
@@ -442,7 +648,7 @@ def digest_context(root: Path | None = None) -> dict:
     root = root or config.data_root()
     g = concept_graph(root)
     by_node = {n["id"]: n for n in g["nodes"]}
-    blobs = {c["id"]: c for c in dream.load_concepts(root)}     # statements + evidence count live on the blob
+    blobs = {c["id"]: c for c in load_concepts(root)}     # statements + evidence count live on the blob
     evid = {cid: len(blobs.get(cid, {}).get("evidence") or []) for cid in by_node}
     return {"clusters": g["clusters"], "by_node": by_node, "blobs": blobs, "evid": evid,
             "relations": _digest_relations(g["edges"])}

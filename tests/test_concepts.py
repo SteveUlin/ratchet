@@ -147,7 +147,7 @@ mint_concept("c2-foobar", "foo and bar", [ch_b])          # one session, shares 
 mint_concept("c3-beta", "beta baz", [ch_c])               # the disjoint outlier
 mint_concept("c4-span", "alpha spanning", [ch_a, ch_d])   # TWO sessions → facets union across them
 
-from ratchet.dream import load_concepts  # noqa: E402
+from ratchet.concepts import load_concepts  # noqa: E402
 by_id = {c["id"]: c for c in load_concepts(R)}
 f4 = concepts.concept_facets(by_id["c4-span"], R)
 assert f4["sessions"] == ["sess-a", "sess-d"], f"a concept spans the sessions it cites: {f4['sessions']}"

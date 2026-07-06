@@ -30,11 +30,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RATCHET_DATA_DIR"] = tempfile.mkdtemp(prefix="ratchet-test-dream-")
 
-from ratchet import blobstore, block, chunk, completer, config, dream, glean  # noqa: E402
+from ratchet import blobstore, block, chunk, completer, concepts, config, dream, events, glean, temporal  # noqa: E402
 from ratchet.completer import Completion  # noqa: E402
 from ratchet.dream import (  # noqa: E402
-    apply, catalog, current_takeaways, mint_takeaway_id, render_catalog, route, salience,
-    synthesize_new, takeaway_content, update_support, working_set, _clean_route)
+    apply, catalog, current_takeaways, mint_takeaway_id, render_catalog, route,
+    synthesize_new, takeaway_content, update_support, _clean_route)
+from ratchet.events import salience, working_set  # noqa: E402
 
 
 # Distinctive durable lines: the two JJ lines share content (so a lexical router strengthens one with
@@ -269,7 +270,7 @@ dream._write_merge("t-merged", "t-keep", run_id="r", root=R1b)
 cat_ids = {t["id"] for t in catalog(R1b)}
 assert cat_ids == {"t-keep", "t-incub"}, f"catalog drops reject + merge losers, keeps incubating: {cat_ids}"
 cur_ids = {t["id"] for t in current_takeaways(R1b)}
-assert cur_ids == {"t-keep"}, f"maturity gate: only the >= {dream.MATURITY_SESSIONS}-session takeaway reaches review: {cur_ids}"
+assert cur_ids == {"t-keep"}, f"maturity gate: only the >= {temporal.MATURITY_SESSIONS}-session takeaway reaches review: {cur_ids}"
 print("OK §1 — working_set folds consolidated/stale (ignores 'processed'); catalog drops merge/retire/reject;")
 print("        maturity gate counts distinct sessions; salience orders the queue; _clean_route + render_catalog.")
 
@@ -310,14 +311,14 @@ rv1, rv2 = wm[JJ1], wm[JJ2]
 assert rv1.session_id != rv2.session_id, "the two strengthening events come from DISTINCT sessions"
 synth = SynthFake()
 tk1, _ = synthesize_new(rv1, synth, [], known_concept_ids=set(), model="fake", run_id="r")
-assert tk1["support"]["sessions"] == 1 < dream.MATURITY_SESSIONS, "one session → incubating"
+assert tk1["support"]["sessions"] == 1 < temporal.MATURITY_SESSIONS, "one session → incubating"
 
 # a 2nd-session event bumps sessions 1→2 (maturing it); drift_threshold=1.0 forces the CHEAP path (drift
 # in [0,1] can never exceed 1.0), so NO LLM call, cost 0.
 synth.calls = 0
 nv, c = update_support(tk1, rv2, synth, [], known_concept_ids=set(), drift_threshold=1.0, model="fake", run_id="r")
 assert nv["support"] == {"events": 2, "sessions": 2}, "a distinct-session event bumps both events and sessions"
-assert nv["support"]["sessions"] >= dream.MATURITY_SESSIONS, "now mature (corroborated across distinct sessions)"
+assert nv["support"]["sessions"] >= temporal.MATURITY_SESSIONS, "now mature (corroborated across distinct sessions)"
 assert {e["event_id"] for e in nv["evidence"]} == {rv1.id, rv2.id}, "the new event's evidence is appended"
 assert synth.calls == 0 and c == 0.0, "the cheap bump path: no LLM call, no cost"
 
@@ -534,18 +535,18 @@ seed_events([("fg-low", "an incidental throwaway line nobody will need again lat
              ("fg-high", JJ1, M_HI, 0.9)], R8)
 low = [rv for rv in working_set(R8) if rv.quote.startswith("an incidental")][0]
 high = [rv for rv in working_set(R8) if rv.quote == JJ1][0]
-assert salience(low.event) < dream.FORGET_SALIENCE_FLOOR < salience(high.event), \
+assert salience(low.event) < events.FORGET_SALIENCE_FLOOR < salience(high.event), \
     f"the throwaway is below the floor, JJ1 is well above: {salience(low.event):.4f} / {salience(high.event):.4f}"
 # simulate >= tau dream cycles AFTER the events were born: distinct dream-stage decisions with later 'at'.
 for rid in ("fc-1", "fc-2", "fc-3"):
     block.write_processed("dream", "dummy-evt", (("prompt_version", dream.PROMPT_VERSION), ("model", "fake")),
                           n_outputs=0, cost_usd=0.0, run_id=rid, extra={}, root=R8)
-staled = dream.forget(R8, tau=2, salience_floor=dream.FORGET_SALIENCE_FLOOR, run_id="forget-run")
+staled = dream.forget(R8, tau=2, salience_floor=events.FORGET_SALIENCE_FLOOR, run_id="forget-run")
 assert staled == [low.id], f"only the aged AND low-salience event is staled (the conjunction): {staled}"
 assert {rv.id for rv in working_set(R8)} == {high.id}, "the staled straggler leaves the working set; the salient one survives"
 assert blobstore.has(blobstore.latest_version(low.id, R8), R8), "stale is a DECISION, not a deletion — the blob remains (reversible)"
 # the conjunction protects against age-alone: even at tau cycles, the high-salience event is never staled.
-assert dream.forget(R8, tau=2, salience_floor=dream.FORGET_SALIENCE_FLOOR, run_id="forget-run-2") == [], \
+assert dream.forget(R8, tau=2, salience_floor=events.FORGET_SALIENCE_FLOOR, run_id="forget-run-2") == [], \
     "a salient event is never aged out (never age alone — ADR-0010 §6)"
 print("OK §8 — forget: stales ONLY on (tau cycles AND low salience); reversible (a decision, not a deletion);")
 print("        a salient event is never aged out.")
@@ -572,15 +573,15 @@ low_rv = [rv for rv in working_set(R8b) if rv.quote == NIX][0]
 assert known_rv.event["relevance"] == "known", "the known event stored its verdict (the ×0.4 tier)"
 # the decoupling invariant in numbers: INTRINSIC clears the floor, but `salience` (×0.4) sinks BELOW it —
 # so the OLD `salience`-gated forget would have evicted this event; the intrinsic-gated forget must NOT.
-assert dream._intrinsic_salience(known_rv.event) > dream.FORGET_SALIENCE_FLOOR > salience(known_rv.event), \
+assert events.intrinsic_salience(known_rv.event) > events.FORGET_SALIENCE_FLOOR > salience(known_rv.event), \
     (f"known event: intrinsic clears the floor, ×0.4 salience sinks below it — "
-     f"{dream._intrinsic_salience(known_rv.event):.4f} / {salience(known_rv.event):.4f}")
-assert dream._intrinsic_salience(low_rv.event) < dream.FORGET_SALIENCE_FLOOR, "the low event is genuinely sub-floor"
+     f"{events.intrinsic_salience(known_rv.event):.4f} / {salience(known_rv.event):.4f}")
+assert events.intrinsic_salience(low_rv.event) < events.FORGET_SALIENCE_FLOOR, "the low event is genuinely sub-floor"
 # age BOTH events past tau cycles (distinct dream-stage decisions with a later 'at').
 for rid in ("fr-1", "fr-2", "fr-3"):
     block.write_processed("dream", "dummy-evt", (("prompt_version", dream.PROMPT_VERSION), ("model", "fake")),
                           n_outputs=0, cost_usd=0.0, run_id=rid, extra={}, root=R8b)
-staled = dream.forget(R8b, tau=2, salience_floor=dream.FORGET_SALIENCE_FLOOR, run_id="forget-rel-run")
+staled = dream.forget(R8b, tau=2, salience_floor=events.FORGET_SALIENCE_FLOOR, run_id="forget-rel-run")
 assert staled == [low_rv.id], \
     f"forget gates on INTRINSIC salience: the ×0.4 `known` event survives, only the genuinely-low one stales: {staled}"
 assert known_rv.id in {rv.id for rv in working_set(R8b)}, "relevance ORDERS but never EVICTS — the known event survives"
@@ -641,22 +642,22 @@ print("        resynth=True spends one synth call to re-write the merged why and
 # === 10. CONCEPT SEAM + belief-change relation coercion ==============================================
 
 R10 = use_store("concepts")
-assert dream.load_concepts(R10) == [], "no concepts yet → empty (the seam is wired; review fills it)"
+assert concepts.load_concepts(R10) == [], "no concepts yet → empty (the seam is wired; review fills it)"
 blobstore.ingest(blobstore.canonical_json({"id": "c1", "title": "Use jj", "statement": "Use jj, never git."}),
                  source_kind="concept", source_id="c1", origin_ref={"stage": "review"}, root=R10)
-assert [c["id"] for c in dream.load_concepts(R10)] == ["c1"], "an ingested concept blob is read once present"
-assert dream._clean_relation({"kind": "contradicts", "concept_id": "c1"}, {"c1"})["kind"] == "contradicts", \
+assert [c["id"] for c in concepts.load_concepts(R10)] == ["c1"], "an ingested concept blob is read once present"
+assert concepts.clean_relation({"kind": "contradicts", "concept_id": "c1"}, {"c1"})["kind"] == "contradicts", \
     "a relation to a KNOWN concept sticks"
-assert dream._clean_relation({"kind": "contradicts", "concept_id": "ghost"}, {"c1"})["kind"] == "new", \
+assert concepts.clean_relation({"kind": "contradicts", "concept_id": "ghost"}, {"c1"})["kind"] == "new", \
     "a relation to a non-existent concept can't be trusted → new"
-assert dream._clean_relation({"kind": "bogus"}, {"c1"})["kind"] == "new", "an unknown relation kind → new"
+assert concepts.clean_relation({"kind": "bogus"}, {"c1"})["kind"] == "new", "an unknown relation kind → new"
 blobstore.ingest(blobstore.canonical_json({"verb": "retire", "target": "c1", "at": config.now()}),
                  source_kind="decision", source_id="dec-retire-c1", prev=None, origin_ref={"stage": "review"}, root=R10)
-assert dream.load_concepts(R10) == [], "a retired concept leaves the valid set"
+assert concepts.load_concepts(R10) == [], "a retired concept leaves the valid set"
 # a non-string concept id is skipped (never fatal) — it would otherwise break the known-id set build.
 blobstore.ingest(blobstore.canonical_json({"id": ["oops"], "title": "x"}),
                  source_kind="concept", source_id="badconcept", origin_ref={"stage": "review"}, root=R10)
-assert all(c["id"] != ["oops"] for c in dream.load_concepts(R10)), "a non-string concept id is skipped — never fatal"
+assert all(c["id"] != ["oops"] for c in concepts.load_concepts(R10)), "a non-string concept id is skipped — never fatal"
 print("OK §10 — concept seam reads VALID concept blobs (retire drops them); belief-change relation coerced.")
 
 

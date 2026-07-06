@@ -1,7 +1,7 @@
 """subject — WHERE a lesson lives: the repo+files scope key of one event (dream-v3 §2.1).
 
 An event's subject_key answers "which code is this lesson about?" with the only two facets that
-discriminate projects: the REPO (the origin cwd's basename, via `concepts._repo_label`) and the
+discriminate projects: the REPO (the origin cwd's basename, via `concepts.repo_label`) and the
 FILES WRITTEN near the lesson's evidence. `tools` is deliberately absent from the key: in a Claude
 Code transcript, tool names (Edit/Bash/Read/Grep) are near-identical across every project — they
 name the instrument, never the subject — so tool overlap relates everything to everything (the
@@ -19,16 +19,15 @@ resolve cascade's seed-only gate for it (§3.1: empty∩empty is not evidence of
 Everything recomputes on read from immutable blobs (ADR-0013): repo from the cleaned blob's
 lineage to the raw transcript's origin_ref, writes from the cleaned text itself, the fallback
 union from a raw re-parse. Nothing is stored here; glean stamps the result onto the event blob.
-`concepts` is imported LAZILY (function-local, the glean idiom): glean grows an import of this
-module, and concepts already reaches glean through dream — a top-level import would close the
-cycle.
+`concepts` imports only the substrate (blobstore/config) since the dissection (ADR-0032), so the
+top-level import here closes no cycle.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from . import blobstore
+from . import blobstore, concepts
 from .weave import active_path, parse
 
 # The narrowing window: bytes either side of the event's evidence span within which a write-tool
@@ -68,7 +67,6 @@ def _write_lines(data: bytes) -> list[tuple[int, int, str]]:
     count as writes is `concepts.EDIT_TOOLS` (Edit/Write/MultiEdit/NotebookEdit — a Read views).
     A line weave truncated (`…[` elision marker) carries a mangled path and is dropped — the
     fallback covers it rather than a garbage path entering the key."""
-    from . import concepts                         # lazy: the concepts→dream→glean→subject cycle
     out: list[tuple[int, int, str]] = []
     pos = 0
     for raw_line in data.split(b"\n"):
@@ -87,16 +85,15 @@ def _write_lines(data: bytes) -> list[tuple[int, int, str]]:
 
 def _blob_entry(cleaned_hash: str, root: Path) -> dict:
     """Everything subject_key needs from ONE cleaned blob, parsed once: the repo (a lineage meta
-    hop to the raw's origin_ref, named via `concepts._repo_label`), the write-line index (a content
+    hop to the raw's origin_ref, named via `concepts.repo_label`), the write-line index (a content
     scan), the blob's byte length (span validation on a cache hit, without re-reading), and the raw
     hash the fallback union re-parses. `union` starts None and fills lazily — a session whose every
     event narrows never pays the raw re-parse. Never fatal: a reclaimed blob or broken lineage
     degrades to an empty entry, so the event carries an empty subject (seed-only, §3.1)."""
-    from . import concepts                         # lazy: see module docstring
     # the shared lineage hop (`blobstore.raw_meta_of`) yields both fields at once: the repo off
     # `origin_ref`, the raw HASH (`content_hash`) the fallback union re-parses. None → empty entry.
     m = blobstore.raw_meta_of(cleaned_hash, root)
-    repo = concepts._repo_label(m.get("origin_ref") or {}) if m else None
+    repo = concepts.repo_label(m.get("origin_ref") or {}) if m else None
     raw = m.get("content_hash") if m else None
     writes: list[tuple[int, int, str]] = []
     nbytes = 0
@@ -112,7 +109,6 @@ def _session_union(entry: dict, root: Path) -> list[str]:
     """The whole-session files union — `concepts.session_facts` over the raw re-parse, the §3.0
     FALLBACK. Computed once per blob (memoized on the entry) and only when some event needs it."""
     if entry["union"] is None:
-        from . import concepts                     # lazy: see module docstring
         files: list[str] = []
         if entry["raw"]:
             try:
@@ -178,7 +174,6 @@ def subject_overlap(a: dict, b: dict) -> float:
     tool names are near-identical across all projects, so they don't discriminate subjects; a
     `tools` field on a key is simply never read. Two empty keys share nothing → 0.0 (empty∩empty
     is not overlap, §3.1)."""
-    from . import concepts                         # lazy: see module docstring
     score = concepts.W_FILE * len(set(a.get("files") or ()) & set(b.get("files") or ()))
     if a.get("repo") and a.get("repo") == b.get("repo"):
         score += concepts.W_REPO
