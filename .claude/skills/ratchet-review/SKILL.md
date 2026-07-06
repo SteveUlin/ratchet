@@ -78,6 +78,16 @@ Then decide which way to go:
 
 ### The card, then ONE question
 
+**Write for a human, not a database** (sulin, 2026-07-06). The card's job is to let sulin judge a
+lesson he may not remember living. Open with a plain-language explanation of what the lesson IS and
+where it came from (project name, what the sessions were doing) — as if telling a colleague who
+wasn't there. Define any term of art in one clause the first time it appears ("truncate-back —
+cutting the file back to its pre-write size"). **Ids are for commands, not prose**: sulin does not
+look anything up by `t-…`/`c-…` id, so never reference another claim or concept by id — describe it
+in words ("your existing rule about verifying scope before deleting C++ code") and put the id only
+in parentheses where he'd need it to run a verb. If a claim is implementation-deep, say so plainly
+and lead with the scope/kind call that follows from it.
+
 Present each claim as a compact, **wrap-safe** card — short labeled lines, **never a wide table** (tables clip in terminals). Always show the verbatim quotes inline, marked verified (✓) — sulin judges *interpretation*, never whether a quote is real. The shape:
 
 ```
