@@ -52,8 +52,9 @@ class Scripted:
     exception). `TimeoutExpired` is preserved so the binding's except clause still resolves."""
     TimeoutExpired = subprocess.TimeoutExpired
     def __init__(self, seq):
-        self.seq, self.calls = list(seq), 0
+        self.seq, self.calls, self.argvs = list(seq), 0, []
     def run(self, *a, **k):
+        self.argvs.append(list(a[0]))        # capture the FULL argv (flag audit for R1/R2)
         item = self.seq[self.calls]
         self.calls += 1
         if isinstance(item, BaseException):
@@ -131,5 +132,88 @@ try:
 finally:
     restore()
 print("OK — throttle budget: bounded retries, wait capped at rate_limit_max_wait, on_throttle hook fires.")
+
+
+# --- 5. the slim TOOL-LESS flags ride every call (R1/ADR-0035) -----------------------------------
+
+waits, sub, restore = install([FakeProc(ok_env())])
+try:
+    completer.make_cli_completer("haiku", cwd=Path("/tmp"))("sys", "usr")
+    argv = sub.argvs[0]
+    for flag in ("--disallowedTools", "--strict-mcp-config", "--disable-slash-commands", "--settings"):
+        assert flag in argv, f"{flag} is on every call (payload trim / no side effects)"
+    assert argv[argv.index("--disallowedTools") + 1] == "*", "disallow ALL tools (removes the schemas)"
+    assert argv[argv.index("--settings") + 1] == '{"disableAllHooks":true}', "hooks off via --settings JSON"
+    assert "--allowedTools" in argv, "the empty allowlist is KEPT as the proven max-turns guard"
+    assert argv[argv.index("--max-turns") + 1] == "1", "still one turn (a pure function)"
+finally:
+    restore()
+print("OK — R1: the slim tool-less flags (disallow-all + strict-mcp + no-slash + hooks-off) ride every call.")
+
+
+# --- 6. cache fields parse from the envelope usage (R0/ADR-0035) ---------------------------------
+
+def cache_env(read, create):
+    return json.dumps({"result": "hi", "total_cost_usd": 0.001,
+                       "usage": {"input_tokens": 40, "output_tokens": 2,
+                                 "cache_read_input_tokens": read, "cache_creation_input_tokens": create}})
+
+waits, sub, restore = install([FakeProc(cache_env(4096, 128))])
+try:
+    c = completer.make_cli_completer("haiku", cwd=Path("/tmp"))("sys", "usr")
+    assert c.cache_read_tokens == 4096 and c.cache_creation_tokens == 128, "cache fields parsed from usage"
+    assert c.input_tokens == 40, "input_tokens (the NON-cached input) still parsed alongside"
+finally:
+    restore()
+
+waits, sub, restore = install([FakeProc(ok_env())])                 # usage without any cache fields
+try:
+    c = completer.make_cli_completer("haiku", cwd=Path("/tmp"))("sys", "usr")
+    assert c.cache_read_tokens == 0 and c.cache_creation_tokens == 0, "absent cache fields default to 0"
+finally:
+    restore()
+print("OK — R0: cache_read/cache_creation parse from the envelope usage (0 when the binding omits them).")
+
+
+# --- 7. the warm/fork session chain: byte-identical shared flags, distinct session flags (R2) -----
+
+def _shared_flags(argv):
+    """The argv MINUS the session-establishment tokens — what must be byte-identical between warm+fork."""
+    out, it = [], iter(argv)
+    for tok in it:
+        if tok in ("--session-id", "--resume"):
+            next(it)                              # drop the session id that follows
+        elif tok == "--fork-session":
+            pass
+        else:
+            out.append(tok)
+    return out
+
+wc = completer.make_cli_completer("haiku", cwd=Path("/tmp"))
+assert hasattr(wc, "warm") and hasattr(wc, "fork"), "the CLI completer exposes the .warm/.fork seam"
+waits, sub, restore = install([FakeProc(ok_env("ready")), FakeProc(ok_env("events"))])
+try:
+    sid = wc.warm("SYS", "BASE-with-digest")
+    assert isinstance(sid, str) and len(sid) >= 32, "warm returns a uuid4 session id"
+    warm_argv = sub.argvs[0]
+    assert "--session-id" in warm_argv and sid in warm_argv, "warm pins the fresh session id"
+    assert "--resume" not in warm_argv, "warm is the FIRST call (establishes, does not resume)"
+    comp = wc.fork("SYS", "CHUNK", sid)
+    fork_argv = sub.argvs[1]
+    assert "--resume" in fork_argv and sid in fork_argv and "--fork-session" in fork_argv, "fork resumes + forks"
+    assert _shared_flags(warm_argv) == _shared_flags(fork_argv), \
+        "warm and fork carry BYTE-IDENTICAL shared flags (only the session flags differ — not persisted on resume)"
+    assert comp.text == "events", "the fork returns a real Completion (the extraction)"
+finally:
+    restore()
+
+waits, sub, restore = install([FakeProc(ok_env()), FakeProc(ok_env())])   # two warms → two distinct ids
+try:
+    wc2 = completer.make_cli_completer("haiku", cwd=Path("/tmp"))
+    assert wc2.warm("S", "A") != wc2.warm("S", "B"), "a fresh uuid per warm — a --session-id is never reused"
+finally:
+    restore()
+print("OK — R2: warm mints a fresh session (--session-id); fork resumes it (--resume --fork-session) with")
+print("     byte-identical shared flags; ids never reused.")
 
 print("\nall completer tests passed.")

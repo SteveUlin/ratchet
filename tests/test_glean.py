@@ -690,6 +690,92 @@ print("     → undated/broken lineage +0.0 exactly; default clock dates undated
 print("     (PDF/webpage policy), 'arrival' uses the tap date only; unknown clock refused.")
 
 
+# --- 8f. warm-base FORK mode (ADR-0035, --warm-base): the digest rides a shared base, forks the chunk --
+# Opt-in cost mode: the concept digest is seated in a warm base ONCE per tick and each chunk FORKS it,
+# instead of re-sending the digest in every chunk's oneshot prompt. The load-bearing properties:
+#   (a) the warm base carries the digest; each fork carries ONLY its chunk (no per-chunk digest re-send);
+#   (b) the oneshot path is UNCHANGED — its per-chunk turn still carries the digest, as before R2;
+#   (c) warm done-keys are DISTINCT from oneshot's (glean/5-fork vs glean/4), so the two never confuse;
+#   (d) the completer's cache fields flow to the per-chunk marker + the run tally.
+
+class WarmFake(FakeCompleter):
+    """FakeCompleter + the session-chain seam (ADR-0035). `warm` records the base user turn and mints a
+    session; `fork` records the per-chunk turn and reuses __call__'s quote→lines logic, stamping cache
+    tokens on the returned Completion so §(d) can prove they flow through to the marker."""
+    def __init__(self, candidates):
+        super().__init__(candidates)
+        self.warm_calls, self.fork_calls = [], []
+    def warm(self, system, base_user):
+        self.warm_calls.append({"system": system, "base_user": base_user})
+        return f"sess-{len(self.warm_calls)}"                 # a fresh id per warm
+    def fork(self, system, user, session_id):
+        self.fork_calls.append({"system": system, "user": user, "session_id": session_id})
+        base = self(system, user)                             # __call__: the quote→lines candidate logic
+        return Completion(text=base.text, model=base.model, cost_usd=base.cost_usd,
+                          cache_read_tokens=4096, cache_creation_tokens=0)   # a warm read landed
+
+raw_w, _ = blobstore.ingest(blob.replace("kick off", "kick off warm"), source_kind="transcript",
+                            source_id="glean-warm", origin_ref={"session_id": "glean-warm"})
+cs_w, _, wchunks = chunk.materialize(raw_w, budget=600)
+w_signal = sum(glean.has_signal_potential(chunk.resolve(c)) for c in wchunks)
+w_keys = {glean.chunk_key(c) for c in wchunks}
+
+warm_fake = WarmFake([{"quote": REAL_QUOTE, "summary": "warm", "markers": {"insight": 0.7}, "confidence": 0.9}])
+wblk = glean.GleanBlock(warm_fake, model="warm", targets=[cs_w], warm_base=True)
+wreport = block.run(wblk, progress=None)
+
+# (a) exactly ONE warm base for the tick; every signal chunk forked it; the base carries the digest,
+#     the forks do NOT re-send it.
+assert len(warm_fake.warm_calls) == 1, "the digest is warmed ONCE per tick (one shared base for the run)"
+assert len(warm_fake.fork_calls) == w_signal, "each signal chunk forks the shared base (one fork per call)"
+assert "WHAT WE ALREADY KNOW" in warm_fake.warm_calls[0]["base_user"], "the warm base carries the concept digest"
+assert all("WHAT WE ALREADY KNOW" not in f["user"] for f in warm_fake.fork_calls), \
+    "a fork's turn is the excerpt ALONE — the digest is NOT re-sent per chunk (the whole point)"
+assert all(f["session_id"] == "sess-1" for f in warm_fake.fork_calls), "every fork resumes the one base"
+assert wreport.outputs == 1, "warm mode still extracts the durable line (the fork sees base + its chunk)"
+
+# (b) the ONESHOT path is unchanged: its per-chunk turn still carries the digest (pre-R2 behavior). A
+#     capturing completer over the SAME chunks (fresh model → not skipped) proves the digest rides the turn.
+seen_oneshot = []
+class Capture(FakeCompleter):
+    def __call__(self, system, user):
+        seen_oneshot.append(user)
+        return super().__call__(system, user)
+cap = Capture([{"quote": REAL_QUOTE, "summary": "cap", "markers": {"insight": 0.7}, "confidence": 0.9}])
+block.run(glean.GleanBlock(cap, model="cap", targets=[cs_w]), progress=None)
+assert seen_oneshot and all("WHAT WE ALREADY KNOW" in u for u in seen_oneshot), \
+    "(b) oneshot: the digest rides EACH chunk's turn, exactly as before R2 (byte-identical prompt build)"
+
+# (c) warm done-keys key on glean/5-fork; the SAME chunks+model under oneshot key on glean/4 → distinct sets.
+assert glean.FORK_PROMPT_VERSION != glean.PROMPT_VERSION, "the fork path has its own prompt version"
+wdone = block.done_index("glean", config.data_root())
+assert all((k, glean.FORK_PROMPT_VERSION, "warm") in wdone for k in w_keys), "warm markers key on glean/5-fork"
+one_fake = FakeCompleter([{"quote": REAL_QUOTE, "summary": "one", "markers": {"insight": 0.7}, "confidence": 0.9}])
+one_rep = block.run(glean.GleanBlock(one_fake, model="warm", targets=[cs_w]), progress=None)
+assert one_fake.calls == w_signal and one_rep.skipped == 0, \
+    "(c) oneshot over the SAME chunks+model is NOT skipped — its glean/4 done-key is distinct from glean/5-fork"
+
+# (d) the fork's cache fields flow to the per-chunk marker AND the run tally. Select the WARM path's
+#     marker precisely (its glean/5-fork + "warm" key) — the same chunks also carry cap/oneshot markers.
+owner_w = next(m for m in glean_markers()
+               if m["target"] in w_keys and m.get("n_outputs") == 1
+               and m.get("prompt_version") == glean.FORK_PROMPT_VERSION and m.get("model") == "warm")
+assert owner_w["cache_read"] == 4096, "the fork's cache_read landed on its per-chunk marker"
+assert owner_w["cache_creation"] == 0 and "input_tokens" in owner_w, "the token/cache audit fields ride the marker"
+assert wblk.cache_read == 4096 * w_signal, "the run tallies cache_read across every fork"
+assert wblk.cache_creation == 0, "no cache-creation on the fork calls in this fake"
+
+# the refusal (ADR-0027): warm_base against a completer with no .warm/.fork raises, loudly, at construction.
+try:
+    glean.GleanBlock(FakeCompleter([]), model="x", targets=[], warm_base=True)
+    raise AssertionError("warm_base without a session-capable completer must raise")
+except ValueError:
+    pass
+
+print("OK — warm-base (ADR-0035): the digest warms ONE shared base per tick; each fork carries its chunk")
+print("     alone; oneshot unchanged (digest per turn); done-keys distinct (glean/5-fork); cache fields flow.")
+
+
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------
 
 if os.environ.get("RATCHET_LIVE_TEST") == "1":

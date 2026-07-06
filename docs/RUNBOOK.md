@@ -50,6 +50,15 @@ ratchet glean --all --source ratchet --limit 500   # focus one project
 ratchet glean --all --max-usd 5 --parallel 2       # stepping away? overlap 2-3 calls — the token bucket is SHARED with your interactive session, so this buys latency, not capacity
 ```
 
+**Cost — the fixed payload and `--warm-base` (ADR-0035).** Every glean call is a fresh `claude -p`; a large FIXED payload (the concept digest + tool schemas) rode each one — ~9× the visible content, measured. The slim tool-less flags now ship by default (nothing to run). `--warm-base` is the OPT-IN next step: it seats the digest in a shared base ONCE per tick and forks each chunk off it, so the digest is sent once, not per chunk.
+
+```
+ratchet glean --all --limit 200                    # baseline: read the summary's `cache r/w` figure
+ratchet glean --all --limit 200 --warm-base        # A/B: same slice, warm-base fork (a DISTINCT done-key, glean/5-fork)
+```
+
+**Pilot method — measure before flipping the default.** Run a slice each way and compare, from the run summary line and the per-chunk `processed` markers (each records `input_tokens` / `cache_read` / `cache_creation`): (1) **input vs cache tokens** — warm-base should shift the digest out of per-chunk `input_tokens` into `cache_read`; (2) **chunks-per-tick** — the real unit under a subscription is chunks cleared per rate-limit window (the token bucket is shared with your session), so watch throughput, not just dollars. The two paths key separately, so an A/B never confuses their markers.
+
 **4 · Resolve** — match or mint, per event; run it **often**. Statement-first entity resolution (ADR-0028): deterministic signals REJECT at $0 — the non-match mass costs nothing — and acceptance is ONE bounded comparative-with-none Haiku call over an event's residue candidates. No match → the event seeds a new claim on the spot (title = its summary, prose deferred). Every merge persists its match key, so review can audit exactly what the model saw.
 
 ```
