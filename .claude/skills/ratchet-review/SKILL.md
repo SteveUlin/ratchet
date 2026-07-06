@@ -25,18 +25,24 @@ A review sitting is a **conversation, not a report**. Careful verdicts are expen
 1. **Orient** — `nix run ~/ratchet#status`. Give sulin ONE line: the counts that matter (pending, incubating, contested, proposals, thin seeds).
 2. **Contested** — `nix run ~/ratchet#review -- --contested`. These are claims being knocked down near the bar — one wrong LLM CONTRADICTS verdict must not silently suppress a good claim. Surface the **count**, and if a contradiction is holding down something that looks durable, say so *now*: it is the one thing that must not wait at the back of a queue.
 3. **Hygiene** — `nix run ~/ratchet#resolve -- --audit-thin`. The pre-gate noise-seed backlog. Report the **count only**, unless items are new since the last sitting — then name them and offer the bulk retire.
-4. **The queue** — `nix run ~/ratchet#review -- --pending --json`. The default top-10 slice, importance-ordered. Pass the backlog depth on ("top 10 of 23") so sulin always knows what the slice was cut from — and can ask to widen or `--source`-narrow it (provenance substring: a project name for transcripts, a file path for documents).
+4. **The index** — `nix run ~/ratchet#review -- --pending --brief --json`. One light row per item (title, standing, badges — no evidence), importance-ordered, with the backlog depth ("top 10 of 23") so sulin always knows what the slice was cut from — and can ask to widen or `--source`-narrow it (provenance substring: a project name for transcripts, a file path for documents). **Never fetch the full queue JSON** — a 15-claim queue renders ~56k tokens of evidence you will only read one claim at a time; the index is the sitting's map, `--card` its magnifier.
 
 If the slice is empty, **don't just say "nothing to review."** The opener already surfaced contested; also run `nix run ~/ratchet#review -- --incubating` to show what's accruing and *why* it's below the bar (each with its score), and offer to lower `--maturity` for this sitting if something looks durable enough already. The bar is sulin's knob, not a fixed rule — a claim earns the queue by *recurring* across distinct, recent sessions; that is evidence of durability, not a quota.
 
-### Assess privately, present incrementally
+### Assess per card, present incrementally
 
-Do your reading **up front, before presenting anything**: the full queue JSON, every audit card, the merge suggestions riding the cards, `--context` on anything that smells (capturing notes to scratch files is fine). Run the per-claim faithfulness pass below on *everything* first, so each verdict question comes pre-checked and the sitting never stalls mid-claim.
+The sitting is a CURSOR over the index, not a batch read — context stays one card deep no matter how
+large the backlog grows. From the index alone, give sulin:
 
-What sulin sees is only:
+- **One orientation paragraph** — 5 lines max: how many claims and of what ("top 10 of 23 pending"), any clusters the index's titles show ("four are jj lessons"), which badges you'll flag when their turn comes (why-pending, contradictions). **NO per-claim tables, no summary map of the queue.**
 
-- **One orientation paragraph** — 5 lines max: how many claims and of what ("top 10 of 23 pending"), any clusters ("four are jj lessons"), anything unusual you'll flag when its turn comes (a contested claim, a suspect merge). **NO per-claim tables, no summary map of the queue.**
-- **Then the claims, ONE AT A TIME, in importance order.** Never present claim N+1's content before claim N has its verdict.
+Then loop, one claim per verdict, in index order:
+
+1. `nix run ~/ratchet#review -- --card <id> --json` — the full render for exactly this claim: verified evidence, the audit card, merge suggestions, standing.
+2. Run the private faithfulness pass below on it — escalate to `--context <id>` yourself if it smells — and only then present the card.
+3. One question, one verdict, execute, confirm, fetch the next card. Never present claim N+1's content before claim N has its verdict.
+
+(If a card is unusually heavy even alone, delegating its deep read to a subagent is fine — but the default loop needs no delegation, because a card is small by construction.)
 
 ### The private pass, per claim (this decides fast vs deep)
 

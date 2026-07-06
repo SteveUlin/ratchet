@@ -541,6 +541,7 @@ def merge_claims(loser_id: str, winner_id: str, root: Path | None = None, *, rea
 
 
 def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
+            brief: bool = False,
             limit: int | None = None, source_filter: str | None = None,
             maturity: float = temporal.MATURITY_WEIGHT,
             coalesce_hours: float = temporal.COALESCE_HOURS, with_total: bool = False):
@@ -564,6 +565,13 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     run on the RAW takeaways FIRST, so the expensive evidence resolution (`_present`) is paid only for the
     survivors the human will see. `with_total=True` returns `(cards, total)` — the backlog depth BEFORE the
     slice — so a bounded render can still state honestly what it was cut from.
+
+    `brief=True` returns the INDEX instead: same ordering, same filters, but one light row per item
+    (title, standing, badges — NO evidence resolution, audit cards, or merge suggestions). The sitting
+    protocol is one-card-one-verdict, so a reviewer-side orchestrator needs the queue's SHAPE up front
+    and the full render for only the claim under the lens — `card()` is that cursor. Without the split,
+    a sitting's context cost is O(queue) even though its attention is O(1) (the 15-claim queue rendered
+    ~56k tokens); with it, backlog size stops bounding the sitting.
 
     THE FEED IS A UNION (dream v3, §6/ADR-0028): v3 CLAIMS over the same bar queue beside the legacy v2
     takeaways — claims PREFERRED when an id exists in both feeds (the id space is shared:
@@ -604,6 +612,21 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
     if limit is not None and limit > 0:
         rows = rows[:limit]                        # the top-N for a one-sitting review (after the ordering);
                                                    # 0/None = everything, so the escape hatch can't return []
+    if brief:                                      # the INDEX: O(a line) per item — no evidence resolution,
+        out = []                                   # no audit cards, no suggestions. The sitting protocol is
+        for view, kind in rows:                    # one-card-one-verdict; the render should scale the same
+            row = {"takeaway_id": view["id"], "kind": kind,          # way (sulin, 2026-07-06) — `card()` is
+                   "title": view.get("title", ""),                   # the cursor that pays the full render
+                   "why_pending": view.get("why") is None,           # for ONE claim at a time.
+                   "claim_kind": view.get("kind") if kind == "claim" else None,
+                   "scope_repo": view.get("scope_repo") if kind == "claim" else None,
+                   "support": view.get("support") or {"events": 0, "sessions": 0},
+                   "evidence_count": len(view.get("evidence") or []),
+                   "contradictions": len(view.get("contradiction_evidence") or []),
+                   **bar_status(view, maturity, valid_times=valid_times, now=now,
+                                coalesce_hours=coalesce_hours)}
+            out.append(row)
+        return (out, total) if with_total else out
     mats = _claim_materials(root) if any(k == "claim" for _, k in rows) else None
     sugg = (_suggestions_by_claim(merge_suggestions(root, now=now, pool=pool,
                                                     valid_times=valid_times, rm=mats["rm"]))
@@ -622,6 +645,37 @@ def pending(root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
                                  coalesce_hours=coalesce_hours)}
         out.append(card)
     return (out, total) if with_total else out
+
+
+def card(takeaway_id: str, root: Path | None = None, *, context_bytes: int = CONTEXT_BYTES,
+         maturity: float = temporal.MATURITY_WEIGHT,
+         coalesce_hours: float = temporal.COALESCE_HOURS) -> dict | None:
+    """ONE fully-rendered review card — the cursor to `pending(brief=True)`'s index. Pays the full
+    render (verified evidence, the audit card, merge suggestions, bar standing) for exactly the claim
+    under the reviewer's lens, so a sitting holds one card's worth of context at a time no matter how
+    deep the backlog runs. Claims preferred over a same-id legacy takeaway (the queue's own precedence);
+    None for an unknown id. Renders regardless of bar standing — the card SHOWS the standing, and a
+    reviewer chasing an incubating or contested id gets the same full view the queue would give it."""
+    root = root or config.data_root()
+    valid_times = temporal.session_valid_times(root)
+    now = config.now()
+    view = _claim_view(takeaway_id, root)
+    if view is not None:
+        mats = _claim_materials(root)
+        sugg = _suggestions_by_claim(merge_suggestions(root, now=now, valid_times=valid_times,
+                                                       rm=mats["rm"]))
+        full = {**_present_claim(view, root, context_bytes=context_bytes, mats=mats,
+                                 valid_times=valid_times),
+                **bar_status(view, maturity, valid_times=valid_times, now=now,
+                             coalesce_hours=coalesce_hours)}
+        full["merge_suggestions"] = sugg.get(view["id"], [])
+        return full
+    tk = _load_takeaway(takeaway_id, root)
+    if tk is None:
+        return None
+    return {**_present(tk, root, context_bytes=context_bytes),
+            **bar_status(tk, maturity, valid_times=valid_times, now=now,
+                         coalesce_hours=coalesce_hours)}
 
 
 def incubating(root: Path | None = None, *, maturity: float = temporal.MATURITY_WEIGHT,
@@ -1150,6 +1204,10 @@ def main(argv=None) -> None:
     g.add_argument("--merge-claims", nargs=2, metavar=("LOSER", "WINNER"),
                    help="confirm a merge suggestion: re-point the loser's live edges onto the winner "
                         "(match keys preserved) and fold the loser out via a merge decision")
+    g.add_argument("--card", metavar="TAKEAWAY",
+                   help="ONE fully-rendered card (evidence, audit, suggestions, standing) — the cursor "
+                        "to --pending --brief's index: a sitting fetches the queue's shape once, then "
+                        "one card per verdict, so context stays O(1) in backlog depth")
     g.add_argument("--context", metavar="TAKEAWAY", help="one takeaway with a WIDE evidence window (deep path)")
     g.add_argument("--accept", metavar="TAKEAWAY", help="promote a takeaway to a concept")
     g.add_argument("--reject", metavar="TAKEAWAY", help="reject a takeaway")
@@ -1187,6 +1245,10 @@ def main(argv=None) -> None:
     ap.add_argument("--source", help="filter the queue to items whose cited SOURCE handle contains this "
                     "substring, case-insensitive — the originating project for transcripts (e.g. taro), "
                     "the file path for documents (e.g. CLAUDE.md)")
+    ap.add_argument("--brief", action="store_true",
+                    help="with --pending: the INDEX — one light row per item (title, standing, badges), "
+                         "no evidence resolution. Pair with --card <id> per verdict so a sitting's "
+                         "context stays one card deep regardless of backlog size")
     ap.add_argument("--maturity", type=float, default=temporal.MATURITY_WEIGHT, metavar="BAR",
                     help=f"the maturity BAR a takeaway's recency-weighted corroboration must cross to surface "
                          f"in --pending (default {temporal.MATURITY_WEIGHT} ≈ {temporal.MATURITY_SESSIONS} recent "
@@ -1229,16 +1291,28 @@ def main(argv=None) -> None:
 
     if args.pending:
         q, total = pending(context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
+                           brief=args.brief,
                            limit=sitting_limit, source_filter=args.source, maturity=args.maturity,
                            coalesce_hours=args.coalesce_hours, with_total=True)
         if args.json:
             print(json.dumps(q, ensure_ascii=False, indent=2))   # a LIST — the skill iterates it
+        elif args.brief:
+            _print_brief(q, total=total)
         else:
             _print_queue(q, total=total,
                          incubating_count=len(incubating(maturity=args.maturity,
                                                          coalesce_hours=args.coalesce_hours,
                                                          source_filter=args.source)),
                          bar=args.maturity)
+    elif args.card:
+        c = card(args.card, context_bytes=args.bytes if args.bytes is not None else CONTEXT_BYTES,
+                 maturity=args.maturity, coalesce_hours=args.coalesce_hours)
+        if c is None:
+            ap.error(f"no claim or takeaway {args.card!r}")
+        if args.json:
+            print(json.dumps(c, ensure_ascii=False, indent=2))
+        else:
+            _print_queue([c], total=1, bar=args.maturity)
     elif args.incubating:
         inc = incubating(maturity=args.maturity, coalesce_hours=args.coalesce_hours,
                          source_filter=args.source)
@@ -1483,6 +1557,24 @@ def _print_proposals(q: list[dict]) -> None:
             for ev in c["evidence"]:
                 print(f"      ✓ {ev['quote'][:100]!r}")
         print()
+
+
+def _print_brief(rows: list[dict], *, total: int | None = None) -> None:
+    """The index, one line per item: standing, badges, title — the human twin of `--brief --json`.
+    No evidence, by design; `--card <id>` is the full view."""
+    if not rows:
+        print("review queue empty — nothing over the maturity bar yet.")
+        return
+    head = f"top {len(rows)} of {total}" if total is not None and total > len(rows) else f"{len(rows)} item(s)"
+    print(f"pending index ({head}; importance desc) — `--card <id>` renders one in full:")
+    for r in rows:
+        badges = "".join([" [why-pending]" if r.get("why_pending") else "",
+                          f" [{r['contradictions']} contradiction(s)]" if r.get("contradictions") else "",
+                          f" [{r['claim_kind']}]" if r.get("claim_kind") == "reference" else "",
+                          f" [scope {r['scope_repo']}]" if r.get("scope_repo") else ""])
+        s = r.get("support") or {}
+        print(f"  {r['takeaway_id']}  {r['entrenchment']:.2f}≥{r['bar']:.2f}  "
+              f"{s.get('events', 0)}ev/{s.get('sessions', 0)}s{badges}  {r.get('title', '')}")
 
 
 def _print_incubating(inc: list[dict], *, total: int | None = None) -> None:

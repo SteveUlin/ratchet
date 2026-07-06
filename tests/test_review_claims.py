@@ -721,4 +721,43 @@ print("OK 10 — refresh re-snapshots the concept's prose from the claim's live 
 print("        command: never automatic, no-op refused, evidence/kind/scope/claim-decisions untouched,")
 print("        retired/unknown/orphaned targets refused.")
 
+# === 11. THE INDEX + THE CURSOR: --brief lists the queue's shape, card() renders one in full =======
+# A sitting is one-card-one-verdict, so its CONTEXT must be O(1) in backlog depth: `pending(brief=True)`
+# is the light index (no evidence resolution), `card(id)` the full render for the claim under the lens.
+
+RB = use_store("brief")
+seed_events([("b-s1", JJ_SEED, M_HI, 0.85, "alpha", None),
+             ("b-s2", JJ_PARA, M_MID, 0.85, "alpha", None)], RB)
+resolve.run(ResolveFake(["same-as-1"]), model="fake", forget=False, root=RB)
+claim_b11 = the_claim(RB)
+seed_takeaway(RB, id="legacy-b", title="a legacy takeaway", why="v2 prose",
+              evidence=[{k: e[k] for k in ("event_id", "cleaned_hash", "byte_start", "byte_end")}
+                        for e in claim_b11["evidence"]],
+              support={"events": 2, "sessions": 2})
+
+full_q = review.pending(RB)
+idx, idx_total = review.pending(RB, brief=True, with_total=True)
+assert [r["takeaway_id"] for r in idx] == [c["takeaway_id"] for c in full_q] and idx_total == len(full_q), \
+    "the index carries the SAME ids in the SAME importance order as the full queue"
+for r in idx:
+    assert "evidence" not in r and "audit" not in r and "merge_suggestions" not in r, \
+        f"the index resolves nothing heavy: {sorted(r)}"
+    assert {"takeaway_id", "kind", "title", "entrenchment", "bar", "rationale"} <= set(r), \
+        "an index row still shows the standing the verdict loop orders by"
+claim_row = [r for r in idx if r["kind"] == "claim"][0]
+assert claim_row["why_pending"] is True and claim_row["evidence_count"] == 2, \
+    "badges ride the index (why-pending, evidence depth) — enough to plan a sitting, not to judge one"
+
+one = review.card(claim_b11["id"], RB)
+full_card = [c for c in full_q if c["takeaway_id"] == claim_b11["id"]][0]
+assert one["takeaway_id"] == claim_b11["id"] and [e["quote"] for e in one["evidence"]] == \
+    [e["quote"] for e in full_card["evidence"]], "card() == the queue's own render for that claim"
+assert "audit" in one and "merge_suggestions" in one, "the cursor pays the FULL render: audit + suggestions"
+legacy_one = review.card("legacy-b", RB)
+assert legacy_one["why"] == "v2 prose" and all(e["verified"] for e in legacy_one["evidence"]), \
+    "card() serves the legacy arm through the same door"
+assert review.card("t-no-such-id", RB) is None, "an unknown id is None, not a crash"
+print("OK 11 — the index (--brief) lists the queue's shape without resolving evidence; card() renders")
+print("        exactly one claim in full — a sitting's context is one card deep at any backlog size.")
+
 print("\nall review-claims tests passed.")
