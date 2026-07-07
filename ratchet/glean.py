@@ -992,6 +992,7 @@ def pilot_report(root: Path | None = None) -> dict:
         return {"n": 0, "events": 0, "zero": 0, "cost": 0.0,
                 "input": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
     cells: dict[tuple[str, str], dict] = {}
+    ev_by_target: dict[str, dict[str, int]] = {"fork": {}, "oneshot": {}}   # cohort → target → events
     seen_keys: set[tuple[str, str, str]] = set()  # (cohort, target, model) — latest marker per done-key wins
     for b in blobstore.decisions_for(None, root, verb="processed", stage="glean"):
         pv = b.get("prompt_version") or dict(b.get("params") or []).get("prompt_version")
@@ -1013,6 +1014,7 @@ def pilot_report(root: Path | None = None) -> dict:
         cell["cost"] += float(b.get("cost_usd", 0.0) or 0.0)
         for f in ("input", "cache_read", "cache_creation", "output"):
             cell[f] += int(b.get(f + ("_tokens" if f in ("input", "output") else ""), 0) or 0)
+        ev_by_target[cohort][str(target)] = n_ev
 
     def cohort_totals(cohort: str) -> dict:
         t = _acc()
@@ -1042,6 +1044,23 @@ def pilot_report(root: Path | None = None) -> dict:
             den += f["n"]
     adj_yield = (num / den) if den else None
 
+    # The PAIRED comparison — chunks gleaned BOTH ways (a fork re-gleans an oneshot-done chunk under its
+    # own done-key). This is the rigorous yield signal: identical inputs, so the events-per-chunk delta
+    # carries NO chunk variance — far tighter than the cross-sectional ratio at small n, and it is what
+    # the fork ticks actually generate (greedy priority re-serves the top oneshot chunks, fork-pending).
+    # Idempotent by span, so the re-glean adds no events — it is deliberate measurement, not drain.
+    paired_t = set(ev_by_target["fork"]) & set(ev_by_target["oneshot"])
+    if paired_t:
+        fsum = sum(ev_by_target["fork"][t] for t in paired_t)
+        osum = sum(ev_by_target["oneshot"][t] for t in paired_t)
+        down = sum(1 for t in paired_t if ev_by_target["fork"][t] < ev_by_target["oneshot"][t])
+        up = sum(1 for t in paired_t if ev_by_target["fork"][t] > ev_by_target["oneshot"][t])
+        paired = {"n": len(paired_t), "fork_ev": fsum / len(paired_t), "oneshot_ev": osum / len(paired_t),
+                  "ratio": (fsum / osum) if osum else None, "fork_lower": down, "fork_higher": up,
+                  "tie": len(paired_t) - down - up}
+    else:
+        paired = None
+
     def per_chunk(t: dict) -> dict:
         n = t["n"] or 1
         return {"n": t["n"], "cost": t["cost"] / n, "events": t["events"] / n,
@@ -1050,14 +1069,18 @@ def pilot_report(root: Path | None = None) -> dict:
     fork_pc, one_pc = per_chunk(fork_t), per_chunk(one_t)
     cost_ratio = (fork_pc["cost"] / one_pc["cost"]) if one_pc["cost"] else None
 
+    # The yield the verdict trusts: the PAIRED ratio when pairs exist (variance-free), else the
+    # stratified cross-sectional one. Both are reported; the rule keys on the better available.
+    yield_used = paired["ratio"] if (paired and paired["ratio"] is not None) else adj_yield
+
     # The verdict — each clause of the rule, so a FAIL says which bar it missed (ADR-0027 legibility).
     checks = {
         "enough_fork": fork_t["n"] >= PILOT_MIN_FORK,
-        "yield_holds": adj_yield is not None and adj_yield >= PILOT_YIELD_FLOOR,
+        "yield_holds": yield_used is not None and yield_used >= PILOT_YIELD_FLOOR,
         "cost_wins": cost_ratio is not None and cost_ratio <= PILOT_COST_CEIL,
     }
-    return {"fork": fork_pc, "oneshot": one_pc, "per_band": per_band,
-            "adjusted_yield_ratio": adj_yield, "cost_ratio": cost_ratio,
+    return {"fork": fork_pc, "oneshot": one_pc, "per_band": per_band, "paired": paired,
+            "adjusted_yield_ratio": adj_yield, "yield_used": yield_used, "cost_ratio": cost_ratio,
             "checks": checks, "flip_to_default": all(checks.values())}
 
 
@@ -1078,6 +1101,13 @@ def _render_pilot(rep: dict) -> str:
         def fmt(t):
             return f"{t[0]:>3} · {t[1]:.2f} · {t[2]:.4f}" if t else f"{'—':>16}"
         lines.append(f"    {row['band']:>5}   fork {fmt(row['fork'])}   one {fmt(row['oneshot'])}")
+    p = rep["paired"]
+    if p:
+        lines += ["",
+                  f"  PAIRED yield (same {p['n']} chunks both ways — variance-free, the trusted signal):",
+                  f"    fork {p['fork_ev']:.2f} vs oneshot {p['oneshot_ev']:.2f} ev/ch  "
+                  f"= {p['ratio']:.2f}  ({p['fork_lower']} pairs fork-lower · {p['tie']} tie · "
+                  f"{p['fork_higher']} fork-higher)"]
     ay = rep["adjusted_yield_ratio"]
     cr = rep["cost_ratio"]
     lines += ["",

@@ -796,6 +796,10 @@ assert rep["fork"]["n"] == w_signal, f"the fork cohort = the warm markers ({w_si
 assert rep["oneshot"]["n"] >= w_signal, "the oneshot cohort collects the glean/4 re-runs over the same chunks"
 assert rep["fork"]["cache_read"] == 4096, "fork cohort carries the per-chunk cache_read the markers recorded"
 assert rep["oneshot"]["cache_read"] == 0, "the oneshot fake reported no cache reads (fresh input every call)"
+# the PAIRED view: the same chunks were gleaned both ways (fork re-glean over oneshot-done), so the paired
+# set = the fork chunks, and the variance-free ratio drives the verdict when present.
+assert rep["paired"] is not None and rep["paired"]["n"] == w_signal, "every fork chunk is paired with its oneshot glean"
+assert rep["yield_used"] == rep["paired"]["ratio"], "the verdict trusts the paired ratio over the cross-sectional one"
 # the decision rule is legible clause-by-clause; with 1 fork chunk it fails the count gate, verdict = keep.
 assert rep["checks"]["enough_fork"] is False and rep["flip_to_default"] is False, \
     "under the fork-count floor the rule refuses to flip the default (ADR-0027 legibility)"
