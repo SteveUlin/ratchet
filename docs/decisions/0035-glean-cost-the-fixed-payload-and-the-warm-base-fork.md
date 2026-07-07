@@ -1,5 +1,10 @@
 # 0035 — glean cost: the fixed payload, the tool-less call, and the warm-base fork
 
+- **Superseded in part by ADR-0036**: the warm-base fork (R2) and the `--pilot-report` A/B are REMOVED
+  — their sole purpose was amortizing the concept digest across a tick, and ADR-0036 makes glean BLIND
+  (no digest), so the fork has nothing to cache and a digest-seating base would re-introduce the global
+  view. R0 (the `Completion` cache instrumentation) and R1 (the slim tool-less flags) SURVIVE — both are
+  independent cost wins untouched by the digest's removal.
 - Status: accepted — offline suites green (`test_completer`, `test_glean` extended); the default-on
   slim flags ship, the warm-base fork ships OPT-IN pending a live A/B pilot
 - Date: 2026-07-06

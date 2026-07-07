@@ -54,7 +54,7 @@ class Scripted:
     def __init__(self, seq):
         self.seq, self.calls, self.argvs = list(seq), 0, []
     def run(self, *a, **k):
-        self.argvs.append(list(a[0]))        # capture the FULL argv (flag audit for R1/R2)
+        self.argvs.append(list(a[0]))        # capture the FULL argv (flag audit for R1)
         item = self.seq[self.calls]
         self.calls += 1
         if isinstance(item, BaseException):
@@ -175,45 +175,18 @@ finally:
 print("OK — R0: cache_read/cache_creation parse from the envelope usage (0 when the binding omits them).")
 
 
-# --- 7. the warm/fork session chain: byte-identical shared flags, distinct session flags (R2) -----
-
-def _shared_flags(argv):
-    """The argv MINUS the session-establishment tokens — what must be byte-identical between warm+fork."""
-    out, it = [], iter(argv)
-    for tok in it:
-        if tok in ("--session-id", "--resume"):
-            next(it)                              # drop the session id that follows
-        elif tok == "--fork-session":
-            pass
-        else:
-            out.append(tok)
-    return out
-
+# --- 7. the completer is a single oneshot callable — no session chain (ADR-0036 removed warm-base) ---
+# glean extracts BLIND (ADR-0036), so there is no digest to amortize and no warm-base fork; the CLI
+# completer is exactly the one text→JSON call, with none of the `.warm`/`.fork` session plumbing.
 wc = completer.make_cli_completer("haiku", cwd=Path("/tmp"))
-assert hasattr(wc, "warm") and hasattr(wc, "fork"), "the CLI completer exposes the .warm/.fork seam"
-waits, sub, restore = install([FakeProc(ok_env("ready")), FakeProc(ok_env("events"))])
+assert not hasattr(wc, "warm") and not hasattr(wc, "fork"), "no session-chain seam — the completer is oneshot only"
+waits, sub, restore = install([FakeProc(ok_env("events"))])
 try:
-    sid = wc.warm("SYS", "BASE-with-digest")
-    assert isinstance(sid, str) and len(sid) >= 32, "warm returns a uuid4 session id"
-    warm_argv = sub.argvs[0]
-    assert "--session-id" in warm_argv and sid in warm_argv, "warm pins the fresh session id"
-    assert "--resume" not in warm_argv, "warm is the FIRST call (establishes, does not resume)"
-    comp = wc.fork("SYS", "CHUNK", sid)
-    fork_argv = sub.argvs[1]
-    assert "--resume" in fork_argv and sid in fork_argv and "--fork-session" in fork_argv, "fork resumes + forks"
-    assert _shared_flags(warm_argv) == _shared_flags(fork_argv), \
-        "warm and fork carry BYTE-IDENTICAL shared flags (only the session flags differ — not persisted on resume)"
-    assert comp.text == "events", "the fork returns a real Completion (the extraction)"
+    comp = wc("SYS", "CHUNK")
+    assert comp.text == "events" and sub.calls == 1, "one oneshot call, no resume/fork"
+    assert "--resume" not in sub.argvs[0] and "--session-id" not in sub.argvs[0], "no session flags on a oneshot call"
 finally:
     restore()
-
-waits, sub, restore = install([FakeProc(ok_env()), FakeProc(ok_env())])   # two warms → two distinct ids
-try:
-    wc2 = completer.make_cli_completer("haiku", cwd=Path("/tmp"))
-    assert wc2.warm("S", "A") != wc2.warm("S", "B"), "a fresh uuid per warm — a --session-id is never reused"
-finally:
-    restore()
-print("OK — R2: warm mints a fresh session (--session-id); fork resumes it (--resume --fork-session) with")
-print("     byte-identical shared flags; ids never reused.")
+print("OK — the completer is a single oneshot callable (no warm/fork session chain, ADR-0036).")
 
 print("\nall completer tests passed.")

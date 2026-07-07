@@ -553,11 +553,11 @@ def forget(root: Path | None = None, *, tau: int = events.FORGET_TAU,
     """Stale the stragglers: for each un-consolidated event, `cycles_resident` = the count of DISTINCT
     dream run_ids in the stored dream-stage decisions whose `at` postdates the event blob (no mutable
     per-event state). Write a `stale` decision ONLY when (cycles_resident >= tau) AND (`intrinsic_salience`
-    < floor) — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Gates on the
-    relevance-FREE intrinsic salience, NOT `salience`: relevance (4b/ADR-0019) orders the queue but must
-    never DRIVE an eviction — a `known` ×0.4 verdict can re-order an event yet never evict it (recall-first;
-    4b adds no new drop path). Reversible. Cheap, no LLM — runs in `DreamBlock.finalize`. Returns the
-    staled event ids."""
+    < floor) — the CONJUNCTION protects a sparse-but-recurring lesson; never age alone. Gates on
+    `intrinsic_salience`, the event's OWN durable-value score — identical to `salience` since ADR-0036
+    removed the relevance multiplier, but kept named this way so eviction stays pinned to the event's own
+    value, independent of any future queue-ordering term. Reversible. Cheap, no LLM — runs in
+    `DreamBlock.finalize`. Returns the staled event ids."""
     root = root or config.data_root()
     ws = events.working_set(root)
     latest = blobstore.latest_by_kind("event", root)

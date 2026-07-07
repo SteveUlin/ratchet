@@ -211,9 +211,10 @@ assert ev["id"] == glean.event_id(cleaned_hash, sp["byte_start"], sp["byte_end"]
 assert ev["cleaned_hash"] == cleaned_hash and "quote" not in ev, "event points into the cleaned blob; never copies its text"
 assert set(ev["markers"]) == set(glean.MARKER_KINDS) and ev["markers"]["insight"] == 0.8, "markers scored per kind"
 assert "status" not in ev, "state is a decision now (ADR-0007) — no in-record status field"
-# the RELEVANCE marker (4b/ADR-0019): the fake gave no verdict → coerced to `novel` (recall-safe) and stored
-assert ev["relevance"] == "novel", "an event with no model relevance defaults to novel (recall-safe, 4b)"
-assert glean.event_content(ev)["relevance"] == "novel", "relevance is part of the stored content projection"
+# BLIND extraction (ADR-0036): glean no longer judges novelty vs the store, so no `relevance` field is
+# produced or projected. Novelty-vs-the-store lives solely in resolve now (ADR-0028).
+assert "relevance" not in ev, "glean is blind — no relevance field on a new event (ADR-0036)"
+assert "relevance" not in glean.event_content(ev), "no relevance in the stored content projection either"
 
 # the dream-v3 §2.1 stamps (S1): every NEW event carries subject_key + stmt_sig, both deterministic
 # (no extra LLM call) — resolve reads identity features off the blob instead of recomputing.
@@ -238,12 +239,11 @@ assert dirty["markers"] == {"surprise": 0.0, "insight": 1.0, "research": 0.0}, "
 assert dirty["confidence"] == 1.0, "confidence clamped to [0,1]"
 assert dirty["producer"]["stage"] == "glean" and dirty["producer"]["prompt_version"] == glean.PROMPT_VERSION
 
-# the RELEVANCE marker coercion (4b/ADR-0019): a known verdict is kept; an unknown/missing one coerces to `novel`
-assert glean.clean_relevance("contradicts") == "contradicts" and glean.clean_relevance("known") == "known"
-assert glean.clean_relevance("wat") == "novel" and glean.clean_relevance(None) == "novel", "unknown/missing → novel"
-assert dirty["relevance"] == "novel", "a candidate with no relevance field defaults to novel (recall-safe)"
-assert glean.build_event({"relevance": "contradicts"}, owner, span,
-                         model="fake", run_id="r")["relevance"] == "contradicts", "a valid verdict is kept verbatim"
+# BLIND extraction (ADR-0036): even a candidate carrying a stale `relevance` gets none stored — glean
+# drops the field entirely, so an old-shape model reply never smuggles a novelty verdict into the event.
+assert "relevance" not in dirty, "build_event produces no relevance field (glean is blind, ADR-0036)"
+assert "relevance" not in glean.build_event({"relevance": "contradicts"}, owner, span, model="fake", run_id="r"), \
+    "a candidate's relevance is ignored — glean never stores it"
 
 print("OK — trust anchor (lines): the model points at numbered lines, the system copies their bytes; "
       "spans resolve to real evidence, un-resolvable selections rejected")
@@ -525,26 +525,19 @@ assert pb.priority(work) == pb.priority(_ci(["assistant", "tool"], 8)), "priorit
 print("OK — priority: capped tick drains best-first by free pointer cues (user-presence > diversity > turns, not bytes).")
 
 
-# --- 8c. the relevance marker flows completer → store, coerced (4b/ADR-0019) ----------------
-# glean asks the model to judge each event's novelty vs the concept digest ("what we already know",
-# injected into the prompt — empty here, so the fake just echoes a verdict) and STORES it on the event.
-# The trust anchor is unchanged (only the REAL_QUOTE candidate verifies): we assert a VALID verdict is
-# stored verbatim and an UNKNOWN one coerces to `novel` end-to-end (the recall-safe default).
-def _store_relevance(tag, verdict):
-    raw_x, _ = blobstore.ingest(blob.replace("kick off", f"kick off {tag}"), source_kind="transcript",
-                                source_id=f"glean-{tag}", origin_ref={"session_id": f"glean-{tag}"})
-    cs_x, _, xchunks = chunk.materialize(raw_x, budget=600)
-    fx = FakeCompleter([{"quote": REAL_QUOTE, "summary": "x", "relevance": verdict,
-                         "markers": {"surprise": 0.5}, "confidence": 0.9}])
-    block.run(glean.GleanBlock(fx, model=tag, targets=[cs_x]), progress=None)
-    evs = [e for e in glean.load_events() if e["cleaned_hash"] == xchunks[0].cleaned_hash]
-    assert len(evs) == 1, f"the durable line is exactly one event in {tag}'s source"
-    return evs[0]["relevance"]
-
-assert _store_relevance("contra", "contradicts") == "contradicts", "a valid verdict is stored verbatim"
-assert _store_relevance("junkrel", "not-a-verdict") == "novel", "an unknown verdict coerces to novel in the store"
-print("OK — relevance (4b): a valid verdict stores verbatim; an unknown one coerces to novel (recall-safe),")
-print("     end-to-end through completer → verify → build_event → ingest → load_events.")
+# --- 8c. BLIND extraction (ADR-0036): a model `relevance` verdict is never stored on the event --------
+# glean no longer judges novelty vs the store, so a candidate carrying any `relevance` field extracts to
+# an event WITHOUT it — novelty lives solely in resolve (ADR-0028). End-to-end: completer → build → store.
+raw_x, _ = blobstore.ingest(blob.replace("kick off", "kick off blind"), source_kind="transcript",
+                            source_id="glean-blind", origin_ref={"session_id": "glean-blind"})
+cs_x, _, xchunks = chunk.materialize(raw_x, budget=600)
+fx = FakeCompleter([{"quote": REAL_QUOTE, "summary": "x", "relevance": "contradicts",
+                     "markers": {"surprise": 0.5}, "confidence": 0.9}])
+block.run(glean.GleanBlock(fx, model="blind", targets=[cs_x]), progress=None)
+blind_evs = [e for e in glean.load_events() if e["cleaned_hash"] == xchunks[0].cleaned_hash]
+assert len(blind_evs) == 1 and "relevance" not in blind_evs[0], \
+    "glean is blind — a model relevance verdict never reaches the stored event (ADR-0036)"
+print("OK — blind extraction (ADR-0036): a model `relevance` verdict is dropped, never stored end-to-end.")
 
 
 # --- 8d. age(): aging reads the RAW transcript's fetched_at through the cleaned lineage (ADR-0021) ---
@@ -690,107 +683,10 @@ print("     → undated/broken lineage +0.0 exactly; default clock dates undated
 print("     (PDF/webpage policy), 'arrival' uses the tap date only; unknown clock refused.")
 
 
-# --- 8f. warm-base FORK mode (ADR-0035, --warm-base): the digest rides a shared base, forks the chunk --
-# Opt-in cost mode: the concept digest is seated in a warm base ONCE per tick and each chunk FORKS it,
-# instead of re-sending the digest in every chunk's oneshot prompt. The load-bearing properties:
-#   (a) the warm base carries the digest; each fork carries ONLY its chunk (no per-chunk digest re-send);
-#   (b) the oneshot path is UNCHANGED — its per-chunk turn still carries the digest, as before R2;
-#   (c) warm done-keys are DISTINCT from oneshot's (glean/5-fork vs glean/4), so the two never confuse;
-#   (d) the completer's cache fields flow to the per-chunk marker + the run tally.
-
-class WarmFake(FakeCompleter):
-    """FakeCompleter + the session-chain seam (ADR-0035). `warm` records the base user turn and mints a
-    session; `fork` records the per-chunk turn and reuses __call__'s quote→lines logic, stamping cache
-    tokens on the returned Completion so §(d) can prove they flow through to the marker."""
-    def __init__(self, candidates):
-        super().__init__(candidates)
-        self.warm_calls, self.fork_calls = [], []
-    def warm(self, system, base_user):
-        self.warm_calls.append({"system": system, "base_user": base_user})
-        return f"sess-{len(self.warm_calls)}"                 # a fresh id per warm
-    def fork(self, system, user, session_id):
-        self.fork_calls.append({"system": system, "user": user, "session_id": session_id})
-        base = self(system, user)                             # __call__: the quote→lines candidate logic
-        return Completion(text=base.text, model=base.model, cost_usd=base.cost_usd,
-                          cache_read_tokens=4096, cache_creation_tokens=0)   # a warm read landed
-
-raw_w, _ = blobstore.ingest(blob.replace("kick off", "kick off warm"), source_kind="transcript",
-                            source_id="glean-warm", origin_ref={"session_id": "glean-warm"})
-cs_w, _, wchunks = chunk.materialize(raw_w, budget=600)
-w_signal = sum(glean.has_signal_potential(chunk.resolve(c)) for c in wchunks)
-w_keys = {glean.chunk_key(c) for c in wchunks}
-
-warm_fake = WarmFake([{"quote": REAL_QUOTE, "summary": "warm", "markers": {"insight": 0.7}, "confidence": 0.9}])
-wblk = glean.GleanBlock(warm_fake, model="warm", targets=[cs_w], warm_base=True)
-wreport = block.run(wblk, progress=None)
-
-# (a) exactly ONE warm base for the tick; every signal chunk forked it; the base carries the digest,
-#     the forks do NOT re-send it.
-assert len(warm_fake.warm_calls) == 1, "the digest is warmed ONCE per tick (one shared base for the run)"
-assert len(warm_fake.fork_calls) == w_signal, "each signal chunk forks the shared base (one fork per call)"
-assert "WHAT WE ALREADY KNOW" in warm_fake.warm_calls[0]["base_user"], "the warm base carries the concept digest"
-assert all("WHAT WE ALREADY KNOW" not in f["user"] for f in warm_fake.fork_calls), \
-    "a fork's turn is the excerpt ALONE — the digest is NOT re-sent per chunk (the whole point)"
-assert all(f["session_id"] == "sess-1" for f in warm_fake.fork_calls), "every fork resumes the one base"
-assert wreport.outputs == 1, "warm mode still extracts the durable line (the fork sees base + its chunk)"
-
-# (b) the ONESHOT path is unchanged: its per-chunk turn still carries the digest (pre-R2 behavior). A
-#     capturing completer over the SAME chunks (fresh model → not skipped) proves the digest rides the turn.
-seen_oneshot = []
-class Capture(FakeCompleter):
-    def __call__(self, system, user):
-        seen_oneshot.append(user)
-        return super().__call__(system, user)
-cap = Capture([{"quote": REAL_QUOTE, "summary": "cap", "markers": {"insight": 0.7}, "confidence": 0.9}])
-block.run(glean.GleanBlock(cap, model="cap", targets=[cs_w]), progress=None)
-assert seen_oneshot and all("WHAT WE ALREADY KNOW" in u for u in seen_oneshot), \
-    "(b) oneshot: the digest rides EACH chunk's turn, exactly as before R2 (byte-identical prompt build)"
-
-# (c) warm done-keys key on glean/5-fork; the SAME chunks+model under oneshot key on glean/4 → distinct sets.
-assert glean.FORK_PROMPT_VERSION != glean.PROMPT_VERSION, "the fork path has its own prompt version"
-wdone = block.done_index("glean", config.data_root())
-assert all((k, glean.FORK_PROMPT_VERSION, "warm") in wdone for k in w_keys), "warm markers key on glean/5-fork"
-one_fake = FakeCompleter([{"quote": REAL_QUOTE, "summary": "one", "markers": {"insight": 0.7}, "confidence": 0.9}])
-one_rep = block.run(glean.GleanBlock(one_fake, model="warm", targets=[cs_w]), progress=None)
-assert one_fake.calls == w_signal and one_rep.skipped == 0, \
-    "(c) oneshot over the SAME chunks+model is NOT skipped — its glean/4 done-key is distinct from glean/5-fork"
-
-# (d) the fork's cache fields flow to the per-chunk marker AND the run tally. Select the WARM path's
-#     marker precisely (its glean/5-fork + "warm" key) — the same chunks also carry cap/oneshot markers.
-owner_w = next(m for m in glean_markers()
-               if m["target"] in w_keys and m.get("n_outputs") == 1
-               and m.get("prompt_version") == glean.FORK_PROMPT_VERSION and m.get("model") == "warm")
-assert owner_w["cache_read"] == 4096, "the fork's cache_read landed on its per-chunk marker"
-assert owner_w["cache_creation"] == 0 and "input_tokens" in owner_w, "the token/cache audit fields ride the marker"
-assert wblk.cache_read == 4096 * w_signal, "the run tallies cache_read across every fork"
-assert wblk.cache_creation == 0, "no cache-creation on the fork calls in this fake"
-
-# the DEFAULT (ADR-0035, flipped on 2026-07-06): warm_base=None auto-detects the completer's capability —
-# ON for a session-capable seam (the real CLI), OFF for a plain oneshot seam, so nothing breaks either way.
-assert glean.GleanBlock(WarmFake([]), model="x", targets=[]).warm_base is True, \
-    "a session-capable completer defaults to warm-base ON (the flipped default)"
-assert glean.GleanBlock(FakeCompleter([]), model="x", targets=[]).warm_base is False, \
-    "a plain oneshot completer auto-falls-back to oneshot (no break, no raise)"
-assert glean.GleanBlock(WarmFake([]), model="x", targets=[], warm_base=False).warm_base is False, \
-    "--no-warm-base (explicit False) forces oneshot even on a session-capable seam"
-
-# the refusal (ADR-0027): an EXPLICIT warm_base=True against a completer with no .warm/.fork still raises,
-# loudly, at construction — a deliberate request that cannot be honored is an error, not a silent fallback.
-try:
-    glean.GleanBlock(FakeCompleter([]), model="x", targets=[], warm_base=True)
-    raise AssertionError("explicit warm_base=True without a session-capable completer must raise")
-except ValueError:
-    pass
-
-print("OK — warm-base (ADR-0035): the digest warms ONE shared base per tick; each fork carries its chunk")
-
-
-# --- 8g. the pilot report (ADR-0035): the warm-base A/B folded from stored markers, $0 -----------
-# The store now holds BOTH cohorts over cs_w (glean/5-fork markers from wblk, glean/4 from the oneshot
-# re-runs), so pilot_report separates them, joins each to its chunk's structural score, and verdicts.
-
-# structural_score is pointer-only + date-blind: a user turn dominates, compact is excluded from
-# diversity, no clock is read (the covariate the report stratifies on must be stable + mode-independent).
+# --- 8f. structural_score: the pointer-only, date-blind part of priority() (compact excluded) -------
+# structural_score is what priority() adds the recency bonus on top of — pointer-only (no content read),
+# date-blind (no clock), so a user turn dominates and `compact` is EXCLUDED from diversity (measured: a
+# compaction summary retells already-compressed material and under-yields its score-mates).
 from ratchet.chunk import Chunk  # noqa: E402
 rich = Chunk(cleaned_hash="x", byte_start=0, byte_end=1, turn_start=0, turn_end=4, segment=0,
              kinds=["user", "assistant"])
@@ -800,22 +696,7 @@ compact = Chunk(cleaned_hash="x", byte_start=0, byte_end=1, turn_start=0, turn_e
                 kinds=["assistant", "compact"])
 assert glean.structural_score(rich) > glean.structural_score(poor), "a user turn + diversity outscores a monologue"
 assert glean.structural_score(compact) == glean.structural_score(poor), "compact adds NO diversity (measured exclusion)"
-
-rep = glean.pilot_report(config.data_root())
-assert rep["fork"]["n"] == w_signal, f"the fork cohort = the warm markers ({w_signal}), by glean/5-fork version"
-assert rep["oneshot"]["n"] >= w_signal, "the oneshot cohort collects the glean/4 re-runs over the same chunks"
-assert rep["fork"]["cache_read"] == 4096, "fork cohort carries the per-chunk cache_read the markers recorded"
-assert rep["oneshot"]["cache_read"] == 0, "the oneshot fake reported no cache reads (fresh input every call)"
-# the PAIRED view: the same chunks were gleaned both ways (fork re-glean over oneshot-done), so the paired
-# set = the fork chunks, and the variance-free ratio drives the verdict when present.
-assert rep["paired"] is not None and rep["paired"]["n"] == w_signal, "every fork chunk is paired with its oneshot glean"
-assert rep["yield_used"] == rep["paired"]["ratio"], "the verdict trusts the paired ratio over the cross-sectional one"
-# the decision rule is legible clause-by-clause; with 1 fork chunk it fails the count gate, verdict = keep.
-assert rep["checks"]["enough_fork"] is False and rep["flip_to_default"] is False, \
-    "under the fork-count floor the rule refuses to flip the default (ADR-0027 legibility)"
-assert isinstance(glean._render_pilot(rep), str) and "VERDICT" in glean._render_pilot(rep), "the render is wrap-safe text"
-print("OK — pilot report (ADR-0035): fork/oneshot folded from markers, stratified by structural score, verdict legible")
-print("     alone; oneshot unchanged (digest per turn); done-keys distinct (glean/5-fork); cache fields flow.")
+print("OK — structural_score: user-presence + diversity, date-blind and pointer-only; compact excluded.")
 
 
 # --- 9. live smoke (opt-in): the real claude CLI over one real chunkset ----------------------

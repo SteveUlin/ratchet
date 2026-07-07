@@ -3,7 +3,11 @@
 - Status: accepted — implemented 2026-06-28 (all 17 offline suites green, incl. the 3a/3b/3c + 4a goldens)
 - Date: 2026-06-28
 - Supersedes: —
-- Superseded by: —
+- **Superseded in part by ADR-0036**: the glean-side digest + per-event `relevance` verdict are REMOVED
+  — injecting "what we already know" into extraction and sinking `known` events in salience starved the
+  cross-session corroboration claim-maturity depends on. Novelty-vs-the-store now lives solely in resolve
+  (ADR-0028). The provenance-relevant digest itself (`concept_digest`/`digest_context`) survives for
+  dream/synthesize/generate; only glean's consumption of it is retired.
 
 Code (`ratchet/glean.py` — `RELEVANCE_KINDS`/`clean_relevance`, the prompt + `build_event`/`event_content`,
 `GleanBlock._relevant_digest`; `ratchet/concepts.py` — `chunk_facets`, `digest_context`, `concept_digest`'s

@@ -48,20 +48,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import blobstore, block, chunk, completer, concepts, config, sig, subject, weave
+from . import blobstore, block, chunk, completer, config, sig, subject, weave
 from .completer import Completer  # the LLM seam (Completion + the default binding) lives in `completer`
 
-PROMPT_VERSION = "glean/4"     # bump to re-extract over the same frozen chunks (idempotency key);
-                               # glean/4: the model POINTS at numbered lines, it no longer retypes a quote
-                               # (ADR-0026) — evidence is copy-pasted from the blob, never transcribed
-FORK_PROMPT_VERSION = "glean/5-fork"   # the WARM-BASE fork path's version (ADR-0035, opt-in --warm-base).
-                               # The fork prompt's STRUCTURE differs from oneshot glean/4: the concept digest
-                               # moves OUT of every chunk's user turn and INTO a shared warm base each chunk
-                               # FORKS, so a fork carries the excerpt alone. A different structure must key
-                               # differently — this rides the done-key (params), so warm and oneshot markers
-                               # never confuse each other and glean/4's 364 done + 1,333 pending markers are
-                               # untouched (no gratuitous re-open). Opt-in until the pilot A/Bs the two paths.
-DOC_PROMPT_VERSION = "glean-doc/1"   # DOCUMENT mode's own version knob (ADR-0031). It rides in the
+PROMPT_VERSION = "glean/5"     # bump to re-extract over the same frozen chunks (idempotency key).
+                               # glean/5 (ADR-0036): BLIND extraction — the concept digest ("what we already
+                               # know") and the per-event `relevance` judgment are GONE from the prompt. glean
+                               # is now a pure function of the chunk; novelty-vs-the-store lives solely in
+                               # resolve (ADR-0028), which USES a re-occurrence to corroborate rather than
+                               # sinking it. The bump RE-OPENS chunks for OPTIONAL blind re-glean — forward-only,
+                               # budgeted, the glean/2→3→4 precedent; the digest-contaminated glean/4 events
+                               # stay valid until a re-glean, and re-gleaning blind may RECOVER events the
+                               # digest once suppressed as `known`. (glean/4: pointed at lines, ADR-0026 —
+                               # still true; that trust anchor is unchanged.)
+DOC_PROMPT_VERSION = "glean-doc/2"   # DOCUMENT mode's own version knob (ADR-0031); glean-doc/2 is the BLIND
+                               # doc prompt (ADR-0036 dropped the digest/relevance clause here too). It rides in the
                                # done-KEY (GleanBlock.key), not params — params is a run-level constant
                                # and one --all run mixes modes. Bumping it re-extracts documents only.
                                # Known asymmetry, accepted: bumping PROMPT_VERSION (in params) re-keys
@@ -111,23 +112,12 @@ RECENT_HALF_LIFE_DAYS = 60.0    # UNTUNED — a two-month-old session carries ha
 # preference (all markers low) still comes through.
 MARKER_KINDS = ("surprise", "insight", "research")
 
-# RELEVANCE is the per-event Bayesian-surprise-vs-the-store verdict (4b/ADR-0019, the long-deferred
-# roadmap-#1 marker of ADR-0005): each event is judged against the concept digest ("what we already
-# know") injected into the prompt — `novel` (nothing covers it) / `known` (a concept already states it)
-# / `contradicts` (it overturns a concept). It FEEDS dream's salience ORDERING (novel/contradicts drain
-# first, known sinks) — it does NOT gate. RECALL-FIRST coercion: an unknown/missing verdict → `novel`,
-# the safe default — never silently call a learning `known` and sink it (the invisible false-negative is
-# the costly error). It is the CHEAP, EARLY complement to dream's precise LATE belief-change judgment.
-RELEVANCE_KINDS = ("novel", "known", "contradicts")
-RELEVANCE_DEFAULT = "novel"    # the recall-safe default: doubt resolves toward "process it", never "drop it"
-
-
-def clean_relevance(v) -> str:
-    """Coerce the model's untrusted relevance verdict to a known kind, defaulting unknown/missing →
-    `novel` (the recall-safe direction — `novel` boosts/keeps an event in dream's queue, `known` sinks it;
-    so doubt must resolve to `novel`, never `known`). Mirrors `_clean_markers`/`_clean_relation`; dream
-    reads the same coercion when it scales salience, so producer and consumer agree on one spelling."""
-    return v if v in RELEVANCE_KINDS else RELEVANCE_DEFAULT
+# NOVELTY-vs-the-store is NOT glean's job (ADR-0036). glean once judged each event's `relevance`
+# (novel/known/contradicts) against an injected concept digest and fed it into dream's salience order.
+# That broke corroboration: a lesson recurring in a DISTINCT session — exactly what matures a claim —
+# was marked `known`, sank in the queue, and under any budget cap never reached resolve. Novelty now
+# lives in ONE place, resolve's statement-first matching (ADR-0028), which USES a re-occurrence to
+# corroborate rather than suppress it. glean extracts BLIND — a pure function of the chunk.
 
 SYSTEM_PROMPT = (
     "You extract durable, reusable learnings from a single excerpt of a Claude Code session "
@@ -151,16 +141,7 @@ SYSTEM_PROMPT = (
     "    research — a researched finding or external fact established during the session.\n"
     "  A learning may score on several at once; a plain preference or fact that is none of these "
     "scores them all low (but is still worth returning).\n"
-    "- \"confidence\": a number 0-1, how durable and reusable this is.\n"
-    "- \"relevance\": judge this learning against WHAT WE ALREADY KNOW — the catalog of already-known "
-    "concepts shown below the excerpt — one of:\n"
-    "    novel — nothing in what we already know covers this; it is new information.\n"
-    "    known — a known concept already states this; it is not new.\n"
-    "    contradicts — this OVERTURNS or corrects something a known concept asserts (a belief change — "
-    "the most important to surface).\n"
-    "  When the catalog is empty or you are unsure, answer \"novel\". The reason is a cost asymmetry: a "
-    "real learning wrongly marked \"known\" sinks out of sight, while a duplicate marked \"novel\" is "
-    "cheaply de-duplicated later — so doubt should resolve toward \"novel\".\n\n"
+    "- \"confidence\": a number 0-1, how durable and reusable this is.\n\n"
     "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
     "holds nothing durable, output {\"events\": []}."
 )
@@ -186,11 +167,7 @@ DOC_SYSTEM_PROMPT = (
     "restate, do not embellish, generalize, or merge neighboring rules.\n"
     "- \"markers\": an object scoring 0-1 on surprise / insight / research — usually all LOW for "
     "a stated rule (nothing broke an expectation; it is a directive, not a discovery).\n"
-    "- \"confidence\": a number 0-1, how durable and actionable the rule is.\n"
-    "- \"relevance\": judge the rule against WHAT WE ALREADY KNOW (the catalog below the excerpt): "
-    "\"novel\" (nothing covers it), \"known\" (a concept already states it), or \"contradicts\" "
-    "(it overturns a known concept). When the catalog is empty or you are unsure, answer "
-    "\"novel\".\n\n"
+    "- \"confidence\": a number 0-1, how durable and actionable the rule is.\n\n"
     "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
     "holds no rules (pure boilerplate), output {\"events\": []}."
 )
@@ -238,27 +215,12 @@ def structural_cues(text: str) -> list[str]:
     return cues
 
 
-def _user_prompt(numbered_excerpt: str, cues: list[str], known: str | None = None) -> str:
+def _user_prompt(numbered_excerpt: str, cues: list[str]) -> str:
     hint = ("\n\nStructural cues (weigh, do not over-trust): " + "; ".join(cues)) if cues else ""
-    # The concept digest ("what we already know") rides BELOW the excerpt so the model judges each event's
-    # `relevance` against it (4b/ADR-0019). It is PROVENANCE-RELEVANT to this chunk (ordered by facet
-    # overlap), so the concepts most likely to already cover it survive the digest's budget cut.
-    known_block = (f"\n\nWHAT WE ALREADY KNOW (judge each learning's relevance against this):\n{known}"
-                   if known else "")
     # The excerpt arrives already line-numbered (number_lines): the model selects line ranges, never text.
-    return f"Excerpt (each line is numbered — cite lines, do not copy text):\n{numbered_excerpt}{hint}{known_block}"
-
-
-def _warm_base_user(digest: str) -> str:
-    """The warm base's FIRST user turn (ADR-0035, --warm-base): present the GLOBAL "what we already
-    know" digest as the shared context every later fork inherits, then ask for a trivial ack. The base
-    reply is discarded — the base exists to seat the digest in a large, byte-stable, cache-warm prefix,
-    NOT to produce output. Each per-chunk fork then sends the excerpt alone (`_user_prompt(..., None)`),
-    so the digest is paid once per tick, not once per chunk — the whole point of the mode."""
-    return ("You will receive session excerpts one at a time and extract durable learnings from each, "
-            "exactly per your instructions. First, here is WHAT WE ALREADY KNOW — the catalog to judge "
-            f"each learning's relevance against:\n\n{digest}\n\n"
-            "Reply with just \"ready\" and wait for the first excerpt.")
+    # Blind extraction (ADR-0036): nothing about the concept layer rides here — glean is a pure function
+    # of the chunk, and resolve owns novelty-vs-the-store.
+    return f"Excerpt (each line is numbered — cite lines, do not copy text):\n{numbered_excerpt}{hint}"
 
 
 def parse_candidates(text: str) -> list[dict]:
@@ -362,7 +324,7 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
     `subject.subject_key`) and `stmt_sig` (the char-shingle signature of the STORED summary,
     `sig.stmt_sig`). resolve reads them off the blob; a pre-stamp event lacks them and resolve
     computes-on-read instead. `subject_cache` shares the per-cleaned-blob subject parse across a
-    batch (the GleanBlock instance owns one, the `_facet_cache` idiom)."""
+    batch (the GleanBlock instance owns one, the `_age_cache` idiom)."""
     bstart, bend = span
     summary = str(candidate.get("summary", "")).strip()[:SUMMARY_MAX]
     return {
@@ -374,7 +336,6 @@ def build_event(candidate: dict, ch: chunk.Chunk, span: tuple[int, int], *,
                                            (bstart, bend), subject_cache),
         "stmt_sig": sig.stmt_sig(summary),
         "markers": _clean_markers(candidate.get("markers")),
-        "relevance": clean_relevance(candidate.get("relevance")),   # novelty vs the store (unknown → novel)
         "confidence": _clean_score(candidate.get("confidence"), 0.5),
         "producer": {"stage": "glean", "model": model, "prompt_version": prompt_version,
                      "run_id": run_id, "cost_usd": None},
@@ -407,10 +368,9 @@ def event_content(ev: dict) -> dict:
         "evidence": ev["evidence"],
         "summary": ev["summary"],
         "markers": ev["markers"],
-        # `relevance` reads DEFENSIVELY: a pre-4b (glean/2) event blob lacks it → projects as `novel`, the
-        # recall-safe default, so an old event never sinks in dream's queue on a missing field. A glean/3
-        # re-extraction (the PROMPT_VERSION bump) re-stamps the real verdict; latest version wins.
-        "relevance": clean_relevance(ev.get("relevance")),
+        # No `relevance` (ADR-0036): glean extracts blind, so new events carry no verdict. A pre-0036 blob
+        # may still hold a stale `relevance` field — it is deliberately NOT projected here, so nothing reads
+        # it and it never perturbs a fold. A blind re-glean (glean/5) forks a clean version, latest wins.
         "confidence": ev["confidence"],
         "supersedes": ev.get("supersedes"),
         # The dream-v3 §2.1 stamps (S1) ride the projection ONLY when present: a pre-stamp blob lacks
@@ -461,11 +421,8 @@ def chunk_key(ch: chunk.Chunk) -> str:
 def structural_score(ch: chunk.Chunk) -> float:
     """The pointer-only, DATE-BLIND salience of a chunk — `has_user + diversity + interaction`, the
     part of `priority()` that is a pure function of the chunk BOUNDARY (never a content read, never a
-    clock). Single-sourced here so the queue's ordering and the pilot report's STRATIFICATION covariate
-    are the identical number: the report corrects the greedy-drain confound (fork chunks glean LATER,
-    so they are structurally poorer on average) by comparing fork-vs-oneshot yield WITHIN score bands,
-    and that only holds if the band is the same signal the drain ordered by. Recency is deliberately
-    excluded — it drifts with wall-clock, so a stored marker's chunk would re-bucket over time; the
+    clock). `priority()` adds only the valid-time recency bonus on top of this. Recency is deliberately
+    excluded HERE — it drifts with wall-clock, so a stored marker's chunk would re-bucket over time; the
     structural part is stable for the life of the frozen chunkset."""
     kinds = set(ch.kinds or [])
     has_user = 2.0 if "user" in kinds else 0.0
@@ -504,8 +461,7 @@ class GleanBlock:
 
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
                  targets: list[str] | None = None, source_filter: str | None = None,
-                 exclude: tuple[str, ...] = (), recent_clock: str = RECENT_CLOCK,
-                 warm_base: bool | None = None) -> None:
+                 exclude: tuple[str, ...] = (), recent_clock: str = RECENT_CLOCK) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
@@ -516,22 +472,7 @@ class GleanBlock:
         if recent_clock not in RECENT_CLOCKS:
             raise ValueError(f"recent_clock must be one of {RECENT_CLOCKS}, got {recent_clock!r}")
         self.recent_clock = recent_clock   # which stamp dates the material (see the RECENT_CLOCK knob)
-        # WARM-BASE FORK MODE (ADR-0035, DEFAULT since 2026-07-06): fork each chunk off a shared base
-        # carrying the concept digest ONCE per tick, instead of re-sending it in every chunk's oneshot
-        # prompt. `warm_base=None` (the default) means AUTO — on when the completer is session-capable
-        # (`.warm`/`.fork`, as the real CLI seam is), off for a plain oneshot seam (test fakes, the
-        # scores path with a non-session stub) so those never break. An EXPLICIT `warm_base=True`
-        # against a non-session seam still refuses loudly rather than AttributeError deep in process()
-        # (ADR-0027 — a knob that binds nothing is a lie); explicit False forces oneshot (`--no-warm-base`).
-        session_capable = hasattr(complete, "warm") and hasattr(complete, "fork")
-        if warm_base is None:
-            warm_base = session_capable
-        elif warm_base and not session_capable:
-            raise ValueError("warm_base=True needs a session-capable completer (with .warm/.fork); "
-                             "the plain oneshot Completer seam has neither")
-        self.warm_base = warm_base
-        self.params: tuple[tuple[str, str], ...] = (
-            ("prompt_version", FORK_PROMPT_VERSION if warm_base else PROMPT_VERSION), ("model", model))
+        self.params: tuple[tuple[str, str], ...] = (("prompt_version", PROMPT_VERSION), ("model", model))
         # run-total tallies (instance-scoped; the Report stays uniform). `_tally_lock` guards them
         # under `--parallel`: `+=` on a shared int is a read-modify-write, so a thread switch between
         # the load and the store LOSES an increment — WRONG audit data, hence the lock. (The caches
@@ -540,38 +481,17 @@ class GleanBlock:
         self._tally_lock = threading.Lock()
         self.events = 0           # events ingested this run (== block.Report.outputs)
         self.rejected = 0         # candidates whose quote failed verification
-        self.calls = 0            # per-CHUNK LLM calls made (signal chunks; filter-skips don't call). The
-                                  # warm base's ONE call per tick is not a chunk call, so it is not tallied
-                                  # here — it is the mode's fixed per-tick overhead (ADR-0035).
-        # PROMPT-CACHE instrumentation (R0/ADR-0035): the run totals of input served from a warm cache
-        # (`cache_read`) and written into it (`cache_creation`), summed across chunk calls. They ride the
-        # per-chunk marker (marker_extra) and the run summary line so the warm-base A/B is measurable —
-        # compare marker input vs cache tokens before/after `--warm-base`.
+        self.calls = 0            # per-CHUNK LLM calls made (signal chunks; filter-skips don't call)
+        # PROMPT-CACHE instrumentation (R0/ADR-0035, survives ADR-0036): the run totals of input served
+        # from a warm cache (`cache_read`) and written into it (`cache_creation`), summed across chunk
+        # calls. They ride the per-chunk marker (marker_extra) and the run summary line so whether the
+        # CLI's cross-invocation prompt cache actually fires stays MEASURED, never assumed.
         self.cache_read = 0
         self.cache_creation = 0
-        # The concept digest seam (4b/ADR-0019): the run-invariant facet pass is built ONCE (first signal
-        # chunk) and re-rendered per chunk with that chunk's `relevant_to`, so the O(concepts) raw re-parse
-        # is paid once per run, not once per chunk; `_facet_cache` shares each cleaned blob's facets across
-        # chunks. `None` until built — a glean run with zero signal chunks never touches concepts.
-        self._digest_ctx: dict | None = None
-        self._facet_cache: dict = {}
-        # WARM-BASE seam (ADR-0035): one shared base session PER MODE (transcript vs document use distinct
-        # system prompts, so each needs its own warm base), built lazily on the first signal chunk of that
-        # mode and cached here; every later chunk of the mode forks it. `_global_digest_str` is the run-
-        # stable GLOBAL digest the base carries, built once. `_warm_lock` guards the once-per-mode warm so
-        # `--parallel` workers don't each mint a base (the forks themselves are independent and lock-free).
-        self._warm_sessions: dict[str, str] = {}   # mode -> warm-base session id
-        self._global_digest_str: str | None = None
-        self._warm_lock = threading.Lock()
-        # LOCK-FREE by design under `--parallel` (this and every cache below: _facet_cache, _age_cache,
-        # _vt_cache, _subject_cache, and the lazy _digest_ctx/_digest_failed latch): each memoizes a DETERMINISTIC
-        # derivation keyed by content hash, so the worst a race can do is build the same value twice —
-        # duplicated work, idempotent and content-addressed, never wrong data. A lock would buy nothing.
-        # The digest-disable latch (4b/ADR-0019): a persistent build failure (a bug in `digest_context`/
-        # `chunk_facets`/`concept_digest`) sets this on the FIRST exception, so every later chunk
-        # short-circuits to the empty sentinel WITHOUT re-attempting the expensive build (no retry-storm).
-        # Surfaced ONCE in the run summary — a permanent novelty-disable must be detectable, not silent.
-        self._digest_failed = False
+        # LOCK-FREE by design under `--parallel` (every cache below: _age_cache, _vt_cache, _meta_cache,
+        # _subject_cache): each memoizes a DETERMINISTIC derivation keyed by content hash, so the worst a
+        # race can do is build the same value twice — duplicated work, idempotent and content-addressed,
+        # never wrong data. A lock would buy nothing.
         # per-chunk audit recorded for marker_extra — THREAD-LOCAL, the one shared slot where a race
         # would produce WRONG data (not merely duplicated work): under `--parallel` a plain dict here
         # could hold whichever chunk finished LAST, mis-attributing another chunk's tallies into a
@@ -595,7 +515,7 @@ class GleanBlock:
                                                       # cleaned blob across the filters AND both clocks
         # The subject-stamp seam (dream-v3 §2.1, S1): `subject_key` derivation parses the cleaned blob
         # once (meta hop + write-line scan, maybe a raw re-parse) — shared across the many events of one
-        # session's chunks, keyed by cleaned_hash. The `_facet_cache`/`_age_cache` idiom.
+        # session's chunks, keyed by cleaned_hash. The `_age_cache` idiom.
         self._subject_cache: dict = {}
 
     # -- enumeration: target chunksets → their chunks ----------------------------------------
@@ -745,66 +665,6 @@ class GleanBlock:
             self._fill_stamps(ch)
         return config.age_days(self._age_cache[ch])
 
-    # -- the concept digest seam: "what we already know", provenance-relevant to THIS chunk --------
-
-    def _relevant_digest(self, cleaned_hash: str, root: Path) -> str:
-        """The bounded, structured "what we already know" render (ADR-0018) ORDERED to THIS chunk: the
-        concepts most facet-overlapping the chunk's provenance survive the digest's budget cut, so a
-        near-duplicate of a thin, single-session concept is judged `known`, not falsely `novel` (4b/ADR-
-        0019). The expensive facet pass (`digest_context`) is cached on the instance — built once per run,
-        re-rendered per chunk with the chunk's `relevant_to`.
-
-        ADVISORY + RECALL-FIRST: this only shapes the model's relevance verdict, never the trust anchor, so
-        any failure to BUILD the context degrades to the empty sentinel rather than costing an extraction —
-        the model then sees nothing known and defaults every event to `novel` (the recall-safe direction).
-        The `concepts` import is FUNCTION-LOCAL: concepts→dream→glean would cycle on a top-level import."""
-        if self._digest_failed:                      # a prior build raised → novelty is OFF for the run;
-            return concepts.DIGEST_EMPTY             # don't re-attempt the expensive build every chunk
-        try:
-            if self._digest_ctx is None:
-                self._digest_ctx = concepts.digest_context(root)
-            facets = concepts.chunk_facets(cleaned_hash, root, cache=self._facet_cache)
-            return concepts.concept_digest(root, relevant_to=facets, context=self._digest_ctx)
-        except Exception:                            # advisory signal: never block extraction (recall-first;
-            self._digest_failed = True               # KeyboardInterrupt/BaseException still propagate, ADR-
-            return concepts.DIGEST_EMPTY             # 0009). Latch OFF + surface once — not silent forever.
-
-    # -- the warm base: the GLOBAL digest, seated ONCE per tick and forked per chunk (ADR-0035) ------
-
-    def _global_digest(self, root: Path) -> str:
-        """The run-stable GLOBAL concept digest for the warm base — built ONCE per tick, reused across all
-        forks. Unlike oneshot's per-chunk `_relevant_digest` (ordered by THIS chunk's facet overlap), the
-        warm base is one SHARED prefix, so it must be chunk-INDEPENDENT: the global entrenchment ordering
-        (dream's, `relevant_to=None`). Below DIGEST_BUDGET concepts the two are content-identical — every
-        concept renders, only the ORDER differs; PAST the budget the global ordering truncates the least-
-        entrenched tail, which can differ from the concepts per-chunk relevance would have kept for a given
-        chunk. That is the accepted tradeoff of one shared base, recorded HERE at the knob (ADR-0035): the
-        cache win of paying the digest once buys a coarser-but-still-bounded novelty signal past 80 concepts.
-        Shares the digest-disable latch (recall-first): a build failure degrades to the empty sentinel, once."""
-        if self._global_digest_str is None:
-            if self._digest_failed:
-                self._global_digest_str = concepts.DIGEST_EMPTY
-            else:
-                try:
-                    self._global_digest_str = concepts.concept_digest(root)
-                except Exception:                    # advisory: never block extraction (mirror _relevant_digest)
-                    self._digest_failed = True
-                    self._global_digest_str = concepts.DIGEST_EMPTY
-        return self._global_digest_str
-
-    def _warm_session_for(self, mode: str, system: str, root: Path) -> str:
-        """Lazily warm ONE shared base for `mode` and return its session id. The base carries the mode's
-        system prompt + the global digest; each chunk of the mode FORKS it (`.fork`), so the digest is sent
-        once per tick, not per chunk, and every fork sees base + its own excerpt only (no cross-chunk
-        contamination — a fork inherits the base, never a sibling's turn). Locked so `--parallel` workers
-        warm each mode exactly once; a fresh uuid4 per warm lives inside the completer (never reused)."""
-        with self._warm_lock:
-            sid = self._warm_sessions.get(mode)
-            if sid is None:
-                sid = self.complete.warm(system, _warm_base_user(self._global_digest(root)))
-                self._warm_sessions[mode] = sid
-            return sid
-
     # -- extract ONE chunk -------------------------------------------------------------------
 
     def process(self, item: ChunkItem, *, root: Path, run_id: str) -> tuple[int, float]:
@@ -829,26 +689,14 @@ class GleanBlock:
         # cues are transcript-shaped (speaker tags, tool errors); on a rules file they'd only misfire.
         cues = [] if doc_mode else structural_cues(text)
         system = DOC_SYSTEM_PROMPT if doc_mode else SYSTEM_PROMPT
-        # pv stamps the event's PROVENANCE only (event_content drops it → re-extraction stays a no-op): the
-        # doc version is independent; a transcript event carries the fork version under warm mode so its
-        # origin_ref names the path that produced it.
-        pv = DOC_PROMPT_VERSION if doc_mode else (FORK_PROMPT_VERSION if self.warm_base else PROMPT_VERSION)
-        if self.warm_base:
-            # WARM-BASE FORK (ADR-0035): the digest rides the shared base this chunk forks, so the fork's
-            # turn is the excerpt ALONE (known=None) — no per-chunk digest re-send. The fork inherits the
-            # base's digest + system, so the model still judges relevance against "what we already know".
-            session_id = self._warm_session_for(item.mode, system, root)
-            prompt = _user_prompt(numbered, cues, None)
-            comp = self.complete.fork(system, prompt, session_id)   # raising → driver errored (per-chunk)
-        else:
-            known = self._relevant_digest(ch.cleaned_hash, root)   # "what we already know", relevant to THIS chunk;
-            # the per-chunk digest build is glean's DELIBERATE advisory exception — a bug there is ISOLATED +
-            # recall-first (swallowed → empty sentinel, latched off; see `_relevant_digest`), NOT surfaced.
-            prompt = _user_prompt(numbered, cues, known)          # our code; a bug HERE surfaces (driver errored)
-            comp = self.complete(system, prompt)                  # the sole LLM call; raising → driver errored
+        # pv stamps the event's PROVENANCE only (event_content drops it → re-extraction stays a no-op); the
+        # doc version is independent so the two modes re-extract on their own knobs.
+        pv = DOC_PROMPT_VERSION if doc_mode else PROMPT_VERSION
+        prompt = _user_prompt(numbered, cues)     # BLIND (ADR-0036): the excerpt + cues alone, no digest
+        comp = self.complete(system, prompt)      # the sole LLM call; raising → driver errored (per-chunk)
         with self._tally_lock:                    # shared int += — a lost increment is wrong audit data
             self.calls += 1
-            self.cache_read += comp.cache_read_tokens         # cache instrumentation (R0): run totals for the A/B
+            self.cache_read += comp.cache_read_tokens         # cache instrumentation (R0): run totals, measured
             self.cache_creation += comp.cache_creation_tokens
         call_cost = completer.cost_of(comp)
 
@@ -876,8 +724,8 @@ class GleanBlock:
             self.events += len(accepted)
             self.rejected += rejected
         # the per-chunk marker records this call's token + cache figures (R0/ADR-0035) alongside the audit
-        # counts, so the warm-base A/B is reconstructable from the store: input vs cache_read is exactly the
-        # payload the warm base was meant to shift out of every chunk. `input_tokens` is the NON-cached input.
+        # counts, so whether the CLI prompt cache fired is reconstructable from the store, never assumed.
+        # `input_tokens` is the NON-cached input (total input = input + cache_read + cache_creation).
         self._last.d = {"n_events": len(accepted), "n_rejected": rejected, "n_calls": 1,
                         "cleaned_hash": ch.cleaned_hash,
                         "input_tokens": comp.input_tokens, "output_tokens": comp.output_tokens,
@@ -934,209 +782,6 @@ def all_chunksets(root: Path | None = None) -> list[str]:
     scan over the derived sidecars."""
     return [m["content_hash"] for m in blobstore.iter_meta(root)
             if m.get("format") in chunk.CHUNKSET_FORMATS]
-
-
-# --- the warm-base A/B pilot report (ADR-0035): $0, marker-derived, iterative --------------------
-#
-# The measurement principle (sulin, 2026-07-06): the BACKLOG DRAIN *is* the experiment — we never
-# re-glean a chunk to measure. Every fork-mode tick is real forward progress whose stored markers
-# also answer "is warm-base winning?". The confound the report must correct: greedy priority drains
-# the richest chunks first, so chunks gleaned LATER (the fork cohort, added after the oneshot
-# baseline) are structurally poorer — a raw yield comparison would blame warm-base for the queue
-# order. The fix is stratification by `structural_score` (the same pointer-only signal the drain
-# ordered by), comparing cohorts WITHIN a band and standardizing to the fork cohort's distribution.
-
-# Score bands for stratification — the covariate axis. Boundaries track the priority signal's natural
-# steps: 2.0 is "a user turn is present" (the dominant term), so <2 = no user turn (tool monologues),
-# 2–3 = user turn + thin exchange, 3+ = user turn + real diversity/interaction (the rich tail).
-PILOT_BANDS = ((0.0, 2.0), (2.0, 3.0), (3.0, 99.0))
-
-# The decision rule (ADR-0035) — flip `--warm-base` to default only when ALL hold. Named so the
-# verdict is legible and the bar is a knob, not a hidden constant (ADR-0027).
-PILOT_MIN_FORK = 50          # enough fork chunks that band ratios aren't single-digit noise (~3 ticks)
-PILOT_YIELD_FLOOR = 0.85     # stratum-adjusted fork/oneshot events-per-chunk must clear this (≤15% loss)
-PILOT_COST_CEIL = 0.70       # fork cost/chunk must be ≤ this × oneshot's (the mechanical caching win)
-
-
-def _marker_cohort(prompt_version: str) -> str | None:
-    """Which A/B arm a glean marker belongs to, read from its `prompt_version` param (the done-key
-    field the two paths already separate on). Fork vs oneshot over TRANSCRIPT chunks only — document
-    chunks (their own version) are a different yield regime with no fork counterpart yet, so they are
-    excluded from the A/B rather than pooled into it (they'd bias whichever arm holds more of them)."""
-    if prompt_version == FORK_PROMPT_VERSION:
-        return "fork"
-    if prompt_version == PROMPT_VERSION:
-        return "oneshot"
-    return None                                   # document / unknown version → out of the A/B
-
-
-def pilot_report(root: Path | None = None) -> dict:
-    """Fold every glean `processed` marker into the warm-base fork A/B — $0, reads only stored markers
-    and chunk POINTERS, never the LLM (the drain already paid for the data). Returns a dict the CLI
-    renders: per-cohort totals, a per-band breakdown, the stratum-adjusted yield ratio, and the verdict
-    against the decision rule. The token fields (`input` vs `cache_read`) are the MECHANISM — warm-base
-    is meant to shift the fixed payload out of every chunk's fresh input into a once-written base the
-    forks read cheaply — so they are shown beside cost, which already applies the price discounts."""
-    root = root or config.data_root()
-    # key → structural_score, over every frozen chunk in the store. One pass; pointer-only (no content
-    # read), so joining a marker to its covariate costs nothing the drain didn't already compute.
-    score_by_key: dict[str, float] = {}
-    for cs in all_chunksets(root):
-        for ch in chunk.load(cs, root):
-            score_by_key[chunk_key(ch)] = structural_score(ch)
-
-    def band_of(score: float | None) -> str:
-        if score is None:
-            return "unknown"                      # marker whose chunk is gone (re-chunked/pruned) — kept visible
-        for lo, hi in PILOT_BANDS:
-            if lo <= score < hi:
-                return f"{lo:g}-{hi:g}" if hi < 99 else f"{lo:g}+"
-        return "unknown"
-
-    # Accumulate per (cohort, band): n, events, cost, and the token mechanism.
-    def _acc() -> dict:
-        return {"n": 0, "events": 0, "zero": 0, "cost": 0.0,
-                "input": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
-    cells: dict[tuple[str, str], dict] = {}
-    ev_by_target: dict[str, dict[str, int]] = {"fork": {}, "oneshot": {}}   # cohort → target → events
-    seen_keys: set[tuple[str, str, str]] = set()  # (cohort, target, model) — latest marker per done-key wins
-    for b in blobstore.decisions_for(None, root, verb="processed", stage="glean"):
-        pv = b.get("prompt_version") or dict(b.get("params") or []).get("prompt_version")
-        cohort = _marker_cohort(str(pv))
-        if cohort is None:
-            continue
-        target = b.get("target")
-        model = b.get("model") or ""
-        dk = (cohort, str(target), str(model))
-        if dk in seen_keys:                       # a re-run re-writes the marker; count each done-key ONCE
-            continue
-        seen_keys.add(dk)
-        band = band_of(score_by_key.get(str(target)))
-        cell = cells.setdefault((cohort, band), _acc())
-        n_ev = int(b.get("n_events", b.get("n_outputs", 0)) or 0)
-        cell["n"] += 1
-        cell["events"] += n_ev
-        cell["zero"] += 1 if n_ev == 0 else 0
-        cell["cost"] += float(b.get("cost_usd", 0.0) or 0.0)
-        for f in ("input", "cache_read", "cache_creation", "output"):
-            cell[f] += int(b.get(f + ("_tokens" if f in ("input", "output") else ""), 0) or 0)
-        ev_by_target[cohort][str(target)] = n_ev
-
-    def cohort_totals(cohort: str) -> dict:
-        t = _acc()
-        for (co, _band), c in cells.items():
-            if co == cohort:
-                for k in t:
-                    t[k] += c[k]
-        return t
-    fork_t, one_t = cohort_totals("fork"), cohort_totals("oneshot")
-
-    # Stratum-adjusted yield ratio: fork vs oneshot events/chunk WITHIN each band, weighted by the
-    # FORK cohort's n in that band (direct standardization to the fork chunks' score distribution) —
-    # so the number answers "at equal chunk quality, how does fork yield compare?", not "did fork
-    # happen to draw poorer chunks?". Only bands where BOTH arms have data contribute.
-    num = den = 0.0
-    per_band = []
-    for lo, hi in PILOT_BANDS:
-        band = f"{lo:g}-{hi:g}" if hi < 99 else f"{lo:g}+"
-        f, o = cells.get(("fork", band)), cells.get(("oneshot", band))
-        row = {"band": band,
-               "fork": (f["n"], f["events"] / f["n"], f["cost"] / f["n"]) if f and f["n"] else None,
-               "oneshot": (o["n"], o["events"] / o["n"], o["cost"] / o["n"]) if o and o["n"] else None}
-        per_band.append(row)
-        if f and o and f["n"] and o["n"] and o["events"]:
-            fork_ypc, one_ypc = f["events"] / f["n"], o["events"] / o["n"]
-            num += f["n"] * (fork_ypc / one_ypc)
-            den += f["n"]
-    adj_yield = (num / den) if den else None
-
-    # The PAIRED comparison — chunks gleaned BOTH ways (a fork re-gleans an oneshot-done chunk under its
-    # own done-key). This is the rigorous yield signal: identical inputs, so the events-per-chunk delta
-    # carries NO chunk variance — far tighter than the cross-sectional ratio at small n, and it is what
-    # the fork ticks actually generate (greedy priority re-serves the top oneshot chunks, fork-pending).
-    # Idempotent by span, so the re-glean adds no events — it is deliberate measurement, not drain.
-    paired_t = set(ev_by_target["fork"]) & set(ev_by_target["oneshot"])
-    if paired_t:
-        fsum = sum(ev_by_target["fork"][t] for t in paired_t)
-        osum = sum(ev_by_target["oneshot"][t] for t in paired_t)
-        down = sum(1 for t in paired_t if ev_by_target["fork"][t] < ev_by_target["oneshot"][t])
-        up = sum(1 for t in paired_t if ev_by_target["fork"][t] > ev_by_target["oneshot"][t])
-        paired = {"n": len(paired_t), "fork_ev": fsum / len(paired_t), "oneshot_ev": osum / len(paired_t),
-                  "ratio": (fsum / osum) if osum else None, "fork_lower": down, "fork_higher": up,
-                  "tie": len(paired_t) - down - up}
-    else:
-        paired = None
-
-    def per_chunk(t: dict) -> dict:
-        n = t["n"] or 1
-        return {"n": t["n"], "cost": t["cost"] / n, "events": t["events"] / n,
-                "zero_rate": t["zero"] / n, "input": t["input"] / n,
-                "cache_read": t["cache_read"] / n, "cache_creation": t["cache_creation"] / n}
-    fork_pc, one_pc = per_chunk(fork_t), per_chunk(one_t)
-    cost_ratio = (fork_pc["cost"] / one_pc["cost"]) if one_pc["cost"] else None
-
-    # The yield the verdict trusts: the PAIRED ratio when pairs exist (variance-free), else the
-    # stratified cross-sectional one. Both are reported; the rule keys on the better available.
-    yield_used = paired["ratio"] if (paired and paired["ratio"] is not None) else adj_yield
-
-    # The verdict — each clause of the rule, so a FAIL says which bar it missed (ADR-0027 legibility).
-    checks = {
-        "enough_fork": fork_t["n"] >= PILOT_MIN_FORK,
-        "yield_holds": yield_used is not None and yield_used >= PILOT_YIELD_FLOOR,
-        "cost_wins": cost_ratio is not None and cost_ratio <= PILOT_COST_CEIL,
-    }
-    return {"fork": fork_pc, "oneshot": one_pc, "per_band": per_band, "paired": paired,
-            "adjusted_yield_ratio": adj_yield, "yield_used": yield_used, "cost_ratio": cost_ratio,
-            "checks": checks, "flip_to_default": all(checks.values())}
-
-
-def _render_pilot(rep: dict) -> str:
-    """The pilot report as a wrap-safe block: cohort headline, per-band table, verdict. Errored chunks
-    write NO marker (ADR-0009 per-chunk retry), so fork RELIABILITY is not reconstructable here — it is
-    read from the run summaries' `errored` count; the report says so rather than implying 100%."""
-    f, o = rep["fork"], rep["oneshot"]
-    lines = ["warm-base fork A/B (ADR-0035) — $0, from stored markers; drain IS the experiment", ""]
-    lines.append(f"  {'cohort':8}  {'n':>4}  {'cost/ch':>8}  {'ev/ch':>6}  {'zero%':>6}  "
-                 f"{'input':>7}  {'cacheR':>7}  {'cacheW':>7}")
-    for name, c in (("oneshot", o), ("fork", f)):
-        lines.append(f"  {name:8}  {c['n']:>4}  {c['cost']:>8.4f}  {c['events']:>6.2f}  "
-                     f"{c['zero_rate']*100:>5.0f}%  {c['input']:>7.0f}  {c['cache_read']:>7.0f}  "
-                     f"{c['cache_creation']:>7.0f}")
-    lines += ["", "  by structural-score band (fork n · ev/ch · cost/ch  vs  oneshot):"]
-    for row in rep["per_band"]:
-        def fmt(t):
-            return f"{t[0]:>3} · {t[1]:.2f} · {t[2]:.4f}" if t else f"{'—':>16}"
-        lines.append(f"    {row['band']:>5}   fork {fmt(row['fork'])}   one {fmt(row['oneshot'])}")
-    p = rep["paired"]
-    if p:
-        lines += ["",
-                  f"  PAIRED yield (same {p['n']} chunks both ways — variance-free, the trusted signal):",
-                  f"    fork {p['fork_ev']:.2f} vs oneshot {p['oneshot_ev']:.2f} ev/ch  "
-                  f"= {p['ratio']:.2f}  ({p['fork_lower']} pairs fork-lower · {p['tie']} tie · "
-                  f"{p['fork_higher']} fork-higher)"]
-    ay = rep["adjusted_yield_ratio"]
-    cr = rep["cost_ratio"]
-    lines += ["",
-              f"  stratum-adjusted yield ratio (fork/oneshot): "
-              f"{ay:.2f}" if ay is not None else "  stratum-adjusted yield ratio: (no overlapping bands yet)",
-              f"  cost ratio (fork/oneshot): {cr:.2f}" if cr is not None else "  cost ratio: (no oneshot data)"]
-    ck = rep["checks"]
-    def mark(b): return "✓" if b else "✗"
-    lines += ["", "  decision rule (ADR-0035):",
-              f"    {mark(ck['enough_fork'])} ≥{PILOT_MIN_FORK} fork chunks (have {rep['fork']['n']})",
-              f"    {mark(ck['yield_holds'])} adjusted yield ≥ {PILOT_YIELD_FLOOR}",
-              f"    {mark(ck['cost_wins'])} cost ratio ≤ {PILOT_COST_CEIL}",
-              "",
-              ("  VERDICT: flip --warm-base to default — the rule is met." if rep["flip_to_default"]
-               else "  VERDICT: keep gathering — run more --warm-base ticks (reliability: read `errored` "
-                    "from run summaries; a fork error writes no marker)")]
-    if rep["fork"]["n"]:
-        lines += ["",
-                  "  caveats: (1) the once-per-tick warm-base CALL writes no chunk marker, so fork "
-                  "cost/ch is optimistic — it amortizes toward 0 on big ticks, inflates small ones; "
-                  "(2) stratification only corrects the drain confound once chunks span BANDS — while "
-                  "every gleaned chunk sits in one band, the raw and adjusted ratios coincide."]
-    return "\n".join(lines)
 
 
 def chunkset_for_source(source_id: str, root: Path | None = None) -> str | None:
@@ -1199,26 +844,7 @@ def main(argv=None) -> None:
                          "with arrival as fallback (default — conversation-less sources like fetched "
                          "PDFs/pages are dated by when they were pulled), strict 'valid' (no date, no "
                          "bonus), or 'arrival' (tap date only)")
-    ap.add_argument("--warm-base", action=argparse.BooleanOptionalAction, default=True,
-                    help="cost mode (ADR-0035, DEFAULT ON since 2026-07-06): fork each chunk off a shared "
-                         "base carrying the concept digest ONCE per tick, instead of re-sending the digest "
-                         "in every chunk's prompt (the large fixed payload that rides every fresh claude -p "
-                         "call). The digest is ratchet's OWN reviewed concepts and never enters evidence "
-                         "(copied bytes), so relocating it changes cost, not trust. `--no-warm-base` forces "
-                         "the legacy oneshot path (done-key glean/4); warm runs under glean/5-fork, so the "
-                         "two never touch each other's markers")
-    ap.add_argument("--pilot-report", action="store_true",
-                    help="read-only: fold every stored glean marker into the warm-base fork A/B "
-                         "(ADR-0035) — per-cohort cost/yield, stratified by structural score (corrects "
-                         "the greedy-drain confound), and the flip-to-default verdict. $0, no LLM; the "
-                         "drain already paid for the data. Ignores the target selectors")
-    ap.add_argument("--json", action="store_true", help="machine-readable output (with --pilot-report)")
     args = ap.parse_args(argv)
-
-    if args.pilot_report:                         # store-wide A/B read — ignores the target selectors,
-        rep = pilot_report(config.ensure_layout())    # reads every glean marker (ADR-0035); $0, no LLM
-        print(json.dumps(rep, ensure_ascii=False, indent=2) if args.json else _render_pilot(rep))
-        return
 
     # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
     if args.all:
@@ -1238,14 +864,13 @@ def main(argv=None) -> None:
     if args.scores:                               # read-only early-return, --dry-run's sibling: the
         blk = GleanBlock(completer.make_cli_completer(args.model), model=args.model,   # completer is
                          targets=targets, source_filter=args.source,  # bound but never called (no LLM)
-                         exclude=tuple(args.exclude), recent_clock=args.recent_clock,
-                         warm_base=args.warm_base)  # warm only shifts the done-key here — the queue is the same
+                         exclude=tuple(args.exclude), recent_clock=args.recent_clock)
         print(block.scores_report(blk, root=config.ensure_layout(), priority=args.priority))
         return
 
     complete = completer.make_cli_completer(args.model)
     blk = GleanBlock(complete, model=args.model, targets=targets, source_filter=args.source,
-                     exclude=tuple(args.exclude), recent_clock=args.recent_clock, warm_base=args.warm_base)
+                     exclude=tuple(args.exclude), recent_clock=args.recent_clock)
     # the stage owns its Progress now (the driver only speaks the protocol). None when there is nothing
     # to watch (--quiet or --dry-run); else built from this stage's args + OUT_NOUN.
     progress = None if (args.quiet or args.dry_run) else block.Progress(
@@ -1263,18 +888,13 @@ def main(argv=None) -> None:
     if report.breaker_tripped:
         tail += "  [stopped: breaker]"
     errs = f", {report.errored} errored" if report.errored else ""
-    # the cache r/w figure (R0/ADR-0035): input tokens SERVED FROM / WRITTEN INTO the prompt cache this
-    # run — the number the warm-base A/B moves. Shown only when there were chunk calls (a fully-skipped
-    # tick has nothing to report), so an idempotent re-run stays quiet.
+    # the cache r/w figure (R0/ADR-0035): input tokens SERVED FROM / WRITTEN INTO the CLI's prompt cache
+    # this run — whether cross-invocation caching actually fires, measured not assumed. Shown only when
+    # there were chunk calls (a fully-skipped tick has nothing to report), so a re-run stays quiet.
     cache = f", cache r/w {blk.cache_read}/{blk.cache_creation}" if blk.calls else ""
     print(f"\nglean-{report.run_id}: {report.examined} examined, {report.processed} done, "
           f"{report.skipped} skipped, {report.outputs} events, {blk.rejected} rejected{errs}, "
           f"${report.cost_usd:.4f}{cache}{tail}")
-    # the digest-disable latch tripped — surface it ONCE so a permanent novelty-off is visible, never silent
-    if blk._digest_failed:
-        print("  WARNING: concept digest build failed — novelty awareness was DISABLED this run "
-              "(every event judged `novel`); see GleanBlock._relevant_digest (oneshot) / _global_digest "
-              "(--warm-base). This is glean's deliberate advisory exception (isolated + recall-first), not a crash.")
 
 
 if __name__ == "__main__":

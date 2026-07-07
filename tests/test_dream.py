@@ -84,9 +84,8 @@ class GleanFake:
     actually contains it — so each session yields exactly its own durable line as an event, with the
     salience signal we asked for. (Each durable line stands alone in its turn, so the selected line's
     bytes ARE the line — see make_session.)"""
-    def __init__(self, lines, *, markers=None, confidence=0.85, relevance=None):
+    def __init__(self, lines, *, markers=None, confidence=0.85):
         self.lines, self.markers, self.confidence, self.calls = lines, markers or {}, confidence, 0
-        self.relevance = relevance   # the per-event novelty verdict (4b); None → field omitted (→ novel)
 
     def __call__(self, system, user):
         self.calls += 1
@@ -100,11 +99,8 @@ class GleanFake:
             hit = next((n for n, body in line_of.items() if ln in body), None)
             if hit is None:
                 continue                     # this line is not in this chunk → nothing to point at
-            c = {"lines": {"from": hit, "to": hit}, "summary": f"machine summary of: {ln[:24]}",
-                 "markers": self.markers.get(ln, M_MID), "confidence": self.confidence}
-            if self.relevance is not None:
-                c["relevance"] = self.relevance
-            cands.append(c)
+            cands.append({"lines": {"from": hit, "to": hit}, "summary": f"machine summary of: {ln[:24]}",
+                          "markers": self.markers.get(ln, M_MID), "confidence": self.confidence})
         return Completion(text=json.dumps({"events": cands}), model="fake", cost_usd=0.001)
 
 
@@ -227,17 +223,18 @@ blk_for_prio = dream.DreamBlock(RouteFake(), SynthFake(), route_model="fake", sy
 nix_rv = [rv for rv in ws if rv.quote == NIX][0]
 assert blk_for_prio.priority(nix_rv) == salience(nix_rv.event), "DreamBlock.priority delegates to salience"
 
-# RELEVANCE (4b/ADR-0019) scales salience RECALL-FIRST: for otherwise-equal events, contradicts > novel >
-# known, so dream drains novel/contradicting events first and SINKS (never drops) already-known ones. A
-# missing relevance field coerces to `novel` (×1.0), so a pre-4b event keeps its EXACT prior salience.
+# RELEVANCE is INERT after ADR-0036: salience no longer scales by any novelty verdict. glean once judged
+# each event `novel`/`known`/`contradicts` against the global concept digest and dream sank `known` in the
+# queue — but sinking a re-occurrence starved the corroboration that matures a claim. Novelty now lives
+# solely in resolve (ADR-0028), so three otherwise-equal events score IDENTICALLY regardless of any (stale)
+# relevance field, and salience == intrinsic_salience.
 _relbase = {"confidence": 0.8, "markers": {"surprise": 0.5, "insight": 0.2, "research": 0.0}}
 _s_contra = salience({**_relbase, "relevance": "contradicts"})
 _s_novel = salience({**_relbase, "relevance": "novel"})
 _s_known = salience({**_relbase, "relevance": "known"})
-assert _s_contra > _s_novel > _s_known, f"contradicts > novel > known for equal events: {(_s_contra, _s_novel, _s_known)}"
-assert salience(_relbase) == _s_novel, "a missing relevance coerces to novel (×1.0) — pre-4b salience preserved"
-assert salience({**_relbase, "relevance": "bogus"}) == _s_novel, "an unknown verdict coerces to novel, never sinks"
-assert _s_known > 0, "known only SINKS in the queue — never zero, never a hard drop (recall-first)"
+assert _s_contra == _s_novel == _s_known == salience(_relbase), \
+    f"ADR-0036: relevance no longer affects salience — all equal: {(_s_contra, _s_novel, _s_known)}"
+assert salience(_relbase) == events.intrinsic_salience(_relbase), "salience == intrinsic_salience (no relevance term)"
 
 # _clean_route: the defensive coercion of the untrusted router JSON.
 assert _clean_route({"decision": "new", "takeaway_id": "t-x"}, {"t-x"}) == {"decision": "new", "takeaway_id": None}, \
@@ -552,41 +549,36 @@ print("OK §8 — forget: stales ONLY on (tau cycles AND low salience); reversib
 print("        a salient event is never aged out.")
 
 
-# === 8b. FORGET-DECOUPLING: relevance scales salience-ORDER, never the forget gate (4b/ADR-0019) ======
-# The bug the `_intrinsic_salience` split fixes: `salience` now folds in × W_REL, so a `known` (×0.4) verdict
-# could flip an aged, modest-marker event from surviving to forget-eligible — a NEW drop path violating
-# recall-first. The fix gates `forget` on `_intrinsic_salience` (the relevance-FREE conf×marker-mass), so
-# relevance ORDERS the queue but NEVER evicts. This pins that invariant.
+# === 8b. ADR-0036: relevance is INERT — it can never drive a forget (the old ×0.4 drop path is gone) ===
+# BEFORE 0036 `salience` folded in × W_REL, so a `known` (×0.4) verdict could sink an aged, modest-marker
+# event below the forget floor and evict it — a relevance-driven drop path that violated recall-first, and
+# the very starvation of corroboration 0036 removes. Now `salience` == `intrinsic_salience`: a stale
+# `relevance` field changes NOTHING, so forget gates on the one own-value score. An above-floor event
+# survives, a genuinely-low one stales — regardless of any verdict glean once produced.
 R8b = use_store("forget-relevance")
-# A `known` event tuned so its INTRINSIC salience clears the floor while ×0.4 sinks `salience` BELOW it —
-# the exact band where the old coupled gate would have wrongly evicted it (intrinsic ≈ 0.85 × 0.11 ≈ 0.094;
-# × 0.4 ≈ 0.037 < the 0.05 floor).
-cs_known = make_session("fr-known", JJ1)
-glean.run([cs_known], GleanFake([JJ1], markers={JJ1: {"surprise": 0.1}}, confidence=0.85, relevance="known"),
-          model="fake", root=R8b)
-# A genuinely low-intrinsic event (no markers, low confidence) — forget SHOULD still evict this one.
+# An above-floor event (intrinsic ≈ 0.85 × 0.11 ≈ 0.094 > the 0.05 floor) and a genuinely sub-floor one.
+cs_keep = make_session("fr-keep", JJ1)
+glean.run([cs_keep], GleanFake([JJ1], markers={JJ1: {"surprise": 0.1}}, confidence=0.85), model="fake", root=R8b)
 cs_low = make_session("fr-low", NIX)
 glean.run([cs_low], GleanFake([NIX], markers={NIX: {}}, confidence=0.1), model="fake", root=R8b)
 
-known_rv = [rv for rv in working_set(R8b) if rv.quote == JJ1][0]
+keep_rv = [rv for rv in working_set(R8b) if rv.quote == JJ1][0]
 low_rv = [rv for rv in working_set(R8b) if rv.quote == NIX][0]
-assert known_rv.event["relevance"] == "known", "the known event stored its verdict (the ×0.4 tier)"
-# the decoupling invariant in numbers: INTRINSIC clears the floor, but `salience` (×0.4) sinks BELOW it —
-# so the OLD `salience`-gated forget would have evicted this event; the intrinsic-gated forget must NOT.
-assert events.intrinsic_salience(known_rv.event) > events.FORGET_SALIENCE_FLOOR > salience(known_rv.event), \
-    (f"known event: intrinsic clears the floor, ×0.4 salience sinks below it — "
-     f"{events.intrinsic_salience(known_rv.event):.4f} / {salience(known_rv.event):.4f}")
-assert events.intrinsic_salience(low_rv.event) < events.FORGET_SALIENCE_FLOOR, "the low event is genuinely sub-floor"
+# relevance is inert: salience is IDENTICAL to intrinsic_salience for every event (no × W_REL term).
+assert salience(keep_rv.event) == events.intrinsic_salience(keep_rv.event), \
+    "ADR-0036: salience == intrinsic_salience (the relevance multiplier is gone)"
+assert events.intrinsic_salience(keep_rv.event) > events.FORGET_SALIENCE_FLOOR > events.intrinsic_salience(low_rv.event), \
+    "the surprise event clears the floor; the throwaway is genuinely sub-floor"
 # age BOTH events past tau cycles (distinct dream-stage decisions with a later 'at').
 for rid in ("fr-1", "fr-2", "fr-3"):
     block.write_processed("dream", "dummy-evt", (("prompt_version", dream.PROMPT_VERSION), ("model", "fake")),
                           n_outputs=0, cost_usd=0.0, run_id=rid, extra={}, root=R8b)
 staled = dream.forget(R8b, tau=2, salience_floor=events.FORGET_SALIENCE_FLOOR, run_id="forget-rel-run")
 assert staled == [low_rv.id], \
-    f"forget gates on INTRINSIC salience: the ×0.4 `known` event survives, only the genuinely-low one stales: {staled}"
-assert known_rv.id in {rv.id for rv in working_set(R8b)}, "relevance ORDERS but never EVICTS — the known event survives"
-print("OK §8b — forget-decoupling: relevance scales salience-ORDER only; forget gates on _intrinsic_salience,")
-print("        so a ×0.4 `known` verdict re-orders an event but never evicts it (relevance orders, never drops).")
+    f"forget gates on the one salience score: only the genuinely-low event stales: {staled}"
+assert keep_rv.id in {rv.id for rv in working_set(R8b)}, "the above-floor event survives forget"
+print("OK §8b — ADR-0036: relevance is inert (salience == intrinsic_salience); no relevance verdict can")
+print("        drive an eviction — forget gates on the one own-value score (above-floor survives).")
 
 
 # === 9. MERGE: maintenance de-dup — winner unions the loser's evidence/sessions; loser leaves catalog =

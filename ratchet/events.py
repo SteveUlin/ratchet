@@ -17,22 +17,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import blobstore, completer, config
-from .glean import MARKER_KINDS, clean_relevance   # the marker + relevance vocab is glean's; events carry it up
+from .glean import MARKER_KINDS   # the marker vocab is glean's; events carry it up
 
 _score = completer.clean_score   # shared untrusted-score hygiene (clamp + scrub NaN/inf)
 
 # Salience weights: surprise highest — a corrective/failure signal is the highest-value cue (ADR-0010 §8).
 W_SURPRISE, W_INSIGHT, W_RESEARCH, EPS = 1.0, 0.7, 0.5, 0.01
 
-# Relevance multipliers (4b/ADR-0019): glean's Bayesian-surprise-vs-the-store verdict SCALES salience so
-# the queue drains NOVEL/CONTRADICTING events first and ALREADY-KNOWN ones last. RECALL-FIRST — `known`
-# only SINKS (deferred under budget), it never hard-drops; the invisible false-negative (silently dropping
-# a learning we wrongly called known) is the costly error (ADR-0005). `novel` is the NEUTRAL ×1.0 default,
-# so a pre-4b event with no relevance field — coerced to `novel` — keeps its EXACT prior salience (the
-# 4b change perturbs only events glean marked `known`/`contradicts`). `contradicts` boosts highest: a
-# belief change is the most valuable to surface, the cheap-early echo of dream's precise LATE weaken
-# judgment (ADR-0012). Untuned, like every weight here — pending a gold set.
-W_REL = {"contradicts": 1.5, "novel": 1.0, "known": 0.4}
+# No relevance multiplier (ADR-0036): salience is the event's OWN durable-value, blind to the store.
+# glean's per-event novelty verdict (4b/ADR-0019) once scaled this to drain novel-first and sink `known`
+# — but sinking a `known` re-occurrence starved the very corroboration that matures a claim. Novelty now
+# lives only in resolve (ADR-0028); `salience` == `intrinsic_salience` again.
 
 FORGET_TAU = 4                           # consolidator cycles (dream/resolve runs) an event may sit
                                          # un-consolidated before forget-eligible
@@ -154,12 +149,11 @@ def event_born_map(root: Path | None = None) -> dict[str, str | None]:
 # --- salience: the priority-queue score (pure, stdlib) --------------------------------------------
 
 def intrinsic_salience(event: dict) -> float:
-    """The relevance-FREE salience: confidence × weighted marker mass (with its +EPS floor) — the event's
-    OWN durable-value score, no novelty term. Surprise weighed highest among markers — a corrective/failure
-    signal is the highest-value cue (ADR-0010 §8). Each untrusted field is scrubbed through `clean_score`.
-    This is the pre-4b salience; `salience` scales it by relevance to order the QUEUE, but `forget` gates
-    eviction on THIS — so a `known` verdict (×0.4) can re-ORDER an event yet never EVICT it. Relevance
-    orders, it never drops (recall-first; the ADR-0019 invariant)."""
+    """The event's OWN durable-value salience: confidence × weighted marker mass (with its +EPS floor),
+    no novelty term. Surprise weighed highest among markers — a corrective/failure signal is the
+    highest-value cue (ADR-0010 §8). Each untrusted field is scrubbed through `clean_score`. Since
+    ADR-0036 this IS `salience` (the relevance multiplier is gone); `forget` keeps naming this score, so
+    eviction stays pinned to an event's own value, independent of any future queue-ordering term."""
     conf = _score(event.get("confidence"), 0.5)
     m = event.get("markers") or {}
     return conf * (W_SURPRISE * _score(m.get("surprise")) + W_INSIGHT * _score(m.get("insight"))
@@ -167,16 +161,17 @@ def intrinsic_salience(event: dict) -> float:
 
 
 def salience(event: dict) -> float:
-    """A pure score of an un-consolidated event for the priority QUEUE: `intrinsic_salience` × the
-    RELEVANCE multiplier. The relevance term (4b/ADR-0019) is glean's novelty-vs-the-store verdict:
-    `contradicts`/`novel` BOOST (drain first), `known` SINKS (deferred under budget) — RECALL-FIRST, so
-    `known` only reorders, it never hard-drops, and a missing field coerces to `novel` (×1.0), never
-    sinking an event on doubt. Relevance scales the queue ORDER ONLY — NOT the forget gate: `forget` reads
-    `intrinsic_salience`, so a `known` verdict can never DRIVE an eviction (a pre-4b event reads novel×1.0
-    → salience == intrinsic, byte-identical). The recurrence bonus (does the event already match a catalog
-    takeaway) is DEFERRED. The blocks' `priority` delegates here."""
-    rel = W_REL[clean_relevance(event.get("relevance"))]   # missing/unknown → novel (×1.0): never sink on doubt
-    return intrinsic_salience(event) * rel
+    """The priority-QUEUE score of an un-consolidated event — now IDENTICAL to `intrinsic_salience`
+    (ADR-0036 removed the relevance multiplier). WHY the term is gone: relevance was glean's
+    novelty-vs-the-GLOBAL-store verdict (4b/ADR-0019), and sinking `known` events was in direct
+    conflict with corroboration. A lesson recurring in a DISTINCT session is exactly what matures a
+    claim — but glean, primed with the global digest, marked that re-occurrence `known`, salience sank
+    it, and under any budget cap it never reached resolve, so the corroboration never happened. Novelty
+    against the store belongs in ONE place — resolve's statement-first matching (ADR-0028), which USES
+    the re-occurrence to corroborate rather than suppressing it — never in the per-chunk extraction's
+    queue order. Reading `relevance` off old events is dropped here (the field lingers on pre-0036 blobs,
+    harmlessly ignored). The blocks' `priority` delegates here; `forget` already read `intrinsic_salience`."""
+    return intrinsic_salience(event)
 
 
 def event_markers(event: dict) -> dict:

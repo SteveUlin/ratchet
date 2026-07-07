@@ -42,7 +42,7 @@ ratchet weave --all --limit 500   # raw transcript → one clean, speaker-tagged
 ratchet chunk --all --limit 500   # → windowed chunksets (pointers, not copies)
 ```
 
-**3 · Glean** — cheap LLM; extract durable events. Novelty-aware: novel/contradicting score high, already-known sinks. Each event is stamped with a subject key + statement signature (deterministic, free) — the raw material resolve matches on.
+**3 · Glean** — cheap LLM; extract durable events. **Blind (ADR-0036):** glean sees the excerpt and its structural cues, nothing about the concept layer — it is a pure function of the chunk. Novelty-vs-the-store is resolve's job (ADR-0028), which USES a re-occurrence to corroborate; judging it here (the old digest + `relevance` verdict) sank recurring lessons in the queue and starved that corroboration. Each event is stamped with a subject key + statement signature (deterministic, free) — the raw material resolve matches on.
 
 ```
 ratchet glean --all --limit 1000 --max-usd 5
@@ -50,15 +50,7 @@ ratchet glean --all --source ratchet --limit 500   # focus one project
 ratchet glean --all --max-usd 5 --parallel 2       # stepping away? overlap 2-3 calls — the token bucket is SHARED with your interactive session, so this buys latency, not capacity
 ```
 
-**Cost — the fixed payload and warm-base (ADR-0035).** Every glean call is a fresh `claude -p`; a large FIXED payload (the concept digest + tool schemas) rode each one — ~9× the visible content, measured. The slim tool-less flags ship by default. **Warm-base is now the DEFAULT (2026-07-06):** glean seats the digest in a shared base ONCE per tick and forks each chunk off it, so the digest is sent once (cache-read per fork), not re-sent per chunk. `--no-warm-base` forces the legacy oneshot path. The digest is ratchet's own reviewed concepts and never enters evidence (copied bytes), so relocating it changes cost, not trust.
-
-```
-ratchet glean --all --limit 200                     # warm-base by default (done-key glean/5-fork)
-ratchet glean --all --limit 200 --no-warm-base      # the legacy oneshot path (glean/4), for an A/B baseline
-ratchet glean --pilot-report                        # $0: fold every marker into the fork-vs-oneshot verdict
-```
-
-**Pilot method — `--pilot-report` (ADR-0035).** `--pilot-report` folds all glean markers into fork-vs-oneshot cohorts and leads with the **PAIRED yield** — chunks gleaned BOTH ways (a fork re-gleans a chunk under its own done-key), so the events/chunk delta is variance-free, the trustworthy signal. It also gives the cross-sectional view stratified by structural score (correcting the greedy-drain confound), the `input`→`cache_read` token shift (the mechanism), and a clause-by-clause verdict. **Reading the yield honestly:** warm-base extracts FEWER events/chunk, which is the digest ("what we already know") suppressing re-extraction of known lessons — GOOD filtering, not lost recall, *unless the dropped events are novel*. So the metric that matters is **novel events per chunk** (events that resolve to NEW claims), not raw count. The real cost unit is **chunks per rate-limit window** (the token bucket is shared with your session). Two caveats the report prints: the once-per-tick warm-base call writes no marker (fork cost/chunk optimistic on small ticks), and a fork error writes no marker (read `errored` from the run summary). Warm-base is the default now; `--no-warm-base` reruns the baseline if you want fresh A/B data.
+**Cost (ADR-0035, surviving 0036).** Every glean call is a fresh `claude -p`. The slim TOOL-LESS flags (R1) ship by default — no tool schemas, MCP, slash-command, or hook payload on a pure text→JSON call. The cache instrumentation (R0) stays too: the run summary's `cache r/w` figure and the per-chunk markers report whether the CLI's cross-invocation prompt cache actually fires — measured, never assumed. (The warm-base fork and `--pilot-report` are GONE with 0036: their only purpose was amortizing the concept digest, and a blind glean has no digest to amortize.) The `glean/5` version bump re-opens frozen chunks for OPTIONAL blind re-glean — forward-only and budgeted; old glean/4 events stay valid until you spend on a re-glean, and a blind re-glean may RECOVER events the digest once suppressed as "known". The real cost unit is **chunks per rate-limit window** (the token bucket is shared with your interactive session).
 
 **4 · Resolve** — match or mint, per event; run it **often**. Statement-first entity resolution (ADR-0028): deterministic signals REJECT at $0 — the non-match mass costs nothing — and acceptance is ONE bounded comparative-with-none Haiku call over an event's residue candidates. No match → the event seeds a new claim on the spot (title = its summary, prose deferred). Every merge persists its match key, so review can audit exactly what the model saw.
 
