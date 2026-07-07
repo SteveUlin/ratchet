@@ -773,6 +773,34 @@ except ValueError:
     pass
 
 print("OK — warm-base (ADR-0035): the digest warms ONE shared base per tick; each fork carries its chunk")
+
+
+# --- 8g. the pilot report (ADR-0035): the warm-base A/B folded from stored markers, $0 -----------
+# The store now holds BOTH cohorts over cs_w (glean/5-fork markers from wblk, glean/4 from the oneshot
+# re-runs), so pilot_report separates them, joins each to its chunk's structural score, and verdicts.
+
+# structural_score is pointer-only + date-blind: a user turn dominates, compact is excluded from
+# diversity, no clock is read (the covariate the report stratifies on must be stable + mode-independent).
+from ratchet.chunk import Chunk  # noqa: E402
+rich = Chunk(cleaned_hash="x", byte_start=0, byte_end=1, turn_start=0, turn_end=4, segment=0,
+             kinds=["user", "assistant"])
+poor = Chunk(cleaned_hash="x", byte_start=0, byte_end=1, turn_start=0, turn_end=1, segment=0,
+             kinds=["assistant"])
+compact = Chunk(cleaned_hash="x", byte_start=0, byte_end=1, turn_start=0, turn_end=1, segment=0,
+                kinds=["assistant", "compact"])
+assert glean.structural_score(rich) > glean.structural_score(poor), "a user turn + diversity outscores a monologue"
+assert glean.structural_score(compact) == glean.structural_score(poor), "compact adds NO diversity (measured exclusion)"
+
+rep = glean.pilot_report(config.data_root())
+assert rep["fork"]["n"] == w_signal, f"the fork cohort = the warm markers ({w_signal}), by glean/5-fork version"
+assert rep["oneshot"]["n"] >= w_signal, "the oneshot cohort collects the glean/4 re-runs over the same chunks"
+assert rep["fork"]["cache_read"] == 4096, "fork cohort carries the per-chunk cache_read the markers recorded"
+assert rep["oneshot"]["cache_read"] == 0, "the oneshot fake reported no cache reads (fresh input every call)"
+# the decision rule is legible clause-by-clause; with 1 fork chunk it fails the count gate, verdict = keep.
+assert rep["checks"]["enough_fork"] is False and rep["flip_to_default"] is False, \
+    "under the fork-count floor the rule refuses to flip the default (ADR-0027 legibility)"
+assert isinstance(glean._render_pilot(rep), str) and "VERDICT" in glean._render_pilot(rep), "the render is wrap-safe text"
+print("OK — pilot report (ADR-0035): fork/oneshot folded from markers, stratified by structural score, verdict legible")
 print("     alone; oneshot unchanged (digest per turn); done-keys distinct (glean/5-fork); cache fields flow.")
 
 

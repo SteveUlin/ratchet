@@ -458,6 +458,27 @@ def chunk_key(ch: chunk.Chunk) -> str:
         f"{ch.cleaned_hash}:{ch.byte_start}:{ch.byte_end}:chunk".encode()).hexdigest()[:16]
 
 
+def structural_score(ch: chunk.Chunk) -> float:
+    """The pointer-only, DATE-BLIND salience of a chunk — `has_user + diversity + interaction`, the
+    part of `priority()` that is a pure function of the chunk BOUNDARY (never a content read, never a
+    clock). Single-sourced here so the queue's ordering and the pilot report's STRATIFICATION covariate
+    are the identical number: the report corrects the greedy-drain confound (fork chunks glean LATER,
+    so they are structurally poorer on average) by comparing fork-vs-oneshot yield WITHIN score bands,
+    and that only holds if the band is the same signal the drain ordered by. Recency is deliberately
+    excluded — it drifts with wall-clock, so a stored marker's chunk would re-bucket over time; the
+    structural part is stable for the life of the frozen chunkset."""
+    kinds = set(ch.kinds or [])
+    has_user = 2.0 if "user" in kinds else 0.0
+    # `compact` is EXCLUDED from diversity — measured, not guessed (2026-07-04, the 317-chunk glean/4
+    # cohort): compact-segment chunks yielded HALF the events of their score-mates with 20% zeros,
+    # because a compaction summary is a RETELLING of already-compressed material — the durable lessons
+    # live in the original exchanges, and rewarding the kind's presence actively mis-ranked (score 4.5
+    # compact chunks under-yielded 4.0 plain ones, Spearman −0.32).
+    diversity = 0.5 * len(kinds - {"compact"})
+    interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
+    return has_user + diversity + interaction
+
+
 class GleanBlock:
     """glean as a `block.Block` — the per-chunk LLM extract stage (ADR-0009). `items()` enumerates the
     target chunksets exactly as the old `run` did, then EXPLODES each into its chunks; `process()`
@@ -654,15 +675,6 @@ class GleanBlock:
         an item with no usable stamp earns NO bonus rather than the age-0 maximum (see below).
         W_RECENT = 0 restores the pure-structural score."""
         ch = item.chunk
-        kinds = set(ch.kinds or [])
-        has_user = 2.0 if "user" in kinds else 0.0
-        # `compact` is EXCLUDED from diversity — measured, not guessed (2026-07-04, the 317-chunk
-        # glean/4 cohort): compact-segment chunks yielded HALF the events of their score-mates with
-        # 20% zeros, because a compaction summary is a RETELLING of already-compressed material —
-        # the durable lessons live in the original exchanges, and rewarding the kind's presence
-        # actively mis-ranked (score 4.5 compact chunks under-yielded 4.0 plain ones, Spearman −0.32).
-        diversity = 0.5 * len(kinds - {"compact"})
-        interaction = 0.1 * min(ch.turn_end - ch.turn_start, 10)
         if ch.cleaned_hash not in self._vt_cache:
             self._fill_stamps(ch.cleaned_hash)
         # Pick the material's date by the RECENT_CLOCK policy: the conversation's own date when the
@@ -679,7 +691,7 @@ class GleanBlock:
         else:                                          # "valid-then-arrival" (default)
             stamp = self._vt_cache[ch.cleaned_hash] or self._age_cache[ch.cleaned_hash]
         recency = W_RECENT * 0.5 ** (config.age_days(stamp) / RECENT_HALF_LIFE_DAYS) if stamp else 0.0
-        return has_user + diversity + interaction + recency
+        return structural_score(ch) + recency
 
     def _fill_stamps(self, cleaned_hash: str) -> None:
         """Fill BOTH stamp caches for one cleaned blob in ONE lineage hop. The cleaned blob is a render —
@@ -918,6 +930,179 @@ def all_chunksets(root: Path | None = None) -> list[str]:
             if m.get("format") in chunk.CHUNKSET_FORMATS]
 
 
+# --- the warm-base A/B pilot report (ADR-0035): $0, marker-derived, iterative --------------------
+#
+# The measurement principle (sulin, 2026-07-06): the BACKLOG DRAIN *is* the experiment — we never
+# re-glean a chunk to measure. Every fork-mode tick is real forward progress whose stored markers
+# also answer "is warm-base winning?". The confound the report must correct: greedy priority drains
+# the richest chunks first, so chunks gleaned LATER (the fork cohort, added after the oneshot
+# baseline) are structurally poorer — a raw yield comparison would blame warm-base for the queue
+# order. The fix is stratification by `structural_score` (the same pointer-only signal the drain
+# ordered by), comparing cohorts WITHIN a band and standardizing to the fork cohort's distribution.
+
+# Score bands for stratification — the covariate axis. Boundaries track the priority signal's natural
+# steps: 2.0 is "a user turn is present" (the dominant term), so <2 = no user turn (tool monologues),
+# 2–3 = user turn + thin exchange, 3+ = user turn + real diversity/interaction (the rich tail).
+PILOT_BANDS = ((0.0, 2.0), (2.0, 3.0), (3.0, 99.0))
+
+# The decision rule (ADR-0035) — flip `--warm-base` to default only when ALL hold. Named so the
+# verdict is legible and the bar is a knob, not a hidden constant (ADR-0027).
+PILOT_MIN_FORK = 50          # enough fork chunks that band ratios aren't single-digit noise (~3 ticks)
+PILOT_YIELD_FLOOR = 0.85     # stratum-adjusted fork/oneshot events-per-chunk must clear this (≤15% loss)
+PILOT_COST_CEIL = 0.70       # fork cost/chunk must be ≤ this × oneshot's (the mechanical caching win)
+
+
+def _marker_cohort(prompt_version: str) -> str | None:
+    """Which A/B arm a glean marker belongs to, read from its `prompt_version` param (the done-key
+    field the two paths already separate on). Fork vs oneshot over TRANSCRIPT chunks only — document
+    chunks (their own version) are a different yield regime with no fork counterpart yet, so they are
+    excluded from the A/B rather than pooled into it (they'd bias whichever arm holds more of them)."""
+    if prompt_version == FORK_PROMPT_VERSION:
+        return "fork"
+    if prompt_version == PROMPT_VERSION:
+        return "oneshot"
+    return None                                   # document / unknown version → out of the A/B
+
+
+def pilot_report(root: Path | None = None) -> dict:
+    """Fold every glean `processed` marker into the warm-base fork A/B — $0, reads only stored markers
+    and chunk POINTERS, never the LLM (the drain already paid for the data). Returns a dict the CLI
+    renders: per-cohort totals, a per-band breakdown, the stratum-adjusted yield ratio, and the verdict
+    against the decision rule. The token fields (`input` vs `cache_read`) are the MECHANISM — warm-base
+    is meant to shift the fixed payload out of every chunk's fresh input into a once-written base the
+    forks read cheaply — so they are shown beside cost, which already applies the price discounts."""
+    root = root or config.data_root()
+    # key → structural_score, over every frozen chunk in the store. One pass; pointer-only (no content
+    # read), so joining a marker to its covariate costs nothing the drain didn't already compute.
+    score_by_key: dict[str, float] = {}
+    for cs in all_chunksets(root):
+        for ch in chunk.load(cs, root):
+            score_by_key[chunk_key(ch)] = structural_score(ch)
+
+    def band_of(score: float | None) -> str:
+        if score is None:
+            return "unknown"                      # marker whose chunk is gone (re-chunked/pruned) — kept visible
+        for lo, hi in PILOT_BANDS:
+            if lo <= score < hi:
+                return f"{lo:g}-{hi:g}" if hi < 99 else f"{lo:g}+"
+        return "unknown"
+
+    # Accumulate per (cohort, band): n, events, cost, and the token mechanism.
+    def _acc() -> dict:
+        return {"n": 0, "events": 0, "zero": 0, "cost": 0.0,
+                "input": 0, "cache_read": 0, "cache_creation": 0, "output": 0}
+    cells: dict[tuple[str, str], dict] = {}
+    seen_keys: set[tuple[str, str, str]] = set()  # (cohort, target, model) — latest marker per done-key wins
+    for b in blobstore.decisions_for(None, root, verb="processed", stage="glean"):
+        pv = b.get("prompt_version") or dict(b.get("params") or []).get("prompt_version")
+        cohort = _marker_cohort(str(pv))
+        if cohort is None:
+            continue
+        target = b.get("target")
+        model = b.get("model") or ""
+        dk = (cohort, str(target), str(model))
+        if dk in seen_keys:                       # a re-run re-writes the marker; count each done-key ONCE
+            continue
+        seen_keys.add(dk)
+        band = band_of(score_by_key.get(str(target)))
+        cell = cells.setdefault((cohort, band), _acc())
+        n_ev = int(b.get("n_events", b.get("n_outputs", 0)) or 0)
+        cell["n"] += 1
+        cell["events"] += n_ev
+        cell["zero"] += 1 if n_ev == 0 else 0
+        cell["cost"] += float(b.get("cost_usd", 0.0) or 0.0)
+        for f in ("input", "cache_read", "cache_creation", "output"):
+            cell[f] += int(b.get(f + ("_tokens" if f in ("input", "output") else ""), 0) or 0)
+
+    def cohort_totals(cohort: str) -> dict:
+        t = _acc()
+        for (co, _band), c in cells.items():
+            if co == cohort:
+                for k in t:
+                    t[k] += c[k]
+        return t
+    fork_t, one_t = cohort_totals("fork"), cohort_totals("oneshot")
+
+    # Stratum-adjusted yield ratio: fork vs oneshot events/chunk WITHIN each band, weighted by the
+    # FORK cohort's n in that band (direct standardization to the fork chunks' score distribution) —
+    # so the number answers "at equal chunk quality, how does fork yield compare?", not "did fork
+    # happen to draw poorer chunks?". Only bands where BOTH arms have data contribute.
+    num = den = 0.0
+    per_band = []
+    for lo, hi in PILOT_BANDS:
+        band = f"{lo:g}-{hi:g}" if hi < 99 else f"{lo:g}+"
+        f, o = cells.get(("fork", band)), cells.get(("oneshot", band))
+        row = {"band": band,
+               "fork": (f["n"], f["events"] / f["n"], f["cost"] / f["n"]) if f and f["n"] else None,
+               "oneshot": (o["n"], o["events"] / o["n"], o["cost"] / o["n"]) if o and o["n"] else None}
+        per_band.append(row)
+        if f and o and f["n"] and o["n"] and o["events"]:
+            fork_ypc, one_ypc = f["events"] / f["n"], o["events"] / o["n"]
+            num += f["n"] * (fork_ypc / one_ypc)
+            den += f["n"]
+    adj_yield = (num / den) if den else None
+
+    def per_chunk(t: dict) -> dict:
+        n = t["n"] or 1
+        return {"n": t["n"], "cost": t["cost"] / n, "events": t["events"] / n,
+                "zero_rate": t["zero"] / n, "input": t["input"] / n,
+                "cache_read": t["cache_read"] / n, "cache_creation": t["cache_creation"] / n}
+    fork_pc, one_pc = per_chunk(fork_t), per_chunk(one_t)
+    cost_ratio = (fork_pc["cost"] / one_pc["cost"]) if one_pc["cost"] else None
+
+    # The verdict — each clause of the rule, so a FAIL says which bar it missed (ADR-0027 legibility).
+    checks = {
+        "enough_fork": fork_t["n"] >= PILOT_MIN_FORK,
+        "yield_holds": adj_yield is not None and adj_yield >= PILOT_YIELD_FLOOR,
+        "cost_wins": cost_ratio is not None and cost_ratio <= PILOT_COST_CEIL,
+    }
+    return {"fork": fork_pc, "oneshot": one_pc, "per_band": per_band,
+            "adjusted_yield_ratio": adj_yield, "cost_ratio": cost_ratio,
+            "checks": checks, "flip_to_default": all(checks.values())}
+
+
+def _render_pilot(rep: dict) -> str:
+    """The pilot report as a wrap-safe block: cohort headline, per-band table, verdict. Errored chunks
+    write NO marker (ADR-0009 per-chunk retry), so fork RELIABILITY is not reconstructable here — it is
+    read from the run summaries' `errored` count; the report says so rather than implying 100%."""
+    f, o = rep["fork"], rep["oneshot"]
+    lines = ["warm-base fork A/B (ADR-0035) — $0, from stored markers; drain IS the experiment", ""]
+    lines.append(f"  {'cohort':8}  {'n':>4}  {'cost/ch':>8}  {'ev/ch':>6}  {'zero%':>6}  "
+                 f"{'input':>7}  {'cacheR':>7}  {'cacheW':>7}")
+    for name, c in (("oneshot", o), ("fork", f)):
+        lines.append(f"  {name:8}  {c['n']:>4}  {c['cost']:>8.4f}  {c['events']:>6.2f}  "
+                     f"{c['zero_rate']*100:>5.0f}%  {c['input']:>7.0f}  {c['cache_read']:>7.0f}  "
+                     f"{c['cache_creation']:>7.0f}")
+    lines += ["", "  by structural-score band (fork n · ev/ch · cost/ch  vs  oneshot):"]
+    for row in rep["per_band"]:
+        def fmt(t):
+            return f"{t[0]:>3} · {t[1]:.2f} · {t[2]:.4f}" if t else f"{'—':>16}"
+        lines.append(f"    {row['band']:>5}   fork {fmt(row['fork'])}   one {fmt(row['oneshot'])}")
+    ay = rep["adjusted_yield_ratio"]
+    cr = rep["cost_ratio"]
+    lines += ["",
+              f"  stratum-adjusted yield ratio (fork/oneshot): "
+              f"{ay:.2f}" if ay is not None else "  stratum-adjusted yield ratio: (no overlapping bands yet)",
+              f"  cost ratio (fork/oneshot): {cr:.2f}" if cr is not None else "  cost ratio: (no oneshot data)"]
+    ck = rep["checks"]
+    def mark(b): return "✓" if b else "✗"
+    lines += ["", "  decision rule (ADR-0035):",
+              f"    {mark(ck['enough_fork'])} ≥{PILOT_MIN_FORK} fork chunks (have {rep['fork']['n']})",
+              f"    {mark(ck['yield_holds'])} adjusted yield ≥ {PILOT_YIELD_FLOOR}",
+              f"    {mark(ck['cost_wins'])} cost ratio ≤ {PILOT_COST_CEIL}",
+              "",
+              ("  VERDICT: flip --warm-base to default — the rule is met." if rep["flip_to_default"]
+               else "  VERDICT: keep gathering — run more --warm-base ticks (reliability: read `errored` "
+                    "from run summaries; a fork error writes no marker)")]
+    if rep["fork"]["n"]:
+        lines += ["",
+                  "  caveats: (1) the once-per-tick warm-base CALL writes no chunk marker, so fork "
+                  "cost/ch is optimistic — it amortizes toward 0 on big ticks, inflates small ones; "
+                  "(2) stratification only corrects the drain confound once chunks span BANDS — while "
+                  "every gleaned chunk sits in one band, the raw and adjusted ratios coincide."]
+    return "\n".join(lines)
+
+
 def chunkset_for_source(source_id: str, root: Path | None = None) -> str | None:
     """The chunkset of a logical source's latest snapshot: raw → cleaned → chunkset, all by sidecar
     scan (no re-fetch, no re-render). None if `chunk` hasn't materialized one yet."""
@@ -985,7 +1170,18 @@ def main(argv=None) -> None:
                          "FIRST — compare marker input vs cache tokens and chunks-per-tick before flipping "
                          "any default (ADR-0027 spirit). Runs under a distinct done-key (glean/5-fork), so "
                          "it never touches the oneshot glean/4 markers")
+    ap.add_argument("--pilot-report", action="store_true",
+                    help="read-only: fold every stored glean marker into the warm-base fork A/B "
+                         "(ADR-0035) — per-cohort cost/yield, stratified by structural score (corrects "
+                         "the greedy-drain confound), and the flip-to-default verdict. $0, no LLM; the "
+                         "drain already paid for the data. Ignores the target selectors")
+    ap.add_argument("--json", action="store_true", help="machine-readable output (with --pilot-report)")
     args = ap.parse_args(argv)
+
+    if args.pilot_report:                         # store-wide A/B read — ignores the target selectors,
+        rep = pilot_report(config.ensure_layout())    # reads every glean marker (ADR-0035); $0, no LLM
+        print(json.dumps(rep, ensure_ascii=False, indent=2) if args.json else _render_pilot(rep))
+        return
 
     # Resolve the target chunksets (the enumeration containers); items() explodes them into chunks.
     if args.all:

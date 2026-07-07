@@ -122,6 +122,21 @@ the digest once per tick.**
   — exactly the `self_name` `tap.discover` drops (`name == self_name or name.startswith(self_name + "-")`).
   Fork mode multiplies the session-JSONL count, but they all fall in the one skipped project dir, so tap
   never re-ingests its own extraction runs. No change to tap needed; `--include-self` still lifts the skip.
-- Deferred: flipping `--warm-base` on by default (awaits the pilot); a per-source-kind warm base beyond
-  the current per-mode split; the Batch API binding (API-key surface, ADR-0004's backlog); folding the
-  warm base's own cost into the budget gate (bounded per-tick, measured separately for now).
+- **`glean --pilot-report` — the drain IS the experiment.** No chunk is ever re-gleaned to measure:
+  every `--warm-base` tick is real forward progress, and its markers also feed a $0 read that folds all
+  glean markers into fork-vs-oneshot cohorts. The confound it must correct is the greedy drain (richest
+  chunks first, so the fork cohort — added after the oneshot baseline — is structurally poorer); the fix
+  is stratification by `structural_score` (extracted as the shared pointer-only, date-blind part of
+  `priority()`, so the report's covariate is literally the signal the queue ordered by) and direct
+  standardization to the fork cohort's band distribution. The flip-to-default rule is three named,
+  legible knobs (ADR-0027): `PILOT_MIN_FORK=50` (band ratios stop being single-digit noise),
+  `PILOT_YIELD_FLOOR=0.85` (adjusted fork yield within ≤15% of oneshot), `PILOT_COST_CEIL=0.70` (the
+  mechanical caching win shows in cost/chunk). The report prints two honest caveats: the warm-base call
+  writes no marker (fork cost/chunk optimistic on small ticks) and a fork error writes no marker
+  (reliability reads from run summaries). First read (n=9 fork, 2026-07-06): all chunks land in one score
+  band so stratification is not yet correcting anything, within-band fork yield trails oneshot (1.78 vs
+  2.98) but far below the count floor — verdict correctly "keep gathering."
+- Deferred: flipping `--warm-base` on by default (awaits the pilot's rule tripping); a per-source-kind
+  warm base beyond the current per-mode split; the Batch API binding (API-key surface, ADR-0004's
+  backlog); folding the warm base's own cost into the budget gate + its own marker (bounded per-tick,
+  measured separately for now, so the pilot's cost/chunk is currently fork-optimistic).
