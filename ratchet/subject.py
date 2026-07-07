@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 
 from . import blobstore, concepts
-from .weave import active_path, parse
+from .weave import DOC_RENDER_FORMAT, active_path, parse
 
 # The narrowing window: bytes either side of the event's evidence span within which a write-tool
 # line counts as CO-LOCATED (§3.0). The principle: a lesson's subject is its OWN nearby writes,
@@ -95,6 +95,12 @@ def _blob_entry(cleaned_hash: str, root: Path) -> dict:
     m = blobstore.raw_meta_of(cleaned_hash, root)
     repo = concepts.repo_label(m.get("origin_ref") or {}) if m else None
     raw = m.get("content_hash") if m else None
+    # A DOCUMENT render (tap --file/--url, ADR-0031/0033) is NOT a coding session: it has no
+    # edited-files union, and its raw is prose/HTML, not transcript JSONL. Read the cleaned blob's
+    # OWN format to skip the transcript re-parse — running it on document text is meaningless AND
+    # fragile (a bare-number line json-parses to an int that `active_path` then `.get`s → crash).
+    cm = blobstore.get_meta(cleaned_hash, root)
+    is_document = bool(cm and cm.get("format") == DOC_RENDER_FORMAT)
     writes: list[tuple[int, int, str]] = []
     nbytes = 0
     try:
@@ -102,19 +108,23 @@ def _blob_entry(cleaned_hash: str, root: Path) -> dict:
         writes, nbytes = _write_lines(data), len(data)
     except (FileNotFoundError, OSError):
         pass
-    return {"repo": repo, "raw": raw, "writes": writes, "nbytes": nbytes, "union": None}
+    return {"repo": repo, "raw": raw, "writes": writes, "nbytes": nbytes,
+            "union": None, "is_document": is_document}
 
 
 def _session_union(entry: dict, root: Path) -> list[str]:
     """The whole-session files union — `concepts.session_facts` over the raw re-parse, the §3.0
-    FALLBACK. Computed once per blob (memoized on the entry) and only when some event needs it."""
+    FALLBACK. Computed once per blob (memoized on the entry) and only when some event needs it.
+    A DOCUMENT source has no such union (not a session) → []. And the union is an ADVISORY fallback
+    (subject_key: 'never wrongly empty'; this module is 'never fatal'), so ANY parse failure over a
+    foreign/legacy raw shape degrades to [] rather than crashing the event."""
     if entry["union"] is None:
         files: list[str] = []
-        if entry["raw"]:
+        if entry["raw"] and not entry.get("is_document"):
             try:
                 files = concepts.session_facts(
                     active_path(parse(blobstore.get(entry["raw"], root))))["files_edited"]
-            except (FileNotFoundError, OSError):
+            except Exception:                        # advisory fallback: a bad parse → empty, never fatal
                 files = []
         entry["union"] = files
     return entry["union"]

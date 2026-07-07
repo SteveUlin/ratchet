@@ -147,6 +147,23 @@ assert k3 == {"repo": None, "files": []}, f"a Read/Bash-only session writes noth
 assert subject.is_empty(k3), "no repo + no files → empty subject (seed-only in resolve, §3.1)"
 
 
+# === (d) a DOCUMENT source (tap --file/--url) has no session-file union — and never crashes ========
+# Regression (ADR-0031/0033): subject_key once ran the TRANSCRIPT parser on a document's raw text.
+# A document line that is a bare JSON scalar (a number, e.g. an HTTP "429" in a fetched page) parsed
+# to an int, which `active_path` then `.get`s → AttributeError crashing the glean chunk. A document
+# is not a coding session: its union must be [] via the format gate, never a raw re-parse.
+doc_raw = "raw fetched page\n429\ntrailing\n"            # the bare "429" line is the parse trap
+doc_cleaned = "Prefer jj over git.\n429\nUse fish, not bash.\n"    # the extracted text (distinct bytes)
+raw_h, _ = blobstore.ingest(doc_raw, source_kind="document", source_id="doc-src",
+                            origin_ref={"kind": "url", "url": "https://x/y"})
+cleaned_h, _ = blobstore.put_derived(doc_cleaned, source_kind="document", derived_from=raw_h,
+                                     produced_by="weave", render_version="weave/1",
+                                     fmt=weave.DOC_RENDER_FORMAT)
+span = (0, len("Prefer jj over git.".encode()))
+kd = subject.subject_key(R, cleaned_h, span)          # must NOT raise on the raw's bare-number line
+assert kd["files"] == [], f"a document has no edited-files union (format-gated, no raw re-parse): {kd}"
+
+
 # === (e) subject_overlap: W_FILE per shared file + W_REPO for a shared repo; tools weigh 0 =========
 
 W_FILE, W_REPO = concepts.W_FILE, concepts.W_REPO
