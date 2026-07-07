@@ -765,10 +765,20 @@ assert owner_w["cache_creation"] == 0 and "input_tokens" in owner_w, "the token/
 assert wblk.cache_read == 4096 * w_signal, "the run tallies cache_read across every fork"
 assert wblk.cache_creation == 0, "no cache-creation on the fork calls in this fake"
 
-# the refusal (ADR-0027): warm_base against a completer with no .warm/.fork raises, loudly, at construction.
+# the DEFAULT (ADR-0035, flipped on 2026-07-06): warm_base=None auto-detects the completer's capability —
+# ON for a session-capable seam (the real CLI), OFF for a plain oneshot seam, so nothing breaks either way.
+assert glean.GleanBlock(WarmFake([]), model="x", targets=[]).warm_base is True, \
+    "a session-capable completer defaults to warm-base ON (the flipped default)"
+assert glean.GleanBlock(FakeCompleter([]), model="x", targets=[]).warm_base is False, \
+    "a plain oneshot completer auto-falls-back to oneshot (no break, no raise)"
+assert glean.GleanBlock(WarmFake([]), model="x", targets=[], warm_base=False).warm_base is False, \
+    "--no-warm-base (explicit False) forces oneshot even on a session-capable seam"
+
+# the refusal (ADR-0027): an EXPLICIT warm_base=True against a completer with no .warm/.fork still raises,
+# loudly, at construction — a deliberate request that cannot be honored is an error, not a silent fallback.
 try:
     glean.GleanBlock(FakeCompleter([]), model="x", targets=[], warm_base=True)
-    raise AssertionError("warm_base without a session-capable completer must raise")
+    raise AssertionError("explicit warm_base=True without a session-capable completer must raise")
 except ValueError:
     pass
 

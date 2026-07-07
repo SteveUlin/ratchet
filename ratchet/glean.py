@@ -505,7 +505,7 @@ class GleanBlock:
     def __init__(self, complete: Completer, *, model: str = completer.DEFAULT_MODEL,
                  targets: list[str] | None = None, source_filter: str | None = None,
                  exclude: tuple[str, ...] = (), recent_clock: str = RECENT_CLOCK,
-                 warm_base: bool = False) -> None:
+                 warm_base: bool | None = None) -> None:
         self.complete = complete
         self.model = model
         self._targets = targets   # explicit chunkset list (the bare-hash / shim path); else by source_id
@@ -516,14 +516,20 @@ class GleanBlock:
         if recent_clock not in RECENT_CLOCKS:
             raise ValueError(f"recent_clock must be one of {RECENT_CLOCKS}, got {recent_clock!r}")
         self.recent_clock = recent_clock   # which stamp dates the material (see the RECENT_CLOCK knob)
-        # WARM-BASE FORK MODE (ADR-0035, opt-in): fork each chunk off a shared base carrying the concept
-        # digest ONCE per tick, instead of re-sending the digest in every chunk's oneshot prompt. It needs
-        # a session-capable completer (`.warm`/`.fork`); refuse loudly against a plain oneshot seam rather
-        # than AttributeError deep in process() (ADR-0027 — a knob that binds nothing is a lie).
-        self.warm_base = warm_base
-        if warm_base and not (hasattr(complete, "warm") and hasattr(complete, "fork")):
+        # WARM-BASE FORK MODE (ADR-0035, DEFAULT since 2026-07-06): fork each chunk off a shared base
+        # carrying the concept digest ONCE per tick, instead of re-sending it in every chunk's oneshot
+        # prompt. `warm_base=None` (the default) means AUTO — on when the completer is session-capable
+        # (`.warm`/`.fork`, as the real CLI seam is), off for a plain oneshot seam (test fakes, the
+        # scores path with a non-session stub) so those never break. An EXPLICIT `warm_base=True`
+        # against a non-session seam still refuses loudly rather than AttributeError deep in process()
+        # (ADR-0027 — a knob that binds nothing is a lie); explicit False forces oneshot (`--no-warm-base`).
+        session_capable = hasattr(complete, "warm") and hasattr(complete, "fork")
+        if warm_base is None:
+            warm_base = session_capable
+        elif warm_base and not session_capable:
             raise ValueError("warm_base=True needs a session-capable completer (with .warm/.fork); "
                              "the plain oneshot Completer seam has neither")
+        self.warm_base = warm_base
         self.params: tuple[tuple[str, str], ...] = (
             ("prompt_version", FORK_PROMPT_VERSION if warm_base else PROMPT_VERSION), ("model", model))
         # run-total tallies (instance-scoped; the Report stays uniform). `_tally_lock` guards them
@@ -1193,13 +1199,14 @@ def main(argv=None) -> None:
                          "with arrival as fallback (default — conversation-less sources like fetched "
                          "PDFs/pages are dated by when they were pulled), strict 'valid' (no date, no "
                          "bonus), or 'arrival' (tap date only)")
-    ap.add_argument("--warm-base", action="store_true",
-                    help="OPT-IN cost mode (ADR-0035): fork each chunk off a shared base carrying the "
-                         "concept digest ONCE per tick, instead of re-sending the digest in every chunk's "
-                         "prompt (the large fixed payload that rides every fresh claude -p call). MEASURE "
-                         "FIRST — compare marker input vs cache tokens and chunks-per-tick before flipping "
-                         "any default (ADR-0027 spirit). Runs under a distinct done-key (glean/5-fork), so "
-                         "it never touches the oneshot glean/4 markers")
+    ap.add_argument("--warm-base", action=argparse.BooleanOptionalAction, default=True,
+                    help="cost mode (ADR-0035, DEFAULT ON since 2026-07-06): fork each chunk off a shared "
+                         "base carrying the concept digest ONCE per tick, instead of re-sending the digest "
+                         "in every chunk's prompt (the large fixed payload that rides every fresh claude -p "
+                         "call). The digest is ratchet's OWN reviewed concepts and never enters evidence "
+                         "(copied bytes), so relocating it changes cost, not trust. `--no-warm-base` forces "
+                         "the legacy oneshot path (done-key glean/4); warm runs under glean/5-fork, so the "
+                         "two never touch each other's markers")
     ap.add_argument("--pilot-report", action="store_true",
                     help="read-only: fold every stored glean marker into the warm-base fork A/B "
                          "(ADR-0035) — per-cohort cost/yield, stratified by structural score (corrects "

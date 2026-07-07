@@ -92,10 +92,31 @@ the digest once per tick.**
   structural, not disciplined. The digest is transmitted once (the base) and cache-READ by every fork,
   turning an O(chunks) re-send into O(1)-per-tick + a cheap cache read per chunk.
 
-- **Opt-in until measured (ADR-0027).** The cache economics are a live, subscription-specific empirical
-  question — whether the fork's cache read actually fires, and how the warm base's one-time cost trades
-  against the per-chunk savings. The default MUST NOT flip on a plausible story. `--warm-base` ships off;
-  the R0 instrumentation makes the A/B a direct read of marker input-vs-cache tokens, before vs after.
+- **Shipped opt-in, then DEFAULTED ON (2026-07-06).** The mode shipped off pending the pilot; the R0
+  instrumentation made the A/B a direct read of marker input-vs-cache tokens. The first paired read (9
+  chunks gleaned both ways — the fork re-gleans the same top chunks under its own done-key, so the
+  comparison is variance-free) confirmed the cache reads fire (~5.4k tok/fork read) and surfaced a
+  yield DROP: fork ~0.70× the events/chunk of oneshot. What flipped the default was re-reading that
+  drop, not overriding it: **the digest is literally "what we already know", and fewer extracted events
+  is the digest doing its JOB** — suppressing re-extraction of already-known lessons — not lost recall,
+  UNLESS the dropped events are novel. Warm-base makes the digest more salient (the acknowledged premise
+  of the conversation, cache-resident) than oneshot's append-below-the-excerpt, so better known-lesson
+  suppression is the expected effect. The decision the pilot should gate on is therefore NOVEL events per
+  chunk (events that resolve to NEW claims), not raw events — a metric correction the raw-count pilot
+  motivated. Defaulting on is reversible in one flag (`--no-warm-base`), the cost/rate win is real and
+  measured, and the trust chain is untouched (below). `warm_base=None` auto-detects: on for the
+  session-capable CLI seam, off for a plain oneshot completer, so nothing that lacks `.warm`/`.fork` breaks.
+
+- **The digest is ratchet's OWN reviewed knowledge, and it never enters evidence.** A recurring worry:
+  is seating "what we already know" in every extraction prompt injecting external data? No — the digest
+  is the human-reviewed concept layer this very pipeline produced, and it has ALWAYS ridden the glean
+  prompt (ADR-0019, oneshot appends it per chunk); warm-base only relocates the SAME digest to the base.
+  It is a relevance-SCORING input, not evidence: evidence is bytes the code copies from the chunk by line
+  number (ADR-0026), so the digest physically cannot inject text into what is stored as truth. In fork
+  mode each fork forks the BASE (digest + its own excerpt only) — no other chunk's content is ever in
+  scope, so there is no cross-chunk contamination. The open design question the digest raises — could
+  showing known concepts bias the model toward confirmation and away from contradictions — is a property
+  of ADR-0019, identical in both modes, backstopped by the human gate, and unchanged by this ADR.
 
 - **The tool-less call is safe BECAUSE the pipeline owns all I/O.** Stripping tools is not a
   capability loss — the model was never allowed to act. It points at lines; the code copies the bytes
