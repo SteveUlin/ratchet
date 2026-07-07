@@ -247,6 +247,44 @@ print("OK — glean document mode: doc system prompt + relaxed pre-filter, spans
 print("     construction, DOC_PROMPT_VERSION in producer + done-key, idempotent, --source via path")
 
 
+# --- 4b. glean REFERENCE mode: a fetched --url page is external, NOT owner-authored (ADR-0037) -----
+# The document prompt asserts "rules its owner WROTE" — on a third-party page the model refuses
+# ("this is public docs, not the user's rules"). A --url source (origin_ref carries `url`, not `path`)
+# routes to REFERENCE mode: the same mostly-signal posture, but each event is a CLAIM THE SOURCE MAKES.
+REF_URL = "https://example.com/guide"
+REF_TEXT = ("Prefer composable patterns over frameworks.\n"
+            "Give the model enough tokens to think before it writes.\n" + "detail. " * 40)
+
+
+def fake_fetch(url):
+    return REF_TEXT, {"final_url": url, "content_type": "text/html", "http_status": 200,
+                      "fetched_at": "2026-07-07T00:00:00+00:00"}
+
+
+block.run(tap.TapBlock(urls=(REF_URL,), fetcher=fake_fetch), root=root)
+raw_ref = blobstore.latest_version(REF_URL, root)
+assert raw_ref and blobstore.get_meta(raw_ref)["origin_ref"].get("url") == REF_URL, \
+    "a --url document's origin_ref carries `url` (the external-reference discriminator)"
+block.run(weave.WeaveBlock(), root=root)
+block.run(chunk.ChunkBlock(), root=root)
+cs_ref = glean.chunkset_for_source(REF_URL, root)
+
+fake_ref = FakeCompleter([{"quote": "composable patterns", "summary": "Prefer composable patterns.",
+                           "markers": {"insight": 0.6}, "confidence": 0.8}])
+blk_ref = glean.GleanBlock(fake_ref, model="fake", targets=[cs_ref])
+items_ref = list(blk_ref.items(root))
+assert items_ref and all(it.mode == "reference" for it in items_ref), \
+    "a --url document (origin has `url`) routes to REFERENCE mode, not `document`"
+kref = blk_ref.key(items_ref[0])
+assert kref == f"{glean.chunk_key(items_ref[0].chunk)}:{glean.REF_PROMPT_VERSION}", \
+    "reference done-keys carry glean-ref/1 — independent of the owner-doc glean-doc/2 done-set"
+block.run(blk_ref, progress=None)
+assert set(fake_ref.systems) == {glean.REF_SYSTEM_PROMPT}, \
+    "reference chunks get the EXTERNAL-REFERENCE prompt, never the owner-authored document one"
+print("OK — glean reference mode (ADR-0037): a --url page extracts under REF_SYSTEM_PROMPT with its")
+print("     own glean-ref/1 done-key; owner-authored (--file) stays document mode — no refusal")
+
+
 # --- 5. SESSION IDENTITY end-to-end: one path = one session ------------------------------------
 
 

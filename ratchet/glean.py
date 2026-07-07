@@ -69,6 +69,10 @@ DOC_PROMPT_VERSION = "glean-doc/2"   # DOCUMENT mode's own version knob (ADR-003
                                # doc chunks too; their re-extraction re-ingests byte-identically, so a
                                # transcript prompt bump wastes a few LLM calls on the (small) document
                                # corpus, never duplicates data.
+REF_PROMPT_VERSION = "glean-ref/1"   # EXTERNAL-REFERENCE mode's version (ADR-0037): a fetched page
+                               # (tap --url) extracts under REF_SYSTEM_PROMPT, keyed independently of the
+                               # owner-authored glean-doc/2 — so a --url doc and a --file doc never share
+                               # a done-key, and the reference prompt versions on its own.
 SUMMARY_MAX = 240              # untrusted-field hygiene: cap the model's summary. Deliberately ABOVE
                                # the prompts' "<= 200 chars" ask — tolerance for model overshoot: the
                                # prompt asks, the hygiene cap forgives (a mild run-on keeps its tail)
@@ -172,6 +176,37 @@ DOC_SYSTEM_PROMPT = (
     "holds no rules (pure boilerplate), output {\"events\": []}."
 )
 
+# The EXTERNAL-REFERENCE variant (ADR-0037): a fetched page/PDF (tap --url) is NEITHER a noisy
+# transcript NOR the owner's own rules — it is THIRD-PARTY material the user saved to learn from.
+# So it inherits the document prompt's mostly-signal, restate-don't-infer posture (a curated article
+# is dense), but drops the "rules its owner WROTE" framing that made the model REFUSE external docs
+# ("this is public documentation, not the user's rules") — each event is a CLAIM THE SOURCE MAKES,
+# not a directive the user issued. The authority distinction rides downstream: a source's claim
+# proposes a `reference`-kind concept far more often than a `behavioral` directive (ADR-0029).
+REF_SYSTEM_PROMPT = (
+    "You extract the durable claims from an excerpt of an EXTERNAL REFERENCE document the user "
+    "SAVED to learn from — an article, documentation page, or blog post they found valuable — for a "
+    "system that folds reference material the user cares about into its reviewed knowledge layer.\n\n"
+    "Like a curated notes file, this document is DISTILLED, so extract generously; but UNLIKE the "
+    "user's own notes, it is THIRD-PARTY material — each event is a CLAIM THE SOURCE MAKES, never a "
+    "directive the user issued. Extract each distinct durable claim, principle, finding, or "
+    "recommendation as one event; skip headings, navigation, decorative structure, and prose that "
+    "states nothing durable.\n\n"
+    "The excerpt is shown with a line number on every line (`12| ...`). You do NOT retype the "
+    "document — you POINT at it by line number, and the system copies those exact bytes as the "
+    "evidence. Pick the tightest line range that carries each whole claim.\n\n"
+    "For each claim, return:\n"
+    "- \"lines\": {\"from\": N, \"to\": M} — the inclusive line numbers whose text IS the claim. A "
+    "single line is {\"from\": N, \"to\": N}.\n"
+    "- \"summary\": one sentence (<= 200 chars) stating the claim FAITHFULLY as the source makes it "
+    "— state it, do not embellish, generalize, merge, or phrase it as the user's own rule.\n"
+    "- \"markers\": an object scoring 0-1 on surprise / insight / research — a reference article "
+    "often scores insight or research (substantive external knowledge); surprise is usually low.\n"
+    "- \"confidence\": a number 0-1, how durable and reusable the claim is.\n\n"
+    "Output ONLY a JSON object: {\"events\": [ ... ]}. No prose, no code fences. If the excerpt "
+    "holds nothing durable (pure navigation/boilerplate), output {\"events\": []}."
+)
+
 # Cheap, no-LLM structural priors fed to the model so it weighs the most extraction-worthy cues. They
 # nudge the markers; they NEVER gate (the prior-art warning: a regex marker alone fires on quoted
 # errors / rhetorical "no"s — high recall, low precision, so the LLM adjudicates). Surprise = a
@@ -191,11 +226,11 @@ def has_signal_potential(text: str, *, min_chars: int = 80, mode: str = "transcr
     durable learning (too small, or no human/assistant turn — pure tool noise or a lone compact
     marker). The model is the real filter; this only spares obvious junk an API call.
 
-    DOCUMENT mode has no speaker structure to require — a curated rules file is almost all signal
-    — so only the size floor applies (ADR-0031)."""
+    DOCUMENT and REFERENCE modes have no speaker structure to require — a curated rules file or a
+    fetched article is almost all signal — so only the size floor applies (ADR-0031/0037)."""
     if len(text) < min_chars:
         return False
-    return mode == "document" or "[user]" in text or "[assistant]" in text
+    return mode in ("document", "reference") or "[user]" in text or "[assistant]" in text
 
 
 def structural_cues(text: str) -> list[str]:
@@ -555,6 +590,14 @@ class GleanBlock:
             except (OSError, json.JSONDecodeError):
                 kind = None
             mode = "document" if kind == "document" else "transcript"
+            # A document is OWNER-AUTHORED (--file: origin_ref carries `path`) or an EXTERNAL REFERENCE
+            # (--url: origin_ref carries `url`, ADR-0033/0037) — one raw-meta hop per chunkset (all its
+            # chunks share one cleaned blob → one origin), cached, disambiguates the extraction prompt.
+            if mode == "document" and chunks:
+                origin = (blobstore.raw_meta_of(chunks[0].cleaned_hash, root, self._meta_cache)
+                          or {}).get("origin_ref") or {}
+                if origin.get("url"):
+                    mode = "reference"
             for ch in chunks:
                 if source_filter is not None or exclude:
                     proj = blobstore.project_of(ch.cleaned_hash, root, self._meta_cache)
@@ -566,13 +609,17 @@ class GleanBlock:
                 yield ChunkItem(chunk=ch, chunkset_hash=cs, mode=mode)
 
     def key(self, item: ChunkItem) -> str:
-        """The done-key target. A DOCUMENT chunk's key carries DOC_PROMPT_VERSION so the two modes
-        stay independently versioned — bumping the document prompt re-extracts documents without
-        touching the transcript done-set (ADR-0031). The chunk keys themselves can never collide
-        across modes (a chunk belongs to exactly one cleaned blob, which has exactly one source
-        kind); the suffix exists purely to give document extraction its own version knob."""
+        """The done-key target. A DOCUMENT/REFERENCE chunk's key carries its mode's PROMPT VERSION so
+        the modes stay independently versioned — bumping the document (or reference) prompt re-extracts
+        only that mode, never the transcript done-set (ADR-0031/0037). The chunk keys themselves can
+        never collide across modes (a chunk belongs to exactly one cleaned blob, one source kind); the
+        suffix gives each non-transcript extraction its own version knob."""
         k = chunk_key(item.chunk)
-        return k if item.mode != "document" else f"{k}:{DOC_PROMPT_VERSION}"
+        if item.mode == "reference":
+            return f"{k}:{REF_PROMPT_VERSION}"
+        if item.mode == "document":
+            return f"{k}:{DOC_PROMPT_VERSION}"
+        return k
 
     def priority(self, item: ChunkItem) -> float:
         """Pre-LLM salience for the amortized queue (ADR-0010 §8): order chunks by LIKELY durable yield
@@ -676,7 +723,7 @@ class GleanBlock:
         completer (or an absent cleaned blob) propagates — the driver isolates it as
         `errored`, writes no marker, and the chunk is retried next run (per-chunk retry, ADR-0009)."""
         ch = item.chunk
-        doc_mode = item.mode == "document"
+        prose_mode = item.mode in ("document", "reference")   # curated text (no transcript speaker structure)
         cleaned_bytes = blobstore.get(ch.cleaned_hash, root).encode("utf-8")   # FileNotFoundError → errored
         text = cleaned_bytes[ch.byte_start:ch.byte_end].decode("utf-8")
         if not has_signal_potential(text, mode=item.mode):
@@ -685,13 +732,18 @@ class GleanBlock:
             return (0, 0.0)                       # filter-skip: still marked done (0-output marker)
 
         numbered, line_spans = number_lines(cleaned_bytes, ch)  # the model points at these lines; we copy bytes
-        # DOCUMENT mode (ADR-0031): the rules-document system prompt, and no structural cues — the
-        # cues are transcript-shaped (speaker tags, tool errors); on a rules file they'd only misfire.
-        cues = [] if doc_mode else structural_cues(text)
-        system = DOC_SYSTEM_PROMPT if doc_mode else SYSTEM_PROMPT
-        # pv stamps the event's PROVENANCE only (event_content drops it → re-extraction stays a no-op); the
-        # doc version is independent so the two modes re-extract on their own knobs.
-        pv = DOC_PROMPT_VERSION if doc_mode else PROMPT_VERSION
+        # The extraction prompt per mode (ADR-0031/0037): owner-authored document, external reference, or
+        # transcript. Curated prose (document/reference) takes NO structural cues — the cues are
+        # transcript-shaped (speaker tags, tool errors) and would only misfire on an article. pv stamps
+        # the event's PROVENANCE only (event_content drops it → re-extraction stays a no-op); each mode
+        # versions independently so one mode's prompt bump re-extracts only its own corpus.
+        cues = [] if prose_mode else structural_cues(text)
+        if item.mode == "reference":
+            system, pv = REF_SYSTEM_PROMPT, REF_PROMPT_VERSION
+        elif item.mode == "document":
+            system, pv = DOC_SYSTEM_PROMPT, DOC_PROMPT_VERSION
+        else:
+            system, pv = SYSTEM_PROMPT, PROMPT_VERSION
         prompt = _user_prompt(numbered, cues)     # BLIND (ADR-0036): the excerpt + cues alone, no digest
         comp = self.complete(system, prompt)      # the sole LLM call; raising → driver errored (per-chunk)
         with self._tally_lock:                    # shared int += — a lost increment is wrong audit data
